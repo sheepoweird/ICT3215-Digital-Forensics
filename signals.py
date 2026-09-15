@@ -355,26 +355,87 @@ def collect_battery() -> EnvSignal:
     return sig
 
 
+def _is_placeholder(val: str) -> bool:
+    """
+    True if a firmware-reported string is a placeholder rather than real data.
+
+    OEM firmware frequently fills SMBIOS string fields with filler instead of
+    leaving them empty. Treating that filler as a real value is worse than
+    treating the signal as absent: every machine from the same product line
+    would produce an identical 'unique' identifier.
+    """
+    if not val:
+        return True
+    v = val.strip().lower()
+    if not v:
+        return True
+    # All-zero, all-F, or all-punctuation strings of any length.
+    stripped = v.replace("-", "").replace(" ", "").replace(".", "")
+    if not stripped or set(stripped) <= {"0"} or set(stripped) <= {"f"}:
+        return True
+    return v in {
+        "unknown", "none", "n/a", "na", "null", "nil", "empty",
+        "not available", "notavailable", "not specified", "notspecified",
+        "not present", "undefined", "default string", "to be filled by o.e.m.",
+        "system serial number", "serialnumber", "0x0000", "no dimm",
+    }
+
+
 def collect_ram_serial() -> EnvSignal:
     sig = EnvSignal(
         "hw_ram", "RAM DIMM Serial(s)", "Hardware",
         "Physical DRAM module serial numbers from SPD data", 8
     )
     try:
+        # Query several fields at once. On machines with soldered/LPDDR memory
+        # the SPD serial is frequently absent, but the module's physical
+        # layout (locator + manufacturer + part + capacity) is still reported
+        # and is stable for the life of the machine. Using it as a fallback
+        # keeps this signal available on hardware that has no DIMM serials.
         out, err, rc = _run_ps_ex(
             "Get-CimInstance Win32_PhysicalMemory | "
-            "Select-Object -ExpandProperty SerialNumber"
+            "Sort-Object DeviceLocator | ForEach-Object { "
+            "'{0}~{1}~{2}~{3}~{4}' -f $_.SerialNumber, $_.DeviceLocator, "
+            "$_.Manufacturer, $_.PartNumber, $_.Capacity }"
         )
-        serials = [
-            s for s in _clean_lines(out, ["serialnumber"])
-            if s and s.lower() not in ("00000000", "unknown", "none")
-        ]
-        if rc == 0 and serials:
-            sig.value = "|".join(sorted(serials))
+
+        if rc != 0:
+            sig.error = _ps_error(err, rc, "RAM query failed")
+            return sig
+
+        rows = [r.split("~") for r in _clean_lines(out) if "~" in r]
+        if not rows:
+            sig.error = "No memory modules reported by WMI"
+            return sig
+
+        serials = sorted(
+            r[0].strip() for r in rows if len(r) >= 1 and not _is_placeholder(r[0])
+        )
+        if serials:
+            sig.value = "|".join(serials)
             sig.available = True
+            return sig
+
+        # Fallback: physical module descriptors. Lower entropy than a true
+        # serial, so the stability rating is reduced to reflect that this no
+        # longer distinguishes two identically-specced machines.
+        descriptors = sorted(
+            "~".join(p.strip() for p in r[1:5])
+            for r in rows if len(r) >= 5 and any(p.strip() for p in r[1:5])
+        )
+        if descriptors:
+            combined = "|".join(descriptors)
+            sig.value = hashlib.sha256(combined.encode()).hexdigest()[:24]
+            sig.available = True
+            sig.stability = 5
+            sig.description = (
+                "RAM module layout hash (SPD serials absent — "
+                "soldered memory or BIOS does not populate them)"
+            )
         else:
-            sig.error = _ps_error(
-                err, rc, "RAM serials not populated (requires BIOS support)"
+            sig.error = (
+                "RAM serials not populated (soldered/LPDDR memory, "
+                "or BIOS does not expose SPD data)"
             )
     except Exception as e:
         sig.error = str(e)
