@@ -1,0 +1,7 @@
+# EnvStego — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+PyQt6>=6.6.0
+cryptography>=42.0.0
+Pillow>=10.0.0
+numpy>=1.26.0
