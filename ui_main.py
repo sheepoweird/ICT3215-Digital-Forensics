@@ -649,36 +649,102 @@ class MainWindow(QMainWindow):
             if not cat_signals:
                 continue
 
-            group = QGroupBox(cat_name)
+            # ── Category header with Select All / Deselect All ──
+            header_widget = QWidget()
+            header_widget.setStyleSheet("background:transparent;")
+            header_layout = QHBoxLayout(header_widget)
+            header_layout.setContentsMargins(0, 8, 0, 2)
+            header_layout.setSpacing(8)
+
+            cat_label = QLabel(cat_name.upper())
+            cat_label.setStyleSheet(
+                "color:#6e7681; font-size:10px; font-weight:bold; letter-spacing:1.5px;"
+            )
+
+            sel_btn = QPushButton("Select All")
+            sel_btn.setFixedHeight(22)
+            sel_btn.setStyleSheet(
+                "QPushButton { background:#21262d; color:#8b949e; border:1px solid #30363d;"
+                "border-radius:4px; padding:0 8px; font-size:11px; }"
+                "QPushButton:hover { color:#58a6ff; border-color:#58a6ff; }"
+            )
+            desel_btn = QPushButton("Deselect All")
+            desel_btn.setFixedHeight(22)
+            desel_btn.setStyleSheet(
+                "QPushButton { background:#21262d; color:#8b949e; border:1px solid #30363d;"
+                "border-radius:4px; padding:0 8px; font-size:11px; }"
+                "QPushButton:hover { color:#f85149; border-color:#f85149; }"
+            )
+
+            sep = QFrame()
+            sep.setFrameShape(QFrame.Shape.HLine)
+            sep.setStyleSheet("background:#21262d; max-height:1px;")
+
+            header_layout.addWidget(cat_label)
+            header_layout.addWidget(sep, stretch=1)
+            header_layout.addWidget(sel_btn)
+            header_layout.addWidget(desel_btn)
+
+            # Group box for the signal rows
+            group = QGroupBox()
             group.setStyleSheet(
-                "QGroupBox { margin-top:14px; } "
-                "QGroupBox::title { color:#6e7681; font-size:10px; letter-spacing:1.5px; }"
+                "QGroupBox { border:1px solid #21262d; border-radius:6px;"
+                "margin-top:0px; padding:8px 4px 4px 4px; }"
             )
             g_layout = QVBoxLayout(group)
             g_layout.setSpacing(2)
 
+            cat_rows = []
             for sig in cat_signals:
                 row = SignalRow(sig)
                 row.toggled.connect(self._update_summary)
                 g_layout.addWidget(row)
                 self._signal_rows.append(row)
-                row.update_signal(sig)          # called AFTER parenting so Qt style engine refreshes
+                cat_rows.append(row)
+                row.update_signal(sig)
 
+            # Wire Select All / Deselect All to this category's rows only
+            def _make_sel(rows, check):
+                def _handler():
+                    for r in rows:
+                        if r._cb.isEnabled():
+                            r._cb.setChecked(check)
+                    self._update_summary()
+                return _handler
+
+            sel_btn.clicked.connect(_make_sel(cat_rows, True))
+            desel_btn.clicked.connect(_make_sel(cat_rows, False))
+
+            # Add header + group to scroll layout
+            self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, header_widget)
             self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, group)
 
         self._update_summary()
 
     def _update_summary(self):
-        selected = [r.signal for r in self._signal_rows if r.is_selected]
-        count    = len(selected)
-        entropy  = estimate_entropy_bits(selected)
+        all_selected  = [r.signal for r in self._signal_rows if r.is_selected]
+        active        = [s for s in all_selected if s.available and s.value]
+        ignored       = [s for s in all_selected if not (s.available and s.value)]
+        count         = len(active)
+        entropy       = estimate_entropy_bits(active)
 
         self._sel_count_lbl.setText(
-            f"{count} signal{'s' if count != 1 else ''} selected"
+            f"{count} active signal{'s' if count != 1 else ''} selected"
         )
         self._entropy_lbl.setText(f"Estimated entropy:  {entropy} bits")
         self._entropy_bar.setValue(entropy)
         self._fp_lbl.setText("Key fingerprint:  —")
+
+        # Warn if any selected signals are N/A and being silently skipped
+        if ignored:
+            names = ", ".join(s.name for s in ignored)
+            self._sel_count_lbl.setText(
+                f"{count} active  |  "
+                f"⚠ {len(ignored)} skipped (N/A): {names}"
+            )
+            self._sel_count_lbl.setStyleSheet("color:#d29922; font-size:11px;")
+        else:
+            self._sel_count_lbl.setStyleSheet("color:#8b949e; font-size:12px;")
 
     def _test_key(self):
         selected = [r.signal for r in self._signal_rows if r.is_selected]
