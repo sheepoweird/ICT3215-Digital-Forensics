@@ -1,0 +1,124 @@
+
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font-sans);color:var(--text-primary)}
+.step{display:flex;gap:16px;padding:20px 0;border-bottom:0.5px solid var(--border)}
+.step:last-child{border-bottom:none}
+.num{width:32px;height:32px;min-width:32px;border-radius:50%;background:var(--bg-accent);color:var(--text-accent);font-size:13px;font-weight:500;display:flex;align-items:center;justify-content:center}
+.body{flex:1}
+.title{font-size:15px;font-weight:500;margin-bottom:6px}
+.desc{font-size:13px;color:var(--text-secondary);line-height:1.6}
+.tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:500;margin-top:8px;margin-right:4px}
+.tag-blue{background:var(--bg-accent);color:var(--text-accent)}
+.tag-green{background:var(--bg-success);color:var(--text-success)}
+.tag-red{background:var(--bg-danger);color:var(--text-danger)}
+.tag-amber{background:var(--bg-warning);color:var(--text-warning)}
+.note{background:var(--surface-1);border:0.5px solid var(--border);border-radius:var(--radius);padding:10px 14px;margin-top:10px;font-size:12px;color:var(--text-secondary);line-height:1.6}
+.note b{color:var(--text-primary);font-weight:500}
+.section-label{font-size:11px;font-weight:500;color:var(--text-muted);letter-spacing:.08em;text-transform:uppercase;padding:20px 0 8px}
+.divider{height:0.5px;background:var(--border-strong);margin:4px 0 0}
+</style>
+
+<h2 class="sr-only">EnvStego step-by-step user guide</h2>
+
+<div class="section-label">When you first open the app</div>
+<div class="divider"></div>
+
+<div class="step">
+  <div class="num">1</div>
+  <div class="body">
+    <div class="title">Wait for signals to load</div>
+    <div class="desc">The app scans your machine automatically. You'll see <b>"Collecting…"</b> in the top right. This takes 5–15 seconds. Once done, the Signals tab fills up with rows — some green, some grey.</div>
+    <div class="note"><b>Green = Available</b> — the app could read this signal from your machine.<br><b>Grey N/A</b> = not accessible (e.g. no battery on a desktop, no Wi-Fi adapter).</div>
+  </div>
+</div>
+
+<div class="step">
+  <div class="num">2</div>
+  <div class="body">
+    <div class="title">Pick your signals (Signals tab)</div>
+    <div class="desc">Tick the signals you want to form your encryption key. The more you select, the harder the key is to recreate elsewhere. Available signals are pre-ticked — you can untick ones you don't want.</div>
+    <div class="note"><b>Rule of thumb:</b> pick at least 3 signals. Machine GUID + Volume Serial + one network signal is a solid starting combination.</div>
+    <span class="tag tag-blue">Stability 8–10 = very reliable</span>
+    <span class="tag tag-amber">Stability 5–7 = can change</span>
+  </div>
+</div>
+
+<div class="step">
+  <div class="num">3</div>
+  <div class="body">
+    <div class="title">Test your key</div>
+    <div class="desc">Click <b>Test Key</b> at the bottom of the Signals tab. A fingerprint appears (e.g. <code style="font-family:var(--font-mono);font-size:12px">D993-8D9E-DA56-3DEA</code>). Click it again — if the fingerprint is identical, your environment is stable and safe to use for encryption.</div>
+  </div>
+</div>
+
+<div class="section-label" style="padding-top:24px">Encrypting a file</div>
+<div class="divider"></div>
+
+<div class="step">
+  <div class="num">4</div>
+  <div class="body">
+    <div class="title">Go to the Encrypt tab</div>
+    <div class="desc">You need three things: a <b>payload file</b> (any file you want to hide), a <b>carrier PNG image</b> (the image the data gets hidden inside), and an <b>output path</b> (where to save the result).</div>
+    <div class="note"><b>Payload:</b> any file — .txt, .pdf, .docx, etc.<br><b>Carrier:</b> must be a PNG. Bigger image = more capacity. A 1920×1080 PNG holds ~759 KB.</div>
+  </div>
+</div>
+
+<div class="step">
+  <div class="num">5</div>
+  <div class="body">
+    <div class="title">Check the capacity bar</div>
+    <div class="desc">After selecting your carrier and payload, a bar shows how much of the image's capacity the payload uses. If it turns red, your image is too small — use a larger PNG.</div>
+    <span class="tag tag-green">Blue bar = fits fine</span>
+    <span class="tag tag-red">Red bar = image too small</span>
+  </div>
+</div>
+
+<div class="step">
+  <div class="num">6</div>
+  <div class="body">
+    <div class="title">Click "Encrypt & Embed"</div>
+    <div class="desc">The app encrypts your file with AES-256-GCM using the key derived from your selected signals, then hides the encrypted data in the PNG's pixel values (LSB steganography). The output image looks identical to the original.</div>
+    <div class="note"><b>Note the key fingerprint shown after success</b> — this confirms which environment was used. You'll need the same signals active to decrypt.</div>
+  </div>
+</div>
+
+<div class="section-label" style="padding-top:24px">Decrypting a file</div>
+<div class="divider"></div>
+
+<div class="step">
+  <div class="num">7</div>
+  <div class="body">
+    <div class="title">Make sure the same signals are selected</div>
+    <div class="desc">Go back to the Signals tab. The <b>same signals that were ticked during encryption must be ticked now</b>. If you're on a different machine or network, decryption will fail — that's the forensic defence working.</div>
+  </div>
+</div>
+
+<div class="step">
+  <div class="num">8</div>
+  <div class="body">
+    <div class="title">Go to the Decrypt tab</div>
+    <div class="desc">Select the stego PNG (the output image from step 6) and choose where to save the recovered file. Click <b>Decrypt & Extract</b>.</div>
+    <span class="tag tag-green">Correct environment → file recovered</span>
+    <span class="tag tag-red">Wrong environment → authentication fails</span>
+  </div>
+</div>
+
+<div class="section-label" style="padding-top:24px">Bonus</div>
+<div class="divider"></div>
+
+<div class="step">
+  <div class="num">9</div>
+  <div class="body">
+    <div class="title">Inspector tab — see raw signal values</div>
+    <div class="desc">Shows you exactly what value was read for each signal. Useful for your report's evaluation section and for debugging if a signal shows N/A unexpectedly.</div>
+  </div>
+</div>
+
+<div class="step">
+  <div class="num">10</div>
+  <div class="body">
+    <div class="title">Refresh Signals button</div>
+    <div class="desc">Top right corner. Re-scans your machine — useful if you connected to a different Wi-Fi network and want to use the new BSSID as part of your key.</div>
+  </div>
+</div>
