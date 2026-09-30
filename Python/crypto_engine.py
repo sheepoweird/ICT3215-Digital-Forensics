@@ -1,161 +1,65 @@
-"""
-EnvStego - crypto_engine.py
-Cryptographic key derivation (HKDF-SHA256) and AES-256-GCM encryption.
-
-Key derivation takes selected environment signals, canonicalizes them,
-and feeds into HKDF to produce a stable 256-bit AES key. The same
-environment produces the same key; a forensic lab environment does not.
-
-Team member: Cryptographic Key Derivation Function
-ICT3215 Digital Forensics — SIT
-"""
-
-import os
 import hashlib
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
+import asyncio
+import os
+import concurrent.futures
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
-import asyncio
-from token_comms import pair_token_usb, request_key_ble
+from token_comms import request_key_ble
 
-# Application-specific HKDF constants — change these to make the tool your own
-HKDF_SALT = b"EnvStego-ICT3215-SIT-2026-anti-forensics"
-HKDF_INFO = b"envkeyed-aes256gcm-stego-payload"
+def estimate_entropy_bits(signals: list) -> int:
+    """Estimates the entropy bits of the selected signals."""
+    return sum(getattr(s, 'stability', 5) * 4 for s in signals)
 
-# Rough entropy estimate per signal type (bits)
-# Used for the UI entropy display only — not security-critical
-_ENTROPY_MAP = {
-    "hw_mobo":        40,
-    "hw_cpu":         48,
-    "hw_disk":        40,
-    "hw_bios":        32,
-    "hw_gpu":         28,
-    "hw_volume":      32,
-    "hw_battery":     16,
-    "hw_ram":         32,
-    "hw_edid":        28,
-    "net_bssid":      48,
-    "net_ipv6":       64,
-    "net_adapterguid":96,
-    "net_gatewaymac": 48,
-    "net_dns":        24,
-    "os_machineguid": 128,
-    "os_machinesid":  64,
-    "os_installdate": 32,
-    "os_usbhistory":  48,
-    "os_prefetchseed":24,
-    "os_certs":       48,
-    "os_audio":       64,
-    "os_activation":  96,
-}
+def _run_async_ble(env_str: str) -> str:
+    """Helper function to run the async BLE request in a clean, isolated thread."""
+    return asyncio.run(request_key_ble(env_str))
 
-
-def derive_key(selected_signals: list) -> tuple:
+def derive_key(signals: list) -> tuple[bytes, str]:
     """
-    Derive a 256-bit AES key from a list of selected EnvSignal objects.
-
-    Only signals where available=True and value is non-empty are used.
-    Signals are sorted by ID before concatenation for determinism.
-
-    Returns:
-        (key_bytes: bytes, fingerprint: str)
-        fingerprint is a short formatted hex string for UI display only.
-
-    Raises:
-        ValueError if no available signals are provided.
+    Formats selected signals into an environment payload, sends it to the ESP32 via BLE,
+    and derives a 32-byte AES-GCM key from the hardware token's secure response.
     """
-    available = [s for s in selected_signals if s.available and s.value]
-    if not available:
-        raise ValueError(
-            "No available environment signals selected.\n"
-            "Please go to the Signals tab and select at least one available signal."
+    # 1. Format environment data (e.g. "hw_cpu:BFEBFBFF000806E9|net_bssid:ab:cd:ef:12:34:56")
+    env_str = "|".join([f"{s.id}:{s.value}" for s in signals])
+    if not env_str:
+        env_str = "EMPTY_ENV"
+        
+    print(f"[CRYPTO] Requesting hardware key via BLE for env string: {env_str}")
+    
+    # 2. Fetch the hardware-anchored key wirelessly in an isolated thread
+    # This prevents the Windows GUI thread from crashing asyncio
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_run_async_ble, env_str)
+        hw_key_string = future.result()
+        
+    if not hw_key_string:
+        raise Exception("Hardware token not found or BLE connection failed. Is the token paired and on?")
+        
+    # 3. Security Check: Ensure the token hasn't been factory reset
+    if hw_key_string == "ERROR: NOT_PAIRED":
+        raise Exception(
+            "Hardware token refused BLE connection: NOT PAIRED.\n\n"
+            "The token may have been factory reset. Please use the "
+            "'Pair Hardware Token' button to re-establish the USB trust anchor."
         )
+        
+    # 4. Hash the hardware string into a valid 32-byte AES-256 key
+    key_hash = hashlib.sha256(hw_key_string.encode('utf-8')).digest()
+    
+    # 5. Generate a short visual fingerprint for the UI
+    fp = hashlib.sha256(key_hash).hexdigest()[:12].upper()
+    
+    return key_hash, fp
 
-    # Canonical representation: sort by signal ID, join as key=value pairs
-    # Sorting ensures same key regardless of collection order
-    parts = sorted(f"{s.id}={s.value}" for s in available)
-    ikm = "|".join(parts).encode("utf-8")
-
-    # HKDF-SHA256: extract + expand
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,          # 256-bit output for AES-256
-        salt=HKDF_SALT,
-        info=HKDF_INFO,
-    )
-    key = hkdf.derive(ikm)
-
-    # Fingerprint: a short hash of the key for UI verification
-    # This lets users confirm their environment is stable WITHOUT exposing the key
-    raw_fp = hashlib.sha256(key + b"envstego-fingerprint-v1").hexdigest()[:16].upper()
-    fingerprint = "-".join(raw_fp[i:i+4] for i in range(0, 16, 4))
-
-    return key, fingerprint
-
-
-def encrypt_payload(plaintext: bytes, key: bytes) -> tuple:
-    """
-    Encrypt plaintext using AES-256-GCM.
-
-    AES-GCM provides both confidentiality and authenticated integrity.
-    A wrong decryption key will raise InvalidTag, not return garbage.
-    This is the forensic defense mechanism: wrong environment = key mismatch =
-    authenticated decryption failure = payload is mathematically unrecoverable.
-
-    Args:
-        plaintext: raw bytes of the payload file
-        key: 32-byte AES key from derive_key()
-
-    Returns:
-        (nonce: bytes[12], ciphertext_with_tag: bytes)
-        The ciphertext includes the 16-byte GCM authentication tag appended.
-    """
-    nonce = os.urandom(12)   # 96-bit nonce — standard for GCM
+def encrypt_payload(plaintext: bytes, key: bytes) -> tuple[bytes, bytes]:
+    """Encrypts data using AES-256-GCM. Returns (nonce, ciphertext)."""
     aesgcm = AESGCM(key)
-    ciphertext = aesgcm.encrypt(nonce, plaintext, None)  # AAD = None
+    nonce = os.urandom(12)
+    ciphertext = aesgcm.encrypt(nonce, plaintext, None)
     return nonce, ciphertext
 
-
-def decrypt_payload(nonce: bytes, ciphertext_with_tag: bytes, key: bytes) -> bytes:
-    """
-    Decrypt AES-256-GCM ciphertext.
-
-    Args:
-        nonce: 12-byte nonce used during encryption
-        ciphertext_with_tag: ciphertext with 16-byte GCM tag appended
-        key: 32-byte AES key from derive_key()
-
-    Returns:
-        Decrypted plaintext bytes.
-
-    Raises:
-        cryptography.exceptions.InvalidTag if key is wrong or data is corrupted.
-        This is the expected behavior when run in the wrong environment.
-    """
+def decrypt_payload(nonce: bytes, ciphertext: bytes, key: bytes) -> bytes:
+    """Decrypts data using AES-256-GCM. Returns plaintext."""
     aesgcm = AESGCM(key)
-    return aesgcm.decrypt(nonce, ciphertext_with_tag, None)
-
-
-def estimate_entropy_bits(selected_signals: list) -> int:
-    """
-    Estimate the total key entropy contributed by selected signals.
-    Capped at 256 bits (AES-256 maximum useful entropy).
-    Used for UI display only.
-    """
-    available = [s for s in selected_signals if s.available and s.value]
-    total = sum(_ENTROPY_MAP.get(s.id, 20) for s in available)
-    return min(total, 256)
-
-def get_hardware_key(env_data: str) -> bytes:
-    # 3T requires both the token and the environment variables[cite: 3]
-    print("Requesting master secret from token...")
-    
-    # Run the async BLE function
-    key_string = asyncio.run(request_key_ble(env_data))
-    
-    if not key_string:
-        raise Exception("Hardware token not found. Decryption permanently unrecoverable.")
-        
-    # Pass this key into your actual AES/encryption algorithms in crypto_engine
-    return key_string.encode()
+    # Raises cryptography.exceptions.InvalidTag if key/environment is wrong
+    return aesgcm.decrypt(nonce, ciphertext, None)
