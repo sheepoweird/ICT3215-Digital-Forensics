@@ -29,6 +29,7 @@ from signals import EnvSignal, collect_all_signals
 from crypto_engine import derive_key, encrypt_payload, decrypt_payload, estimate_entropy_bits
 from stego_engine import embed, extract, get_capacity_bytes, get_image_info
 from cryptography.exceptions import InvalidTag
+from token_comms import pair_token_usb
 
 
 # ─── STYLESHEET ──────────────────────────────────────────────────────────────
@@ -206,6 +207,14 @@ class CollectWorker(QThread):
         self.done.emit(signals)
 
 
+class PairWorker(QThread):
+    done = pyqtSignal(bool)
+
+    def run(self):
+        success = pair_token_usb("COM3")
+        self.done.emit(success)
+
+
 class EncryptWorker(QThread):
     done  = pyqtSignal(str, str, str)
     error = pyqtSignal(str)
@@ -219,10 +228,8 @@ class EncryptWorker(QThread):
 
     def run(self):
         try:
-            # Re-collect signals LIVE at encrypt time — not cached startup values
             fresh    = collect_all_signals()
-            selected = [s for s in fresh
-                        if s.id in self._selected_ids and s.available and s.value]
+            selected = [s for s in fresh if s.id in self._selected_ids and s.available and s.value]
             if not selected:
                 self.error.emit(
                     "None of the selected signals are readable right now.\n"
@@ -263,12 +270,8 @@ class DecryptWorker(QThread):
 
     def run(self):
         try:
-            # Re-collect signals LIVE at decrypt time — this is what makes the
-            # forensic defense work: if environment changed, key derivation
-            # produces a different key and AES-GCM authentication fails.
             fresh    = collect_all_signals()
-            selected = [s for s in fresh
-                        if s.id in self._selected_ids and s.available and s.value]
+            selected = [s for s in fresh if s.id in self._selected_ids and s.available and s.value]
             if not selected:
                 self.error.emit(
                     "None of the selected signals are readable in the current environment.\n"
@@ -310,8 +313,7 @@ class DecryptWorker(QThread):
 class FilePicker(QWidget):
     """Label + LineEdit + Browse button row."""
 
-    def __init__(self, label: str, mode: str = "open",
-                 filter_: str = "All Files (*.*)", parent=None):
+    def __init__(self, label: str, mode: str = "open", filter_: str = "All Files (*.*)", parent=None):
         super().__init__(parent)
         self._mode   = mode
         self._filter = filter_
@@ -336,13 +338,9 @@ class FilePicker(QWidget):
 
     def _browse(self):
         if self._mode == "save":
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Save File", "", self._filter
-            )
+            path, _ = QFileDialog.getSaveFileName(self, "Save File", "", self._filter)
         else:
-            path, _ = QFileDialog.getOpenFileName(
-                self, "Open File", "", self._filter
-            )
+            path, _ = QFileDialog.getOpenFileName(self, "Open File", "", self._filter)
         if path:
             self.path_edit.setText(path)
 
@@ -385,11 +383,6 @@ class StatusPanel(QLabel):
 
 
 class SignalRow(QWidget):
-    """
-    One row in the signal selection list.
-    Contains: checkbox | name + description | stability bar | status badge
-    """
-
     toggled = pyqtSignal()
 
     def __init__(self, signal: EnvSignal, parent=None):
@@ -407,7 +400,6 @@ class SignalRow(QWidget):
         self._cb.toggled.connect(self.toggled.emit)
         layout.addWidget(self._cb)
 
-        # Name + description
         info = QVBoxLayout()
         info.setSpacing(1)
         self._name_lbl = QLabel(self._signal.name)
@@ -418,7 +410,6 @@ class SignalRow(QWidget):
         info.addWidget(self._desc_lbl)
         layout.addLayout(info, stretch=4)
 
-        # Stability bar
         stab_col = QVBoxLayout()
         stab_col.setSpacing(2)
         stab_lbl = QLabel("Stability")
@@ -435,7 +426,6 @@ class SignalRow(QWidget):
         stab_col.addWidget(self._stab_bar)
         layout.addLayout(stab_col)
 
-        # Status badge
         self._badge = QLabel("Loading")
         self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._badge.setMinimumWidth(80)
@@ -449,8 +439,7 @@ class SignalRow(QWidget):
         self._signal = signal
         if signal.available:
             self._cb.setEnabled(True)
-            self._cb.setChecked(False)   # user must deliberately choose signals
-            # Force Qt style engine to repaint the checkbox (needed on Windows)
+            self._cb.setChecked(False)
             self._cb.style().unpolish(self._cb)
             self._cb.style().polish(self._cb)
             self._cb.update()
@@ -496,6 +485,7 @@ class MainWindow(QMainWindow):
         self._signal_rows: list[SignalRow] = []
         self._collect_worker = None
         self._op_worker      = None
+        self._pair_worker    = None
 
         self._build_ui()
         self._start_collection()
@@ -527,6 +517,11 @@ class MainWindow(QMainWindow):
         hbox.addWidget(sub)
         hbox.addStretch()
 
+        self._pair_btn = QPushButton("🔗  Pair Hardware Token")
+        self._pair_btn.setFixedHeight(32)
+        self._pair_btn.clicked.connect(self._start_pairing)
+        hbox.addWidget(self._pair_btn)
+
         self._refresh_btn = QPushButton("↻  Refresh Signals")
         self._refresh_btn.setFixedHeight(32)
         self._refresh_btn.clicked.connect(self._start_collection)
@@ -550,6 +545,39 @@ class MainWindow(QMainWindow):
         self._status.showMessage("Initialising…")
 
     # ─────────────────────────────────────────────────────────────
+    #  HARDWARE PAIRING
+    # ─────────────────────────────────────────────────────────────
+
+    def _start_pairing(self):
+        self._pair_btn.setEnabled(False)
+        self._pair_btn.setText("🔗  Pairing...")
+        self._status.showMessage("Pairing with hardware token via USB (COM3)...")
+
+        self._pair_worker = PairWorker()
+        self._pair_worker.done.connect(self._on_pairing_done)
+        self._pair_worker.start()
+
+    def _on_pairing_done(self, success: bool):
+        if success:
+            self._pair_btn.setStyleSheet(
+                "background-color: #1a4731; color: #3fb950; border: 1px solid #2ea043;"
+            )
+            self._pair_btn.setText("✓  Token Paired")
+            self._status.showMessage("Hardware token successfully paired.")
+            QMessageBox.information(
+                self, "Success", 
+                "Wired hardware token pairing successful!\n\nYou can now generate keys and perform encryption via BLE."
+            )
+        else:
+            self._pair_btn.setEnabled(True)
+            self._pair_btn.setText("🔗  Pair Hardware Token")
+            self._status.showMessage("Token pairing failed.")
+            QMessageBox.critical(
+                self, "Error", 
+                "Could not pair with the hardware token.\n\nEnsure it is connected via USB to COM3 and no other application (like the VS Code Serial Monitor) is using the port."
+            )
+
+    # ─────────────────────────────────────────────────────────────
     #  TAB 1 — SIGNAL SELECTION
     # ─────────────────────────────────────────────────────────────
 
@@ -569,7 +597,6 @@ class MainWindow(QMainWindow):
         info.setStyleSheet("color:#8b949e; font-size:12px; padding:4px 0;")
         outer.addWidget(info)
 
-        # Scroll area for signal rows
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -582,7 +609,6 @@ class MainWindow(QMainWindow):
         scroll.setWidget(self._scroll_content)
         outer.addWidget(scroll, stretch=1)
 
-        # ── Summary bar ──────────────────────────────────────────
         summary_frame = QFrame()
         summary_frame.setStyleSheet(
             "background:#161b22; border:1px solid #21262d; border-radius:6px;"
@@ -632,8 +658,6 @@ class MainWindow(QMainWindow):
         return page
 
     def _populate_signal_rows(self, signals: list[EnvSignal]):
-        """Build signal rows grouped by category."""
-        # Clear existing
         while self._scroll_layout.count() > 1:
             item = self._scroll_layout.takeAt(0)
             if item.widget():
@@ -649,7 +673,6 @@ class MainWindow(QMainWindow):
             if not cat_signals:
                 continue
 
-            # ── Category header with Select All / Deselect All ──
             header_widget = QWidget()
             header_widget.setStyleSheet("background:transparent;")
             header_layout = QHBoxLayout(header_widget)
@@ -685,7 +708,6 @@ class MainWindow(QMainWindow):
             header_layout.addWidget(sel_btn)
             header_layout.addWidget(desel_btn)
 
-            # Group box for the signal rows
             group = QGroupBox()
             group.setStyleSheet(
                 "QGroupBox { border:1px solid #21262d; border-radius:6px;"
@@ -703,7 +725,6 @@ class MainWindow(QMainWindow):
                 cat_rows.append(row)
                 row.update_signal(sig)
 
-            # Wire Select All / Deselect All to this category's rows only
             def _make_sel(rows, check):
                 def _handler():
                     for r in rows:
@@ -715,7 +736,6 @@ class MainWindow(QMainWindow):
             sel_btn.clicked.connect(_make_sel(cat_rows, True))
             desel_btn.clicked.connect(_make_sel(cat_rows, False))
 
-            # Add header + group to scroll layout
             self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, header_widget)
             self._scroll_layout.insertWidget(self._scroll_layout.count() - 1, group)
 
@@ -735,7 +755,6 @@ class MainWindow(QMainWindow):
         self._entropy_bar.setValue(entropy)
         self._fp_lbl.setText("Key fingerprint:  —")
 
-        # Warn if any selected signals are N/A and being silently skipped
         if ignored:
             names = ", ".join(s.name for s in ignored)
             self._sel_count_lbl.setText(
@@ -772,7 +791,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(20, 18, 20, 16)
         layout.setSpacing(12)
 
-        # File inputs
         inputs = QGroupBox("Files")
         il = QVBoxLayout(inputs)
         il.setSpacing(10)
@@ -789,7 +807,6 @@ class MainWindow(QMainWindow):
         il.addWidget(self._enc_output)
         layout.addWidget(inputs)
 
-        # Capacity display
         cap_frame = QFrame()
         cap_frame.setStyleSheet(
             "background:#161b22; border:1px solid #21262d; border-radius:6px;"
@@ -817,7 +834,6 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(cap_frame)
 
-        # Encrypt button
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         self._enc_btn = QPushButton("  ⬛  Encrypt & Embed  ")
@@ -828,11 +844,9 @@ class MainWindow(QMainWindow):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        # Result
         self._enc_result = StatusPanel()
         layout.addWidget(self._enc_result)
 
-        # Fingerprint display after encrypt
         self._enc_fp_lbl = QLabel("")
         self._enc_fp_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._enc_fp_lbl.setStyleSheet(
@@ -861,7 +875,6 @@ class MainWindow(QMainWindow):
 
             if payload and os.path.isfile(payload):
                 payload_size = os.path.getsize(payload)
-                # encrypted payload = payload_size + 16 (GCM tag) + 20 (header)
                 total_needed = payload_size + 16 + 20
                 pct = min(100, int(total_needed / cap * 100)) if cap > 0 else 100
 
@@ -877,7 +890,7 @@ class MainWindow(QMainWindow):
                     self._cap_label.setText(
                         f"Using {total_needed:,} / {cap:,} bytes  ({pct}%)"
                     )
-                    self._cap_bar.setStyleSheet("")  # Reset to default
+                    self._cap_bar.setStyleSheet("")
                 self._cap_bar.setValue(pct)
             else:
                 self._cap_label.setText(
@@ -972,7 +985,6 @@ class MainWindow(QMainWindow):
         self._dec_result = StatusPanel()
         layout.addWidget(self._dec_result)
 
-        # Preview (if recovered is text)
         self._dec_preview_lbl = QLabel("Preview (text payloads only):")
         self._dec_preview_lbl.setStyleSheet("color:#6e7681; font-size:11px;")
         self._dec_preview_lbl.setVisible(False)
@@ -1018,14 +1030,13 @@ class MainWindow(QMainWindow):
         self._dec_btn.setText("  🔓  Decrypt & Extract  ")
         self._status.showMessage("Decryption successful")
 
-        # Try to show a text preview
         try:
             text = plaintext.decode("utf-8")
             self._dec_preview.setPlainText(text[:2000] + ("…" if len(text) > 2000 else ""))
             self._dec_preview.setVisible(True)
             self._dec_preview_lbl.setVisible(True)
         except UnicodeDecodeError:
-            pass  # Binary payload — no preview
+            pass
 
     def _on_decrypt_error(self, msg: str):
         self._dec_result.show_error(msg)
