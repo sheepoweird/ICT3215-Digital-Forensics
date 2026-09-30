@@ -61,7 +61,7 @@ Double-click `build.bat`
 OR run in terminal:
 ```
 build.bat
-```
+```T
 
 The executable will be created at:
 ```
