@@ -9,9 +9,23 @@
 #define SERVICE_UUID        "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
+// --- LED CONFIGURATION ---
+// Pin 4 is the bright Flash LED next to the SD Card slot
+#define LED_PIN 4  
+
 Preferences preferences;
 bool devicePaired = false;
 BLECharacteristic *pCharacteristic;
+
+// Helper function to blink the LED
+void flashLED(int times, int delayMs) {
+    for (int i = 0; i < times; i++) {
+        digitalWrite(LED_PIN, HIGH);
+        delay(delayMs);
+        digitalWrite(LED_PIN, LOW);
+        if (i < times - 1) delay(delayMs);
+    }
+}
 
 class MyServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -37,6 +51,9 @@ class MyCallbacks : public BLECharacteristicCallbacks {
                 return;
             }
 
+            // Visual feedback: 2 fast flashes to prove BLE communication!
+            flashLED(2, 50);
+
             // Generate deterministic key anchored by hardware secret + environment
             String finalKey = "3T_HARDWARE_ANCHOR_SECRET_778899-" + envData;
             
@@ -49,24 +66,47 @@ class MyCallbacks : public BLECharacteristicCallbacks {
 
 void setup() {
     Serial.begin(115200);
-    delay(1000);
-
-    // Check why the ESP32 restarted
-    esp_reset_reason_t reason = esp_reset_reason();
     
-    // Open NVS storage space named "3t_storage"
+    // Initialize LED Pin and BOOT button
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(0, INPUT_PULLUP);
+
+    // 1. Boot Indicator: Turn LED ON solid
+    digitalWrite(LED_PIN, HIGH);
+    Serial.println("\n--- 3T Token Booting ---");
+    Serial.println("You have 3 seconds to press and hold the BOOT (IO0) button for a Factory Reset...");
+    
+    bool factoryResetTriggered = false;
+    
+    // 2. The Grace Period: Wait 3 seconds, scanning for the BOOT button
+    for (int i = 0; i < 30; i++) {
+        if (digitalRead(0) == LOW) {
+            factoryResetTriggered = true;
+            break;
+        }
+        delay(100);
+    }
+    
+    digitalWrite(LED_PIN, LOW); // Turn off the boot indicator LED
+
+    // 3. Process the Result
     preferences.begin("3t_storage", false);
 
-    // FACTORY RESET CONDITION: If user pressed the physical RST button (EXT_RESET), wipe memory!
-    if (reason == ESP_RST_EXT || reason == ESP_RST_SW) {
-        Serial.println("[HW] Physical RST button detected! Wiping pairing state (Factory Reset)...");
-        preferences.clear(); // Clear NVS storage
+    if (factoryResetTriggered) {
+        Serial.println("[HW] Factory Reset triggered! Wiping pairing state...");
+        preferences.clear(); 
         devicePaired = false;
+        
+        // Visual feedback: 10 rapid flashes
+        flashLED(10, 40); 
     } else {
-        // Normal power on — check if it was previously paired
         devicePaired = preferences.getBool("paired", false);
         if (devicePaired) {
             Serial.println("[HW] Restored state: Token is ALREADY bound to host from NVS flash.");
+            // Single short blink to show it's alive and paired
+            flashLED(1, 100);
+        } else {
+            Serial.println("[HW] Token is UNPAIRED. Waiting for USB handshake...");
         }
     }
 
@@ -87,14 +127,6 @@ void setup() {
     pCharacteristic->setCallbacks(new MyCallbacks());
     pService->start();
 
-    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-    pAdvertising->addServiceUUID(SERVICE_UUID);
-    pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06);  
-    pAdvertising->setMinPreferred(0x12);
-    pAdvertising->start();
-    
-    Serial.println("Token secret initialized and stored safely off-disk.");
     Serial.println("BLE Server is running. Waiting for connections...");
 }
 
@@ -106,8 +138,11 @@ void loop() {
 
         if (command == "PAIR_DEVICE") {
             devicePaired = true;
-            preferences.putBool("paired", true); // Save permanently to flash!
+            preferences.putBool("paired", true); // Save permanently to flash
             Serial.println("PAIRING_SUCCESS: 3T-Hardware-Token is now bound to this host.");
+            
+            // Visual feedback: 3 flashes for successful wired pairing
+            flashLED(3, 150);
         } 
         else if (command == "CHECK_STATUS") {
             if (devicePaired) {
