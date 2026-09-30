@@ -1,3 +1,7 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "st7305.h"
 #include <string.h>
 #include <assert.h>
 #include "nvs_flash.h"
@@ -71,6 +75,23 @@ static void on_sync(void) {
 
 static void on_reset(int reason) { ESP_LOGE(TAG, "nimble reset; reason=%d", reason); }
 
+static void draw_screen(void) {
+    char line[48];
+    st7305_clear();
+
+    // header bar: black background, white text
+    st7305_fill_rect(0, 0, LCD_WIDTH, 22, true);
+    st7305_draw_text(8, 3, "Bluetooth is currently enabled", 1, false);
+
+    snprintf(line, sizeof(line), "Name  : %s", DEVICE_NAME);
+    st7305_draw_text(8, 34, line, 1, true);
+
+    st7305_draw_text(8, 60, "Status:", 1, true);
+    st7305_draw_text(8, 80, s_connected ? "CONNECTED" : "ADVERTISING", 2, true);
+
+    st7305_flush();
+}
+
 static void host_task(void *param) {
     nimble_port_run();
     nimble_port_freertos_deinit();
@@ -84,6 +105,8 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    ESP_ERROR_CHECK(st7305_init());   // screen first, so it is ready before BLE events
+
     ESP_ERROR_CHECK(nimble_port_init());
 
     ble_hs_cfg.sync_cb  = on_sync;
@@ -93,5 +116,14 @@ void app_main(void) {
     ble_svc_gap_device_name_set(DEVICE_NAME);
 
     ESP_LOGI(TAG, "Bluetooth is currently enabled, name='%s'", DEVICE_NAME);
-    nimble_port_freertos_init(host_task);
+    
+    // Redraw whenever the connection state changes
+    bool last = !s_connected;
+    while (1) {
+        if (s_connected != last) {
+            last = s_connected;
+            draw_screen();
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
 }
