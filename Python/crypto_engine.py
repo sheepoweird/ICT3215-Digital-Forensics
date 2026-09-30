@@ -16,7 +16,8 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
-
+import asyncio
+from token_comms import pair_token_usb, request_key_ble
 
 # Application-specific HKDF constants — change these to make the tool your own
 HKDF_SALT = b"EnvStego-ICT3215-SIT-2026-anti-forensics"
@@ -145,3 +146,16 @@ def estimate_entropy_bits(selected_signals: list) -> int:
     available = [s for s in selected_signals if s.available and s.value]
     total = sum(_ENTROPY_MAP.get(s.id, 20) for s in available)
     return min(total, 256)
+
+def get_hardware_key(env_data: str) -> bytes:
+    # 3T requires both the token and the environment variables[cite: 3]
+    print("Requesting master secret from token...")
+    
+    # Run the async BLE function
+    key_string = asyncio.run(request_key_ble(env_data))
+    
+    if not key_string:
+        raise Exception("Hardware token not found. Decryption permanently unrecoverable.")
+        
+    # Pass this key into your actual AES/encryption algorithms in crypto_engine
+    return key_string.encode()
