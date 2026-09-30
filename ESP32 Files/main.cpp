@@ -9,20 +9,19 @@
 #define SERVICE_UUID        "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-// --- LED CONFIGURATION ---
-// Pin 4 is the bright Flash LED next to the SD Card slot
+// --- ESP32-CAM FLASH LED CONFIGURATION ---
+// Pin 4 is the bright white LED on the front. Uses standard logic (HIGH = ON).
 #define LED_PIN 4  
 
 Preferences preferences;
 bool devicePaired = false;
 BLECharacteristic *pCharacteristic;
 
-// Helper function to blink the LED
 void flashLED(int times, int delayMs) {
     for (int i = 0; i < times; i++) {
-        digitalWrite(LED_PIN, HIGH);
+        digitalWrite(LED_PIN, HIGH); // HIGH = ON for Pin 4
         delay(delayMs);
-        digitalWrite(LED_PIN, LOW);
+        digitalWrite(LED_PIN, LOW);  // LOW = OFF
         if (i < times - 1) delay(delayMs);
     }
 }
@@ -51,12 +50,10 @@ class MyCallbacks : public BLECharacteristicCallbacks {
                 return;
             }
 
-            // Visual feedback: 2 fast flashes to prove BLE communication!
+            // Visual feedback: 2 fast white flashes
             flashLED(2, 50);
 
-            // Generate deterministic key anchored by hardware secret + environment
             String finalKey = "3T_HARDWARE_ANCHOR_SECRET_778899-" + envData;
-            
             pCharacteristic->setValue(finalKey.c_str());
             pCharacteristic->notify();
             Serial.println("[BLE] Secure key generated and sent back.");
@@ -67,18 +64,18 @@ class MyCallbacks : public BLECharacteristicCallbacks {
 void setup() {
     Serial.begin(115200);
     
-    // Initialize LED Pin and BOOT button
+    // Initialize LED Pin and turn it OFF to start
     pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
     pinMode(0, INPUT_PULLUP);
 
-    // 1. Boot Indicator: Turn LED ON solid
+    // 1. Boot Indicator: Turn white LED ON solid
     digitalWrite(LED_PIN, HIGH);
     Serial.println("\n--- 3T Token Booting ---");
-    Serial.println("You have 3 seconds to press and hold the BOOT (IO0) button for a Factory Reset...");
     
     bool factoryResetTriggered = false;
     
-    // 2. The Grace Period: Wait 3 seconds, scanning for the BOOT button
+    // 2. The Grace Period: Wait 3 seconds, scanning for the IO0 button
     for (int i = 0; i < 30; i++) {
         if (digitalRead(0) == LOW) {
             factoryResetTriggered = true;
@@ -87,31 +84,28 @@ void setup() {
         delay(100);
     }
     
-    digitalWrite(LED_PIN, LOW); // Turn off the boot indicator LED
+    // Turn off the boot indicator LED
+    digitalWrite(LED_PIN, LOW); 
 
-    // 3. Process the Result
     preferences.begin("3t_storage", false);
 
     if (factoryResetTriggered) {
         Serial.println("[HW] Factory Reset triggered! Wiping pairing state...");
         preferences.clear(); 
         devicePaired = false;
-        
-        // Visual feedback: 10 rapid flashes
         flashLED(10, 40); 
     } else {
         devicePaired = preferences.getBool("paired", false);
         if (devicePaired) {
             Serial.println("[HW] Restored state: Token is ALREADY bound to host from NVS flash.");
-            // Single short blink to show it's alive and paired
             flashLED(1, 100);
         } else {
             Serial.println("[HW] Token is UNPAIRED. Waiting for USB handshake...");
         }
     }
 
-    // Initialize BLE
-    BLEDevice::init("3T-Hardware-Token");
+    // Initialize BLE with V3 name to bypass Windows cache
+    BLEDevice::init("3T-Token-v3");
     BLEServer *pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
@@ -127,26 +121,41 @@ void setup() {
     pCharacteristic->setCallbacks(new MyCallbacks());
     pService->start();
 
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->setMinPreferred(0x06);  
+    pAdvertising->setMinPreferred(0x12);
+    pAdvertising->start();
+    
     Serial.println("BLE Server is running. Waiting for connections...");
 }
 
 void loop() {
-    // Handle Serial (USB) Pairing Command
     if (Serial.available() > 0) {
         String command = Serial.readStringUntil('\n');
         command.trim();
 
-        if (command == "PAIR_DEVICE") {
-            devicePaired = true;
-            preferences.putBool("paired", true); // Save permanently to flash
-            Serial.println("PAIRING_SUCCESS: 3T-Hardware-Token is now bound to this host.");
+        // New Host Binding Logic
+        if (command.startsWith("PAIR_DEVICE:")) {
+            // Extract the unique Host ID sent by Python
+            String hostID = command.substring(12); 
             
-            // Visual feedback: 3 flashes for successful wired pairing
+            devicePaired = true;
+            preferences.putBool("paired", true);
+            preferences.putString("host_id", hostID); // Save specific PC identity
+            
+            Serial.print("PAIRING_SUCCESS: Token bound to Host ID: ");
+            Serial.println(hostID);
+            
+            // Visual feedback: 3 flashes for successful binding
             flashLED(3, 150);
         } 
         else if (command == "CHECK_STATUS") {
             if (devicePaired) {
-                Serial.println("STATUS: PAIRED");
+                String savedHost = preferences.getString("host_id", "UNKNOWN");
+                Serial.print("STATUS: PAIRED to ");
+                Serial.println(savedHost);
             } else {
                 Serial.println("STATUS: UNPAIRED");
             }
