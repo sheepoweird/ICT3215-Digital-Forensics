@@ -116,7 +116,7 @@ void app_main(void) {
     ble_svc_gap_device_name_set(DEVICE_NAME);
 
     ESP_LOGI(TAG, "Bluetooth is currently enabled, name='%s'", DEVICE_NAME);
-    
+    nimble_port_freertos_init(host_task);
     // Redraw whenever the connection state changes
     bool last = !s_connected;
     while (1) {
