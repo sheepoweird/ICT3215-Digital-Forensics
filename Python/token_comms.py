@@ -16,44 +16,57 @@ def get_host_id() -> str:
     return hashlib.sha256(raw_id.encode()).hexdigest()[:8].upper()
 
 def pair_token_usb(com_port: str = "COM3") -> tuple[bool, str]:
-    """Phase 1: Robustly binds the token over USB, waiting for the boot sequence."""
+    """Phase 1: Robustly binds the token over USB by continuously pinging it."""
     host_id = get_host_id()
-    try:
-        with serial.Serial(com_port, 115200, timeout=2.0) as ser:
-            # 1. Opening the port forces the ESP32 to reboot. 
-            # The white LED turns on for a 3-second grace period. We MUST wait for it to finish.
-            time.sleep(3.5)
-            
-            # 2. Clear out all the boot messages (e.g. "Token Booting")
-            ser.reset_input_buffer()
-            
-            # 3. Now that the ESP32 is ready, send the command
-            command = f"PAIR_DEVICE:{host_id}\n".encode("utf-8")
-            ser.write(command)
-            ser.flush()
 
-            # 4. Read the response
-            for _ in range(5):
+    try:
+        # Configure port manually to try and prevent Windows from resetting the board
+        ser = serial.Serial()
+        ser.port = com_port
+        ser.baudrate = 115200
+        ser.timeout = 0.5
+        ser.dtr = False
+        ser.rts = False
+        
+        ser.open()
+        
+        try:
+            command = f"PAIR_DEVICE:{host_id}\n".encode("utf-8")
+            
+            # The ESP32 takes ~5 seconds to fully boot (3s grace + 2s BLE init).
+            # We continuously ping it for up to 10 seconds until it is ready to respond.
+            start_time = time.time()
+            while time.time() - start_time < 10.0:
+                ser.write(command)
+                ser.flush()
+
+                # Read whatever the ESP32 sends back
                 line = ser.readline().decode("utf-8", errors="ignore").strip()
-                
+
                 if "PAIRING_SUCCESS" in line and "BLE_MAC=" in line:
-                    # Parse the MAC address out of the string
-                    mac_address = line.split("BLE_MAC=")[1].split(":UUID=")[0].strip()
+                    # Safely parse the dynamic MAC address
+                    mac_part = line.split("BLE_MAC=")[1].strip()
+                    mac_address = mac_part.split(":UUID=")[0].strip()
                     
-                    # Parse UUID if it was sent dynamically by C++, otherwise use default
+                    # Safely parse the UUID (supports both hardcoded and C++ dynamic versions)
                     char_uuid = line.split("UUID=")[1].strip() if "UUID=" in line else CHARACTERISTIC_UUID
-                    
+
                     config_data = {
                         "ble_mac": mac_address, 
                         "char_uuid": char_uuid,
                         "host_id": host_id
                     }
+                    
+                    # Save it locally so Phase 2 BLE knows exactly who to talk to
                     with open(CONFIG_FILE, "w") as f:
                         json.dump(config_data, f)
                         
                     return True, f"Bound to MAC [{mac_address}]"
-                    
+
             return False, "Token did not reply. Verify PlatformIO monitor is closed."
+        finally:
+            ser.close()
+
     except Exception as e:
         return False, f"Port error: {e}"
 

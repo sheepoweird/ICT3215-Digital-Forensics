@@ -136,29 +136,24 @@ void loop() {
         String command = Serial.readStringUntil('\n');
         command.trim();
 
-        // New Host Binding Logic
         if (command.startsWith("PAIR_DEVICE:")) {
-            // Extract the unique Host ID sent by Python
             String hostID = command.substring(12); 
             
             devicePaired = true;
             preferences.putBool("paired", true);
-            preferences.putString("host_id", hostID); // Save specific PC identity
+            preferences.putString("host_id", hostID);
             
-            Serial.print("PAIRING_SUCCESS: Token bound to Host ID: ");
-            Serial.println(hostID);
+            std::string mac = BLEDevice::getAddress().toString();
             
-            // Visual feedback: 3 flashes for successful binding
+            // Send Host ID, MAC, AND the UUID dynamically
+            Serial.print("PAIRING_SUCCESS:HOST_ID=");
+            Serial.print(hostID);
+            Serial.print(":BLE_MAC=");
+            Serial.print(mac.c_str());
+            Serial.print(":UUID=");
+            Serial.println(CHARACTERISTIC_UUID); // Send the UUID over wire
+            
             flashLED(3, 150);
-        } 
-        else if (command == "CHECK_STATUS") {
-            if (devicePaired) {
-                String savedHost = preferences.getString("host_id", "UNKNOWN");
-                Serial.print("STATUS: PAIRED to ");
-                Serial.println(savedHost);
-            } else {
-                Serial.println("STATUS: UNPAIRED");
-            }
         }
     }
 }
