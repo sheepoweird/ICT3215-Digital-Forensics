@@ -208,11 +208,11 @@ class CollectWorker(QThread):
 
 
 class PairWorker(QThread):
-    done = pyqtSignal(bool)
+    done = pyqtSignal(bool, str)
 
     def run(self):
-        success = pair_token_usb("COM3")
-        self.done.emit(success)
+        success, msg = pair_token_usb("COM3")
+        self.done.emit(success, msg)
 
 
 class EncryptWorker(QThread):
@@ -557,24 +557,24 @@ class MainWindow(QMainWindow):
         self._pair_worker.done.connect(self._on_pairing_done)
         self._pair_worker.start()
 
-    def _on_pairing_done(self, success: bool):
+    def _on_pairing_done(self, success: bool, msg: str):
         if success:
             self._pair_btn.setStyleSheet(
                 "background-color: #1a4731; color: #3fb950; border: 1px solid #2ea043;"
             )
             self._pair_btn.setText("✓  Token Paired")
-            self._status.showMessage("Hardware token successfully paired.")
+            self._status.showMessage(f"Hardware token paired: {msg}")
             QMessageBox.information(
                 self, "Success", 
-                "Wired hardware token pairing successful!\n\nYou can now generate keys and perform encryption via BLE."
+                f"Wired hardware token pairing successful!\n\n{msg}\n\nYou can now generate keys and perform encryption via BLE."
             )
         else:
             self._pair_btn.setEnabled(True)
             self._pair_btn.setText("🔗  Pair Hardware Token")
-            self._status.showMessage("Token pairing failed.")
+            self._status.showMessage(f"Token pairing failed: {msg}")
             QMessageBox.critical(
                 self, "Error", 
-                "Could not pair with the hardware token.\n\nEnsure it is connected via USB to COM3 and no other application (like the VS Code Serial Monitor) is using the port."
+                f"Could not pair with the hardware token.\n\nDetails: {msg}\n\nEnsure it is connected via USB to COM3 and no other application (like the VS Code Serial Monitor) is using the port."
             )
 
     # ─────────────────────────────────────────────────────────────

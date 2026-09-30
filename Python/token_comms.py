@@ -1,107 +1,89 @@
 import asyncio
 import time
+import json
+import os
+import platform
+import hashlib
 import serial
-from bleak import BleakClient, BleakScanner
+from bleak import BleakClient
 
-DEVICE_NAME = "3T-Hardware-Token"
+CONFIG_FILE = "token_config.json"
 CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-def pair_token_usb(com_port="COM3") -> bool:
-    """
-    Handles the wired USB connection with an automatic retry loop to survive boot delays.
-    """
-    try:
-        print(f"[HOST] Connecting to {com_port}...")
-        
-        # --- ESP32 HARDWARE FIX: Prevent the board from being held in reset ---
-        ser = serial.Serial()
-        ser.port = com_port
-        ser.baudrate = 115200
-        ser.timeout = 1
-        ser.dtr = False  # Matches PlatformIO's "forcing DTR inactive"
-        ser.rts = False  # Matches PlatformIO's "forcing RTS inactive"
-        ser.open()
-        # ----------------------------------------------------------------------
-        
-        # Wait for the initial boot cycle
-        time.sleep(2.5) 
-        ser.reset_input_buffer()
+def get_host_id() -> str:
+    """Derives a stable, unique 8-character ID for this specific PC."""
+    raw_id = platform.node() + platform.system()
+    return hashlib.sha256(raw_id.encode()).hexdigest()[:8].upper()
 
-        # Try sending the command up to 5 times
-        for attempt in range(1, 6):
-            print(f"[HOST] Sending PAIR_DEVICE command (Attempt {attempt})...")
-            ser.write(b"PAIR_DEVICE\n")
+def pair_token_usb(com_port: str = "COM3") -> tuple[bool, str]:
+    """Phase 1: Robustly binds the token over USB, waiting for the boot sequence."""
+    host_id = get_host_id()
+    try:
+        with serial.Serial(com_port, 115200, timeout=2.0) as ser:
+            # 1. Opening the port forces the ESP32 to reboot. 
+            # The white LED turns on for a 3-second grace period. We MUST wait for it to finish.
+            time.sleep(3.5)
+            
+            # 2. Clear out all the boot messages (e.g. "Token Booting")
+            ser.reset_input_buffer()
+            
+            # 3. Now that the ESP32 is ready, send the command
+            command = f"PAIR_DEVICE:{host_id}\n".encode("utf-8")
+            ser.write(command)
             ser.flush()
 
-            # Wait up to 1.5 seconds for the ESP32 to reply to this attempt
-            start_time = time.time()
-            while time.time() - start_time < 1.5:
-                if ser.in_waiting:
-                    line = ser.readline().decode('utf-8', errors='ignore').strip()
-                    if line:
-                        print(f"[ESP32 REPLY] {line}")
-                    if "PAIRING_SUCCESS" in line:
-                        ser.close()
-                        print("[HOST] Wired pairing verified.")
-                        return True
+            # 4. Read the response
+            for _ in range(5):
+                line = ser.readline().decode("utf-8", errors="ignore").strip()
+                
+                if "PAIRING_SUCCESS" in line and "BLE_MAC=" in line:
+                    # Parse the MAC address out of the string
+                    mac_address = line.split("BLE_MAC=")[1].split(":UUID=")[0].strip()
+                    
+                    # Parse UUID if it was sent dynamically by C++, otherwise use default
+                    char_uuid = line.split("UUID=")[1].strip() if "UUID=" in line else CHARACTERISTIC_UUID
+                    
+                    config_data = {
+                        "ble_mac": mac_address, 
+                        "char_uuid": char_uuid,
+                        "host_id": host_id
+                    }
+                    with open(CONFIG_FILE, "w") as f:
+                        json.dump(config_data, f)
                         
-        ser.close()
-        print("[HOST] Pairing timed out after 5 attempts.")
-        return False
-        
+                    return True, f"Bound to MAC [{mac_address}]"
+                    
+            return False, "Token did not reply. Verify PlatformIO monitor is closed."
     except Exception as e:
-        print(f"[HOST] USB Pairing error: {e}")
-        return False
+        return False, f"Port error: {e}"
 
-async def request_key_ble(env_variables: str) -> str:
-    """
-    Scans for the 3T token, connects over BLE, and waits for key notification.
-    """
-    print(f"[BLE] Scanning for '{DEVICE_NAME}'...")
-    device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=5.0)
-    
-    if not device:
-        raise ConnectionError(f"Could not find BLE token named '{DEVICE_NAME}'.")
+async def request_key_ble(env_str: str) -> str:
+    """Phase 2: Reads cached MAC/UUID and retrieves the cryptographic key over BLE."""
+    if not os.path.exists(CONFIG_FILE):
+        return "ERROR: NOT_PAIRED"
 
-    file_key = None
-    key_received_event = asyncio.Event()
+    with open(CONFIG_FILE, "r") as f:
+        config = json.load(f)
+        mac_address = config.get("ble_mac")
+        target_uuid = config.get("char_uuid", CHARACTERISTIC_UUID)
 
-    def notification_handler(sender, data):
-        nonlocal file_key
-        file_key = data.decode('utf-8')
-        print(f"[BLE] Received Key from Token: {file_key}")
-        key_received_event.set()
+    if not mac_address:
+        return "ERROR: NOT_PAIRED"
 
-    print(f"[BLE] Connecting to {device.address}...")
-    async with BleakClient(device) as client:
-        # Subscribe to notifications from the ESP32
-        await client.start_notify(CHARACTERISTIC_UUID, notification_handler)
+    received_data = []
+    response_event = asyncio.Event()
 
-        # Send environment variables
-        print(f"[BLE] Sending environment payload: {env_variables}")
-        await client.write_gatt_char(CHARACTERISTIC_UUID, env_variables.encode('utf-8'))
+    def notification_handler(sender, data: bytearray):
+        received_data.append(data.decode("utf-8", errors="ignore"))
+        response_event.set()
 
-        # Wait until notification arrives (timeout after 5 seconds)
-        try:
-            await asyncio.wait_for(key_received_event.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            print("[BLE] Timed out waiting for decryption key.")
-        finally:
-            await client.stop_notify(CHARACTERISTIC_UUID)
-
-    return file_key
-
-if __name__ == "__main__":
-    print("--- 3T Hardware Token Integration Test ---")
-    
-    # 1. Wired Pairing Phase
-    paired = pair_token_usb("COM3")
-    
-    # 2. Wireless Decryption Key Phase
-    if paired:
-        print("\n--- Starting Wireless BLE Key Exchange ---")
-        test_env = "WIFI:SIT_SECURE,RAM:16GB"
-        key = asyncio.run(request_key_ble(test_env))
-        print(f"\nFinal Derived Key: {key}")
-    else:
-        print("\nAborting BLE test: Wired pairing failed.")
+    try:
+        async with BleakClient(mac_address, timeout=7.0) as client:
+            await client.start_notify(target_uuid, notification_handler)
+            await client.write_gatt_char(target_uuid, env_str.encode("utf-8"))
+            await asyncio.wait_for(response_event.wait(), timeout=5.0)
+            await client.stop_notify(target_uuid)
+            return received_data[0] if received_data else "ERROR: NO_RESPONSE"
+    except Exception as e:
+        print(f"[BLE] Connection error: {e}")
+        return ""
