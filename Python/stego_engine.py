@@ -6,10 +6,13 @@ Embeds encrypted payloads in the LSB of each RGB channel value.
 PNG is required for the carrier — JPEG's lossy compression destroys LSB data.
 
 Embedded layout (in LSBs of sequential pixels, RGB channels):
-  Bytes  0–3:   Magic header b"ENVS"
+  Bytes  0–3:   Magic header b"ENV2"
   Bytes  4–7:   Ciphertext length as big-endian uint32
-  Bytes  8–19:  AES-GCM nonce (12 bytes)
-  Bytes 20–N:   AES-256-GCM ciphertext (includes 16-byte tag)
+  Bytes  8–23:  HKDF salt (16 bytes)
+  Bytes 24–35:  AES-GCM nonce (12 bytes)
+  Bytes 36–N:   AES-256-GCM ciphertext (includes 16-byte tag)
+
+The magic and salt are authenticated as GCM associated data.
 
 Team member: Steganography Engine
 ICT3215 Digital Forensics — SIT
@@ -23,15 +26,19 @@ from PIL import Image
 
 
 # Header constants
-MAGIC = b"ENVS"                        # 4-byte magic identifier
-HEADER_SIZE = 4 + 4 + 12              # magic + length + nonce = 20 bytes
-HEADER_BITS = HEADER_SIZE * 8         # 160 bits
+MAGIC = b"ENV2"                        # 4-byte magic identifier
+LEGACY_MAGIC = b"ENVS"                 # v1 images, keyed by the old hardcoded token secret
+SALT_SIZE = 16
+NONCE_SIZE = 12
+GCM_TAG_SIZE = 16
+HEADER_SIZE = 4 + 4 + SALT_SIZE + NONCE_SIZE   # magic + length + salt + nonce = 36 bytes
+HEADER_BITS = HEADER_SIZE * 8                  # 288 bits
 
 
 def get_capacity_bytes(image_path: str) -> int:
     """
     Returns the usable payload capacity in bytes for a given image.
-    Subtracts the 20-byte header overhead.
+    Subtracts the 36-byte header overhead.
     """
     img = Image.open(image_path).convert("RGB")
     w, h = img.size
@@ -39,9 +46,9 @@ def get_capacity_bytes(image_path: str) -> int:
     return max(0, (total_bits // 8) - HEADER_SIZE)
 
 
-def embed(carrier_path: str, nonce: bytes, ciphertext: bytes, output_path: str) -> str:
+def embed(carrier_path: str, salt: bytes, nonce: bytes, ciphertext: bytes, output_path: str) -> str:
     """
-    Embed an encrypted payload (nonce + ciphertext) into a PNG carrier image.
+    Embed an encrypted payload (salt + nonce + ciphertext) into a PNG carrier image.
 
     The carrier is loaded as RGB, the payload bits are written to the LSB
     of each channel byte in raster order. Output is always saved as PNG
@@ -49,6 +56,7 @@ def embed(carrier_path: str, nonce: bytes, ciphertext: bytes, output_path: str) 
 
     Args:
         carrier_path:  Path to the carrier PNG image
+        salt:          16-byte HKDF salt
         nonce:         12-byte AES-GCM nonce
         ciphertext:    Ciphertext with 16-byte GCM tag (from encrypt_payload)
         output_path:   Desired output path (extension forced to .png)
@@ -59,13 +67,16 @@ def embed(carrier_path: str, nonce: bytes, ciphertext: bytes, output_path: str) 
     Raises:
         ValueError if the carrier image is too small for the payload.
     """
-    if len(nonce) != 12:
-        raise ValueError(f"Nonce must be 12 bytes, got {len(nonce)}")
+    if len(salt) != SALT_SIZE:
+        raise ValueError(f"Salt must be {SALT_SIZE} bytes, got {len(salt)}")
+    if len(nonce) != NONCE_SIZE:
+        raise ValueError(f"Nonce must be {NONCE_SIZE} bytes, got {len(nonce)}")
 
     # Build the complete byte sequence to embed
     header = (
         MAGIC +
         struct.pack(">I", len(ciphertext)) +
+        salt +
         nonce
     )
     payload = header + ciphertext
@@ -108,7 +119,7 @@ def embed(carrier_path: str, nonce: bytes, ciphertext: bytes, output_path: str) 
 
 def extract(stego_path: str) -> tuple:
     """
-    Extract the embedded nonce and ciphertext from a stego PNG image.
+    Extract the embedded salt, nonce and ciphertext from a stego PNG image.
 
     Reads the LSBs of RGB channel values in raster order, parses the
     header, and extracts the ciphertext of the length specified in the header.
@@ -117,7 +128,7 @@ def extract(stego_path: str) -> tuple:
         stego_path: Path to the stego PNG image
 
     Returns:
-        (nonce: bytes[12], ciphertext: bytes)
+        (salt: bytes[16], nonce: bytes[12], ciphertext: bytes)
 
     Raises:
         ValueError on missing/invalid magic bytes or corrupted length field.
@@ -132,14 +143,20 @@ def extract(stego_path: str) -> tuple:
             f"(need at least {HEADER_SIZE} bytes capacity)."
         )
 
-    # ── Read 20-byte header ──────────────────────────────────────
+    # ── Read 36-byte header ──────────────────────────────────────
     header_lsbs = (flat[:HEADER_BITS] & np.uint8(1)).astype(np.uint8)
     header_bytes = np.packbits(header_lsbs).tobytes()
 
     magic   = header_bytes[0:4]
     ct_len  = struct.unpack(">I", header_bytes[4:8])[0]
-    nonce   = header_bytes[8:20]
+    salt    = header_bytes[8:8 + SALT_SIZE]
+    nonce   = header_bytes[8 + SALT_SIZE:HEADER_SIZE]
 
+    if magic == LEGACY_MAGIC:
+        raise ValueError(
+            "This image was made by an older EnvStego build that used a hardcoded "
+            "token secret. It is not supported by the secure token protocol."
+        )
     if magic != MAGIC:
         raise ValueError(
             f"No EnvStego payload detected in this image.\n"
@@ -168,7 +185,7 @@ def extract(stego_path: str) -> tuple:
     ct_lsbs    = (flat[ct_start:ct_end] & np.uint8(1)).astype(np.uint8)
     ciphertext = np.packbits(ct_lsbs).tobytes()
 
-    return nonce, ciphertext
+    return salt, nonce, ciphertext
 
 
 def get_image_info(image_path: str) -> dict:
