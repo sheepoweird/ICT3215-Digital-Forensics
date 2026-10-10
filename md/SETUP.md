@@ -72,33 +72,64 @@ This .exe has no dependencies — copy it anywhere on Windows and run it.
 
 ---
 
+## Step 6 — Flash the 3T Token Firmware
+
+The token firmware lives in `ESP32 Files/`. Copy `main.cpp`, `encryption.cpp` and `encryption.h`
+into your PlatformIO project's `src/` folder and upload it. **Close the serial monitor afterwards**:
+pairing needs the COM port.
+
+> Firmware v2 uses a new BLE protocol. Older pairings and stego images made with the
+> hardcoded-secret build will not work. Pair the token again and re-encrypt.
+
+---
+
 ## How to Use the App
 
+Your signal selection, presets, file paths and active tab are remembered across
+refreshes and restarts.
+
+### Tab 4 first: Token
+1. Plug the token in over USB, pick its **serial port** (CH340/CP210x ports are listed first)
+2. Click **Pair Token**. The token generates its master secret with its hardware RNG and
+   gives this PC an auth key, which is stored encrypted with Windows DPAPI
+3. Click **Test connection** to run the authenticated BLE handshake. The USB cable is no longer needed
+- **Forget pairing** deletes only this PC's credentials. Re-pairing later keeps your files decryptable
+- **Factory reset** (hold IO0 while booting) destroys the master secret. Files encrypted with
+  that token become permanently unrecoverable
+
 ### Tab 1: Signals
-- The app automatically scans your machine when it launches
-- Green "Available" badges = signals that could be read
-- Grey "N/A" = not available on this machine (no battery, no Wi-Fi, etc.)
-- Check the signals you want to form the encryption key
-- Click **Test Key** to confirm your environment is stable
-- Note the **fingerprint** (e.g. `D993-8D9E-DA56-3DEA`) — you will need the same environment to decrypt
+- The app scans your machine on launch. **Refresh** re-scans and keeps your selection
+- Pick a **preset** (Device-bound, Location-bound, Hardware only, Everything) or tick signals
+  yourself. Clicking anywhere on a row toggles it, and hovering shows the current value
+- **Save as preset…** stores your own combinations. **Clear selection** unticks everything
+- Click **Test Key** twice. A matching fingerprint (`✓ stable`) means the environment is stable
 
 ### Tab 2: Encrypt
-1. Select your **payload file** (any file — .txt, .pdf, .docx, etc.)
-2. Select a **carrier PNG image** (the image that will hide the data)
-3. Set an **output PNG path** (where the stego image is saved)
-4. Click **Encrypt & Embed**
-5. The output PNG looks identical to the original — the payload is hidden in the LSBs
+1. Choose (or drag in) the **payload file**, then the **carrier PNG**
+2. The output path is suggested automatically (`<carrier>_stego.png`). Change it if you like
+3. **Encrypt & Embed** stays disabled until everything is ready. The hint below it says what is missing
 
 ### Tab 3: Decrypt
-1. Select the **stego PNG** produced by Encrypt
-2. Set an **output file path**
-3. Make sure the **same signals are selected** in Tab 1
-4. Click **Decrypt & Extract**
-5. If you are on a different machine or in a different location → Authentication failed (forensic defense)
+1. Choose the **stego PNG**. The last image you encrypted is filled in for you
+2. Optionally choose a folder. By default the payload is restored next to the stego image,
+   **under its original filename**, and existing files are never overwritten
+3. The same signals (use the same preset) and the same token are required, otherwise
+   authentication fails (forensic defense)
 
-### Tab 4: Inspector
-- Shows raw values of every collected signal
+### Tab 5: Inspector
+- Shows raw values of every collected signal and which ones are in the key
 - Useful for debugging and for the report evaluation section
+
+---
+
+## Security Design (3T token)
+
+| Step | What happens |
+|------|--------------|
+| USB pairing | Token creates `master_secret` (never leaves it), `auth_key` and `token_id` from its hardware RNG. `auth_key` + `token_id` go to the PC (DPAPI-encrypted) |
+| BLE request | HELLO → token sends a fresh nonce. PC sends its own nonce + an AES-GCM request keyed by `HMAC(auth_key, nonces)`. The token replies AES-GCM encrypted under the same session key |
+| Key | `env_key = HMAC(master_secret, SHA-256(signals))` on the token. `file_key = HKDF(env_key, random per-file salt)` on the PC |
+| Defences | Raw signal values never leave the PC. Replays fail (single-use nonces). Impostor tokens/hosts fail the GCM tag. Lockout after 5 bad requests |
 
 ---
 
