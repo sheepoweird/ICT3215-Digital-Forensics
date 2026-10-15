@@ -38,6 +38,7 @@ desktop.ini
 *.egg-info/
 .eggs/
 pip-log.txt
+.pytest_cache/
 
 # ─── Logs ─────────────────────────────────────────────────────
 *.log
