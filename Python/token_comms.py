@@ -182,83 +182,147 @@ def _parse_fields(line: str) -> dict:
     return fields
 
 
-def pair_token_usb(com_port: str) -> tuple[bool, str]:
-    """Binds the token over USB by repeating the pairing command until it answers."""
+# Long enough for a full token start-up (3 s reset window + BLE start) plus one restart
+PAIR_WINDOW_S = 15.0
+
+POWER_MESSAGE = (
+    "The token keeps restarting because this USB port is not giving it enough power.\n"
+    "Its light repeats the start-up blinks but never gives the 2 short 'ready' flashes.\n"
+    "Try a USB port on the back of the PC, a shorter cable, or a powered USB hub."
+)
+
+
+def _friendly_port_error(com_port: str, e: Exception) -> str:
+    text = str(e)
+    if "PermissionError" in text or "Access is denied" in text:
+        return (f"{com_port} is being used by another program, or the token was unplugged.\n"
+                "Close any serial monitor (PlatformIO, Arduino IDE), check the cable, and try again.")
+    if "FileNotFoundError" in text or "cannot find" in text.lower():
+        return f"{com_port} is not available. Is the token plugged in? Click ↻ to rescan the ports."
+    return f"Could not use {com_port}: {text}"
+
+
+def _open_port(com_port: str) -> serial.Serial:
+    ser = serial.Serial()
+    ser.port = com_port
+    ser.baudrate = 115200
+    ser.timeout = 0.5
+    # DTR/RTS low before opening so Windows does not reset the board
+    ser.dtr = False
+    ser.rts = False
+    ser.open()
+    ser.reset_input_buffer()
+    return ser
+
+
+def pair_token_usb(com_port: str, progress=None) -> tuple[bool, str]:
+    """
+    Binds the token over USB by repeating the pairing command until it answers.
+
+    progress, if given, is called with short status lines for the UI. A port that
+    drops mid-exchange (the token resetting, a cable nudge) is reopened within the
+    pairing window, and a token stuck restarting from low power is reported as such.
+    """
+    report = progress or (lambda _msg: None)
     host_id = get_host_id()
     request_id = os.urandom(8).hex()
+    command = f"PAIR_DEVICE:{host_id}:{request_id}\n".encode("utf-8")
 
+    ser = None
+    opened = False
+    open_error = None
+    drops = 0
+    restarts = 0
+    deadline = time.time() + PAIR_WINDOW_S
+    report(f"Connecting to {com_port}…")
     try:
-        # Configure port manually to try and prevent Windows from resetting the board
-        ser = serial.Serial()
-        ser.port = com_port
-        ser.baudrate = 115200
-        ser.timeout = 0.5
-        ser.dtr = False
-        ser.rts = False
+        while time.time() < deadline:
+            if ser is None:
+                try:
+                    ser = _open_port(com_port)
+                except serial.SerialException as e:
+                    open_error = e
+                    time.sleep(0.5)
+                    continue
+                if not opened:
+                    report("Waiting for the token to answer. No buttons need pressing…")
+                opened = True
 
-        ser.open()
-
-        try:
-            ser.reset_input_buffer()
-            command = f"PAIR_DEVICE:{host_id}:{request_id}\n".encode("utf-8")
-
-            # The ESP32 takes ~5 seconds to fully boot (3s grace + 2s BLE init).
-            # We continuously ping it for up to 10 seconds until it is ready to respond.
-            # The token answers a repeated request ID with the same reply, so this is safe.
-            start_time = time.time()
-            while time.time() - start_time < 10.0:
+            try:
+                # The token answers a repeated request ID with the same reply, so repeating is safe
                 ser.write(command)
                 ser.flush()
-
                 line = ser.readline().decode("utf-8", errors="ignore").strip()
-                if not line.startswith("PAIRING_"):
-                    continue
-                fields = _parse_fields(line)
-                if fields.get("REQ") != request_id:
-                    continue
+            except serial.SerialException:
+                drops += 1
+                ser.close()
+                ser = None
+                report("Lost the connection to the token. Reconnecting…")
+                time.sleep(0.5)
+                continue
 
-                if line.startswith("PAIRING_REFUSED"):
-                    if fields.get("REASON") == "BOUND_TO_OTHER_HOST":
-                        return False, (
-                            "This token is already bound to a different PC.\n"
-                            "Hold the IO0 button while it boots to factory reset it. "
-                            "Note: a reset destroys its master secret, so files encrypted "
-                            "with it can never be decrypted again."
-                        )
-                    return False, f"Token refused pairing ({fields.get('REASON', 'unknown')})."
+            if "Brownout detector was triggered" in line:
+                restarts += 1
+                if restarts >= 3:
+                    return False, POWER_MESSAGE
+                report("The token restarted (low power). Still trying…")
+                continue
+            if not line.startswith("PAIRING_"):
+                continue
+            fields = _parse_fields(line)
+            if fields.get("REQ") != request_id:
+                continue
 
-                try:
-                    token_id = bytes.fromhex(fields["TOKEN_ID"])
-                    auth_key = bytes.fromhex(fields["AUTH_KEY"])
-                    mac = fields["BLE_MAC"]
-                except (KeyError, ValueError):
-                    return False, "Token sent an unreadable pairing reply. Is the firmware up to date?"
-                if len(token_id) != TOKEN_ID_LEN or len(auth_key) != 32:
-                    return False, "Token sent invalid key material. Is the firmware up to date?"
+            if line.startswith("PAIRING_REFUSED"):
+                if fields.get("REASON") == "BOUND_TO_OTHER_HOST":
+                    return False, (
+                        "This token is already bound to a different PC.\n"
+                        "Hold the IO0 button while it boots to factory reset it. "
+                        "Note: a reset destroys its master secret, so files encrypted "
+                        "with it can never be decrypted again."
+                    )
+                return False, f"Token refused pairing ({fields.get('REASON', 'unknown')})."
 
-                key_blob, scheme = _protect_secret(auth_key)
-                config = {
-                    "version": CONFIG_VERSION,
-                    "host_id": host_id,
-                    "token_id": token_id.hex(),
-                    "ble_mac": mac,
-                    "char_uuid": fields.get("CHAR_UUID", CHARACTERISTIC_UUID),
-                    "firmware": fields.get("FW", "?"),
-                    "auth_key": key_blob,
-                    "auth_key_protection": scheme,
-                    "paired_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                }
-                with open(CONFIG_FILE, "w") as f:
-                    json.dump(config, f, indent=2)
+            try:
+                token_id = bytes.fromhex(fields["TOKEN_ID"])
+                auth_key = bytes.fromhex(fields["AUTH_KEY"])
+                mac = fields["BLE_MAC"]
+            except (KeyError, ValueError):
+                return False, "Token sent an unreadable pairing reply. Is the firmware up to date?"
+            if len(token_id) != TOKEN_ID_LEN or len(auth_key) != 32:
+                return False, "Token sent invalid key material. Is the firmware up to date?"
 
-                return True, f"Token {token_fingerprint(token_id.hex())} bound (BLE {mac})"
+            report("Token answered. Saving the pairing…")
+            key_blob, scheme = _protect_secret(auth_key)
+            config = {
+                "version": CONFIG_VERSION,
+                "host_id": host_id,
+                "token_id": token_id.hex(),
+                "ble_mac": mac,
+                "char_uuid": fields.get("CHAR_UUID", CHARACTERISTIC_UUID),
+                "firmware": fields.get("FW", "?"),
+                "auth_key": key_blob,
+                "auth_key_protection": scheme,
+                "paired_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(config, f, indent=2)
 
-            return False, "Token did not reply. Verify the PlatformIO serial monitor is closed and the firmware is flashed."
-        finally:
+            return True, f"Token {token_fingerprint(token_id.hex())} bound (BLE {mac})"
+    finally:
+        if ser is not None:
             ser.close()
 
-    except serial.SerialException as e:
-        return False, f"Port error: {e}"
+    if restarts:
+        return False, POWER_MESSAGE
+    if not opened and open_error is not None:
+        return False, _friendly_port_error(com_port, open_error)
+    if drops:
+        return False, (f"The connection to the token kept dropping. Check the cable and close any "
+                       f"other program using {com_port}, then try again.")
+    return False, ("The token did not answer. Check its firmware is flashed and no serial monitor is "
+                   "open. After start-up its light should give 2 short flashes; if it doesn't, see "
+                   "Troubleshooting on this page.")
 
 
 # ── Phase 2: BLE protocol (pure functions, testable without hardware) ──

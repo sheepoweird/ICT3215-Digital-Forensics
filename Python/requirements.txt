@@ -7,3 +7,4 @@ Pillow>=10.0.0
 numpy>=1.26.0
 pyserial
 bleak
+pytest          # only needed to run tests/test_offline.py

@@ -68,6 +68,21 @@ unsigned long lockoutUntil = 0;
 String lastPairRequest = "";
 String lastPairReply = "";
 
+// --- LED STATUS PATTERNS ---
+// Count tells you what happened, length tells you good (short) or bad (long):
+//   Boot window (hold IO0 now)  short blink every 0.5 s for 3 s
+//   Ready, paired               1 short
+//   Ready, unpaired             2 short
+//   Pairing success             3 short
+//   Key served                  2 very fast
+//   Auth failure                1 long
+//   Pairing refused             2 long
+//   Lockout engaged             3 long
+//   Factory reset               10 rapid
+#define PAT_SHORT_MS 150
+#define PAT_LONG_MS  600
+
+// Blocking flash, only used in setup() before BLE is running
 void flashLED(int times, int delayMs) {
     for (int i = 0; i < times; i++) {
         digitalWrite(LED_PIN, HIGH); // HIGH = ON for Pin 4
@@ -75,6 +90,29 @@ void flashLED(int times, int delayMs) {
         digitalWrite(LED_PIN, LOW);  // LOW = OFF
         if (i < times - 1) delay(delayMs);
     }
+}
+
+// Non-blocking patterns: queued from anywhere (including BLE callbacks) and
+// played by updateLED() in loop(), so the BLE stack is never stalled by delay().
+volatile uint8_t ledToggles = 0;
+volatile uint16_t ledOnMs = 0, ledOffMs = 0;
+bool ledIsOn = false;
+unsigned long ledNextMs = 0;
+
+void playPattern(uint8_t count, uint16_t onMs, uint16_t offMs) {
+    ledOnMs = onMs;
+    ledOffMs = offMs;
+    ledIsOn = false;
+    ledNextMs = millis();
+    ledToggles = count * 2;
+}
+
+void updateLED() {
+    if (!ledToggles || (long)(millis() - ledNextMs) < 0) return;
+    ledIsOn = !ledIsOn;
+    digitalWrite(LED_PIN, ledIsOn ? HIGH : LOW);
+    ledNextMs = millis() + (ledIsOn ? ledOnMs : ledOffMs);
+    ledToggles--;
 }
 
 bool loadSecrets() {
@@ -111,8 +149,10 @@ void recordAuthFailure() {
         lockoutUntil = millis() + LOCKOUT_MS;
         authFailures = 0;
         Serial.println("[SEC] Too many failures. Token locked for 30 s.");
+        playPattern(3, PAT_LONG_MS, 300);
+    } else {
+        playPattern(1, PAT_LONG_MS, 0);
     }
-    flashLED(1, 400);
 }
 
 void handleRequest(const uint8_t *data, size_t len) {
@@ -188,7 +228,7 @@ void handleRequest(const uint8_t *data, size_t len) {
 
     if (op == OP_DERIVE) {
         Serial.println("[BLE] Authenticated key request served.");
-        flashLED(2, 50); // Visual feedback: 2 fast white flashes
+        playPattern(2, 50, 80);
     } else {
         Serial.println("[BLE] Authenticated ping served.");
     }
@@ -264,7 +304,7 @@ void handlePairCommand(const String &args) {
         lastPairRequest = reqID;
         lastPairReply = "PAIRING_REFUSED;REQ=" + reqID + ";REASON=BOUND_TO_OTHER_HOST";
         Serial.println(lastPairReply);
-        flashLED(1, 400);
+        playPattern(2, PAT_LONG_MS, 300);
         return;
     }
 
@@ -300,7 +340,7 @@ void handlePairCommand(const String &args) {
                     ";FW=" + String(FIRMWARE_VERSION);
     Serial.println(lastPairReply);
 
-    flashLED(3, 150);
+    playPattern(3, PAT_SHORT_MS, PAT_SHORT_MS);
 }
 
 void setup() {
@@ -311,22 +351,20 @@ void setup() {
     digitalWrite(LED_PIN, LOW);
     pinMode(0, INPUT_PULLUP);
 
-    // 1. Boot Indicator: Turn white LED ON solid
-    digitalWrite(LED_PIN, HIGH);
     Serial.println("\n--- 3T Token Booting ---");
 
     bool factoryResetTriggered = false;
 
-    // 2. The Grace Period: Wait 3 seconds, scanning for the IO0 button
+    // Grace period: 3 seconds scanning for the IO0 button, with a short blink
+    // every 0.5 s to show the factory-reset window is open
     for (int i = 0; i < 30; i++) {
+        digitalWrite(LED_PIN, (i % 5 == 0) ? HIGH : LOW);
         if (digitalRead(0) == LOW) {
             factoryResetTriggered = true;
             break;
         }
         delay(100);
     }
-
-    // Turn off the boot indicator LED
     digitalWrite(LED_PIN, LOW);
 
     preferences.begin("3t_storage", false);
@@ -342,7 +380,6 @@ void setup() {
         devicePaired = loadSecrets();
         if (devicePaired) {
             Serial.println("[HW] Restored state: Token is ALREADY bound to host from NVS flash.");
-            flashLED(1, 100);
         } else {
             Serial.println("[HW] Token is UNPAIRED. Waiting for USB handshake...");
         }
@@ -376,9 +413,14 @@ void setup() {
     pAdvertising->start();
 
     Serial.println("BLE Server is running. Waiting for connections...");
+
+    // Ready: 1 short flash if paired, 2 if waiting for USB pairing
+    playPattern(devicePaired ? 1 : 2, PAT_SHORT_MS, PAT_SHORT_MS);
 }
 
 void loop() {
+    updateLED();
+
     if (Serial.available() > 0) {
         String command = Serial.readStringUntil('\n');
         command.trim();

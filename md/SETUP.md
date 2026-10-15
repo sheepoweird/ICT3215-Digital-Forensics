@@ -81,14 +81,34 @@ pairing needs the COM port.
 > Firmware v2 uses a new BLE protocol. Older pairings and stego images made with the
 > hardcoded-secret build will not work. Pair the token again and re-encrypt.
 
+### Token LED signals
+The count tells you what happened; short flashes are good news, long ones are problems.
+
+| Pattern | Meaning |
+|---------|---------|
+| Short blink every 0.5 s for 3 s | Booting. Hold IO0 now to factory reset |
+| 10 rapid flashes | Factory reset done, all secrets wiped |
+| 1 short | Ready, paired |
+| 2 short | Ready, waiting for USB pairing |
+| 3 short | Pairing succeeded |
+| 2 very fast | Key request served |
+| 1 long | Rejected a bad request |
+| 2 long | Pairing refused (bound to another PC) |
+| 3 long | Locked out for 30 s after 5 bad requests |
+
+If the boot blink keeps repeating, the token is resetting itself, usually because the
+USB port can't supply enough power when Bluetooth starts. Try a rear USB port or a powered hub.
+
 ---
 
 ## How to Use the App
 
-Your signal selection, presets, file paths and active tab are remembered across
+The sidebar groups the pages by workflow (Setup → Protect → Diagnostics) and shows each
+page's status at a glance: token paired, signals selected, Encrypt/Decrypt ready.
+Your signal selection, presets, file paths and active page are remembered across
 refreshes and restarts.
 
-### Tab 4 first: Token
+### Setup › Token (do this first)
 1. Plug the token in over USB, pick its **serial port** (CH340/CP210x ports are listed first)
 2. Click **Pair Token**. The token generates its master secret with its hardware RNG and
    gives this PC an auth key, which is stored encrypted with Windows DPAPI
@@ -97,26 +117,26 @@ refreshes and restarts.
 - **Factory reset** (hold IO0 while booting) destroys the master secret. Files encrypted with
   that token become permanently unrecoverable
 
-### Tab 1: Signals
+### Setup › Signals
 - The app scans your machine on launch. **Refresh** re-scans and keeps your selection
 - Pick a **preset** (Device-bound, Location-bound, Hardware only, Everything) or tick signals
   yourself. Clicking anywhere on a row toggles it, and hovering shows the current value
 - **Save as preset…** stores your own combinations. **Clear selection** unticks everything
 - Click **Test Key** twice. A matching fingerprint (`✓ stable`) means the environment is stable
 
-### Tab 2: Encrypt
+### Protect › Encrypt
 1. Choose (or drag in) the **payload file**, then the **carrier PNG**
 2. The output path is suggested automatically (`<carrier>_stego.png`). Change it if you like
 3. **Encrypt & Embed** stays disabled until everything is ready. The hint below it says what is missing
 
-### Tab 3: Decrypt
+### Protect › Decrypt
 1. Choose the **stego PNG**. The last image you encrypted is filled in for you
 2. Optionally choose a folder. By default the payload is restored next to the stego image,
    **under its original filename**, and existing files are never overwritten
 3. The same signals (use the same preset) and the same token are required, otherwise
    authentication fails (forensic defense)
 
-### Tab 5: Inspector
+### Diagnostics › Inspector
 - Shows raw values of every collected signal and which ones are in the key
 - Useful for debugging and for the report evaluation section
 
