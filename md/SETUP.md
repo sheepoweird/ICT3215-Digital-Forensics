@@ -124,21 +124,60 @@ refreshes and restarts.
 - **Save as preset…** stores your own combinations. **Clear selection** unticks everything
 - Click **Test Key** twice. A matching fingerprint (`✓ stable`) means the environment is stable
 
+### Privacy mode (sidebar, on by default)
+Leaves a forensic examiner less to find. While it is on:
+- file paths are **not** remembered between sessions (otherwise the registry would record
+  exactly which image hides a payload and the original file's name)
+- the stego image **copies the carrier's date**, so it blends into a photo library instead
+  of showing a fresh timestamp
+- outputs default to your **Pictures** (stego image) and **Downloads** (recovered file) folders
+
+Turn it off if you prefer the app to remember your recent files and save next to the carrier.
+
+### Portable mode (Signals page)
+For when you move around a lot. With it on, only signals that **travel with this PC**
+(hardware and OS) can be selected; **network/location** signals are disabled and shown
+as *Off · portable*. The file is then bound to this laptop and the token, not to a place,
+so you can encrypt at home and decrypt in a café on the same machine.
+
+It is less location-specific (anyone with this exact laptop + the token could open the
+file), so leave it **off** if you want a file that only opens in one place — use the
+*Location-bound* preset instead.
+
 ### Protect › Encrypt
-1. Choose (or drag in) the **payload file**, then the **carrier PNG**
-2. The output path is suggested automatically (`<carrier>_stego.png`). Change it if you like
-3. **Encrypt & Embed** stays disabled until everything is ready. The hint below it says what is missing
+1. Choose (or drag in) the **file** to hide — or click **Folder…** to hide a whole folder
+   (it is zipped into the carrier and restored as a folder on decrypt). Then pick the
+   **carrier**: a **PNG image** or a **WAV audio** file (both are lossless, so the hidden
+   bits survive — JPEG/MP3 would destroy them)
+2. The output path is suggested automatically (`<carrier>_stego.png` or `.wav`, matching the
+   carrier). Change it if you like
+3. **Split across several carriers** (checkbox): for a payload too big for one carrier, tick
+   this and add several PNGs/WAVs (browse, or **drag them onto the list**). The data is
+   spread across them, each piece carrying a
+   token-encrypted tag so only your token can tell the set apart or put it back together.
+   Pick an output folder; one stego file is written per carrier used
+4. **Encrypt & Embed** stays disabled until everything is ready. The hint below it says what is missing
+5. After it succeeds, **Shred original** overwrites and deletes the source file so the plaintext
+   does not linger. The encrypted copy is kept. (On SSDs and USB flash, overwriting cannot
+   guarantee the data is unrecoverable — the surest protection is to keep originals only on media
+   you fully control.)
 
 ### Protect › Decrypt
-1. Choose the **stego PNG**. The last image you encrypted is filled in for you
-2. Optionally choose a folder. By default the payload is restored next to the stego image,
+1. Choose the **stego carrier** (PNG or WAV). The last one you encrypted is filled in for you
+2. For a payload split across several carriers, tick **This file was split across several
+   images** and add the whole set — the app regroups and reorders them with the token. If a
+   carrier is missing it tells you which pieces are absent
+3. Optionally choose a folder. By default the payload is restored next to the stego carrier,
    **under its original filename**, and existing files are never overwritten
-3. The same signals (use the same preset) and the same token are required, otherwise
+4. The same signals (use the same preset) and the same token are required, otherwise
    authentication fails (forensic defense)
 
 ### Diagnostics › Inspector
 - Shows raw values of every collected signal and which ones are in the key
 - Useful for debugging and for the report evaluation section
+- **Hide sensitive values** (checkbox): masks the raw identifiers (disk serial, machine
+  GUID, SID, …) as e.g. `WD••••••H3`, so the page is safe to screenshot for a report
+  without exposing this machine's real hardware IDs. Untick it to read the values locally
 
 ---
 
@@ -155,10 +194,14 @@ refreshes and restarts.
 
 ## Important Notes
 
-- **Always use PNG** as the carrier image — JPEG recompression destroys LSB data
-- The stego image is visually identical to the carrier (max 1-bit difference per channel)
-- Minimum carrier image size: ~200×200 px for small payloads
-- **Rule of thumb for capacity:** a 1920×1080 PNG holds ~759 KB of payload
+- **Use a lossless carrier** — PNG for images, uncompressed PCM WAV for audio. JPEG, MP3
+  and other lossy formats recompress the data and destroy the hidden LSBs
+- The stego carrier is perceptually identical to the original (max 1-bit change per channel /
+  per audio sample)
+- Minimum carrier size: ~200×200 px image, or a WAV a few seconds long, for small payloads
+- **Rule of thumb for capacity:** a 1920×1080 PNG holds ~759 KB; a 16-bit stereo WAV holds
+  ~1 byte per 8 samples (~10.6 KB per second at 44.1 kHz). For bigger files, split across
+  several carriers
 
 ---
 
@@ -167,8 +210,11 @@ refreshes and restarts.
 envstego/
 ├── main.py            ← Entry point (run this)
 ├── signals.py         ← Environment signal collection (22 signals)
-├── crypto_engine.py   ← HKDF key derivation + AES-256-GCM
-├── stego_engine.py    ← LSB steganography (embed/extract)
+├── crypto_engine.py   ← HKDF key derivation + AES-256-GCM + v3 header/shard crypto
+├── stego_engine.py    ← LSB steganography for PNG images
+├── audio_engine.py    ← LSB steganography for WAV audio
+├── media.py           ← Carrier dispatcher (routes PNG vs WAV by extension)
+├── multi_image.py     ← Split one payload across several carriers (+ rejoin)
 ├── ui_main.py         ← Full PyQt6 user interface
 ├── requirements.txt   ← pip dependencies
 ├── build.bat          ← Build EnvStego.exe

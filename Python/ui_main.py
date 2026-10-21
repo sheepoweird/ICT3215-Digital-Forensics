@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QCheckBox, QProgressBar, QFileDialog, QTextEdit, QButtonGroup,
     QScrollArea, QFrame, QTableWidget, QTableWidgetItem, QLineEdit, QStatusBar,
     QGridLayout, QHeaderView, QMessageBox, QComboBox, QInputDialog, QToolButton,
-    QApplication,
+    QApplication, QListWidget, QListWidgetItem,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QUrl, QPointF, QTimer
 from PyQt6.QtGui import QColor, QDesktopServices, QPainter, QPainterPath, QPen, QPixmap
@@ -39,8 +39,16 @@ from signals import EnvSignal, collect_all_signals
 from crypto_engine import (
     derive_env_key, encrypt_payload, decrypt_payload, estimate_entropy_bits,
     pack_payload, unpack_payload, packed_size,
+    request_index_key, pack_header, unpack_header, OUTER_SIZE, PAYLOAD_AAD,
+    SHARD_OUTER_SIZE, KIND_FILE, KIND_FOLDER, payload_kind,
 )
-from stego_engine import embed, extract, get_image_info, MAGIC
+import multi_image as mi
+import media
+from archive import zip_folder, safe_extract_zip
+from stego_engine import extract, MAGIC, LEGACY_MAGIC
+from media import embed_blob, extract_lsb_bytes, lsb_capacity_bytes
+from winutils import pictures_dir, downloads_dir
+from winutils import protect_str, unprotect_str
 from cryptography.exceptions import InvalidTag
 from token_comms import (
     pair_token_usb, ping_token, load_config, forget_pairing, list_serial_ports,
@@ -189,6 +197,16 @@ QLineEdit:read-only { color: #c9d1d9; }
 QLineEdit#drop { border: 1px dashed #3d444d; }
 QLineEdit#drop[filled="true"] { border: 1px solid #30363d; }
 QLineEdit#drop[dragging="true"] { border: 1px dashed #2f81f7; background-color: #0f1d33; }
+QListWidget#carrier_list {
+    background-color: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 4px;
+    color: #c9d1d9;
+    outline: none;
+}
+QListWidget#carrier_list::item { padding: 4px 6px; border-radius: 4px; }
+QListWidget#carrier_list::item:selected { background: #1f6feb; color: #ffffff; }
 QComboBox:hover { border-color: #484f58; }
 QComboBox:disabled { color: #484f58; }
 QComboBox::drop-down { border: none; width: 26px; }
@@ -254,6 +272,8 @@ QWidget#signal_row[checked="true"] {
 }
 QLabel#sig_name { color: #e6edf3; font-weight: 600; }
 QLabel#sig_name[readable="false"] { color: #6e7681; }
+QWidget#signal_row[blocked="true"] QLabel#sig_name { color: #545d68; }
+QWidget#signal_row[blocked="true"] QLabel#sig_desc { color: #3d444d; }
 QLabel#sig_desc { color: #6e7681; font-size: 11px; }
 QLabel#badge_ok {
     background: #12261e; color: #3fb950; border: 1px solid #238636;
@@ -408,7 +428,7 @@ class PingWorker(QThread):
 
 
 class TestKeyWorker(QThread):
-    done  = pyqtSignal(str)
+    done  = pyqtSignal(str, dict)   # fingerprint, {signal id: (name, live value)}
     error = pyqtSignal(str)
 
     def __init__(self, selected_ids):
@@ -422,7 +442,8 @@ class TestKeyWorker(QThread):
                 self.error.emit("Unreadable: " + ", ".join(s.name for s in missing))
                 return
             _, fp = derive_env_key(selected)
-            self.done.emit(fp)
+            snapshot = {s.id: (s.name, s.value) for s in selected}
+            self.done.emit(fp, snapshot)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -431,12 +452,13 @@ class EncryptWorker(QThread):
     done  = pyqtSignal(str, str, str)
     error = pyqtSignal(str)
 
-    def __init__(self, selected_ids, carrier, payload_path, output_path):
+    def __init__(self, selected_ids, carriers, payload_path, outputs, match_timestamps=False):
         super().__init__()
         self._selected_ids = set(selected_ids)
-        self._carrier      = carrier
+        self._carriers     = list(carriers)   # one carrier = single image; several = split
         self._payload      = payload_path
-        self._output       = output_path
+        self._outputs      = list(outputs)
+        self._match_timestamps = match_timestamps
 
     def run(self):
         try:
@@ -449,25 +471,60 @@ class EncryptWorker(QThread):
                 )
                 return
 
-            with open(self._payload, "rb") as f:
-                plaintext = f.read()
+            # A folder is zipped into one payload; a single file is used as-is.
+            if os.path.isdir(self._payload):
+                raw = zip_folder(self._payload)
+                plaintext_blob = pack_payload(self._payload, raw, kind=KIND_FOLDER)
+                src_desc = f"{Path(self._payload).name}{os.sep}  (folder, zipped to {len(raw):,} bytes)"
+            else:
+                with open(self._payload, "rb") as f:
+                    raw = f.read()
+                plaintext_blob = pack_payload(self._payload, raw, kind=KIND_FILE)
+                src_desc = f"{Path(self._payload).name}  ({len(raw):,} bytes)"
 
             env_key, fp = derive_env_key(selected)
-            salt, nonce, ct = encrypt_payload(pack_payload(self._payload, plaintext), env_key, MAGIC)
-            out_path = embed(self._carrier, salt, nonce, ct, self._output)
+            index_key = request_index_key()
+            salt, nonce, ct = encrypt_payload(plaintext_blob, env_key, PAYLOAD_AAD)
+            # The header stores the signal IDs, encrypted under the token-only index key
+            header = pack_header(index_key, salt, nonce, len(ct), sorted(s.id for s in selected))
+            blob = header + ct
+
+            if len(self._carriers) > 1:
+                written = mi.split_embed(index_key, blob, self._carriers, self._outputs,
+                                         match_timestamps=self._match_timestamps)
+                carrier_desc = f"{len(written)} images (split)"
+                out_desc = "\n                 ".join(written)
+                first_out = written[0]
+            else:
+                first_out = embed_blob(self._carriers[0], blob, self._outputs[0],
+                                       match_timestamps=self._match_timestamps)
+                written = [first_out]
+                carrier_desc = Path(self._carriers[0]).name
+                out_desc = first_out
 
             self.done.emit(
                 f"Payload embedded successfully\n"
-                f"  Signals used:  {len(selected)} (collected live at encrypt time)\n"
-                f"  Payload:       {Path(self._payload).name}  ({len(plaintext):,} bytes)\n"
+                f"  Signals used:  {len(selected)} (stored encrypted in the image header)\n"
+                f"  Payload:       {src_desc}\n"
                 f"  Encrypted to:  {len(ct):,} bytes  (AES-256-GCM, per-file HKDF salt)\n"
-                f"  Carrier:       {Path(self._carrier).name}\n"
-                f"  Output:        {out_path}",
+                f"  Carrier:       {carrier_desc}\n"
+                f"  Output:        {out_desc}",
                 fp,
-                out_path
+                first_out
             )
         except Exception as e:
             self.error.emit(str(e))
+
+
+def _folder_size(folder: str) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(folder):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
 
 
 def _unique_path(folder: str, name: str) -> Path:
@@ -479,60 +536,173 @@ def _unique_path(folder: str, name: str) -> Path:
     return p
 
 
-class DecryptWorker(QThread):
-    done  = pyqtSignal(str, str, str, bytes)
-    error = pyqtSignal(str)
+ENV_MISMATCH_MSG = (
+    "Decryption failed — Authentication tag mismatch\n\n"
+    "The key rebuilt here does not match the one used during encryption:\n"
+    "  • Different signal selection  →  check the Signals page / preset\n"
+    "  • Different network   →  BSSID/gateway signals changed\n"
+    "  • Different machine   →  hardware serials changed\n"
+    "  • Different token     →  token reset or another token paired\n"
+    "  • Forensic lab/clone  →  no live environment signals\n\n"
+    "The payload is mathematically unrecoverable in this environment."
+)
 
-    def __init__(self, selected_ids, stego_path, output_dir):
+
+class DecryptWorker(QThread):
+    done         = pyqtSignal(str, str, str, bytes)
+    error        = pyqtSignal(str)
+    signals_used = pyqtSignal(list)   # IDs read from a v3 header, so the UI can show them
+
+    def __init__(self, selected_ids, stego_paths, output_dir):
         super().__init__()
         self._selected_ids = set(selected_ids)
-        self._stego        = stego_path
+        self._stego_paths  = [stego_paths] if isinstance(stego_paths, str) else list(stego_paths)
+        self._stego        = self._stego_paths[0] if self._stego_paths else ""
         self._output_dir   = output_dir
 
     def run(self):
         try:
-            # Parse the image first so a wrong file fails before contacting the token
-            salt, nonce, ct = extract(self._stego)
-
-            selected, missing = _resolve_selection(self._selected_ids)
-            if missing:
-                self.error.emit(
-                    "Environment mismatch — these selected signals cannot be read here:\n  "
-                    + "\n  ".join(s.name for s in missing)
-                    + "\n\nThe key cannot be rebuilt without them (forensic defense active)."
-                )
+            if len(self._stego_paths) > 1:
+                self._decrypt_multi()        # a payload split across several images
                 return
 
-            env_key, fp = derive_env_key(selected)
-            name, data = unpack_payload(decrypt_payload(salt, nonce, ct, env_key, MAGIC))
+            cap = lsb_capacity_bytes(self._stego)
+            if cap < 4:
+                self.error.emit("This image is too small to contain an EnvStego payload.")
+                return
+            marker = extract_lsb_bytes(self._stego, 4)
 
-            out_dir = self._output_dir or str(Path(self._stego).parent)
+            if marker == LEGACY_MAGIC:
+                self.error.emit(
+                    "This image was made by an older EnvStego build that used a hardcoded "
+                    "token secret. It is not supported by the secure token protocol.")
+                return
+            if marker == MAGIC:
+                self._decrypt_v2()           # legacy ENV2 image, uses the page's selection
+            else:
+                self._decrypt_v3(cap)        # current format, signals read from the header
+        except InvalidTag:
+            self.error.emit(ENV_MISMATCH_MSG)
+        except Exception as e:
+            self.error.emit(str(e))
+
+    # -- current format: token-encrypted header, signals auto-detected -------------
+    def _decrypt_v3(self, cap: int):
+        if cap < OUTER_SIZE:
+            self.error.emit("No EnvStego payload detected in this image.")
+            return
+        index_key = request_index_key()          # token round-trip 1
+        try:
+            salt, nonce, ct_len, ids = unpack_header(index_key, extract_lsb_bytes(self._stego, OUTER_SIZE))
+        except InvalidTag:
+            # The header did not decrypt. Before blaming the token, check whether this
+            # image is actually one piece of a split set — a common mistake is to pick a
+            # single shard without enabling split mode.
+            try:
+                _mid, _idx, total, _slen = mi.inspect_shard(index_key, self._stego)
+            except InvalidTag:
+                total = None
+            if total:
+                self.error.emit(
+                    f"This carrier is one piece of a set split across {total} carriers.\n\n"
+                    "Tick “This file was split across several images” and add the whole "
+                    "set (all its stego files) to recover the payload.")
+                return
+            self.error.emit(
+                "No EnvStego payload here, or this is not the token that made it.\n\n"
+                "The image header could not be decrypted. Check you selected a stego image "
+                "from this tool and that the paired token is the one used to create it.")
+            return
+        if ct_len <= 0 or ct_len > cap - OUTER_SIZE:
+            self.error.emit("The image header is corrupted or the image was recompressed.")
+            return
+        ct = extract_lsb_bytes(self._stego, OUTER_SIZE + ct_len)[OUTER_SIZE:]
+        self._finish_v3(salt, nonce, ids, ct, "read from the image header")
+
+    # -- current format, split across several images -------------------------------
+    def _decrypt_multi(self):
+        index_key = request_index_key()          # token round-trip 1
+        try:
+            blob = mi.join_extract(index_key, self._stego_paths)   # regroup + order the shards
+        except InvalidTag:
+            self.error.emit(
+                "These are not EnvStego split images, or this is not the token that made them.\n\n"
+                "Check you selected stego images from this tool and that the paired token is the "
+                "one used to create them.")
+            return
+        try:
+            salt, nonce, ct_len, ids = unpack_header(index_key, blob[:OUTER_SIZE])
+        except InvalidTag:
+            self.error.emit("The reassembled header could not be decrypted — a shard may be corrupted.")
+            return
+        if ct_len <= 0 or OUTER_SIZE + ct_len > len(blob):
+            self.error.emit("The reassembled payload is incomplete or corrupted.")
+            return
+        ct = blob[OUTER_SIZE:OUTER_SIZE + ct_len]
+        self._finish_v3(salt, nonce, ids, ct,
+                        f"read from the header of {len(self._stego_paths)} split images")
+
+    def _finish_v3(self, salt, nonce, ids, ct, how):
+        """Shared tail for both v3 paths: collect the named signals, derive the key, decrypt."""
+        fresh = {s.id: s for s in collect_all_signals()}
+        selected, missing = [], []
+        for sid in ids:
+            s = fresh.get(sid)
+            if s is not None and s.available and s.value:
+                selected.append(s)
+            else:
+                missing.append(s.name if s is not None else sid)
+        if missing:
+            self.error.emit(
+                "Environment mismatch — the image needs these signals, which cannot be read here:\n  "
+                + "\n  ".join(missing)
+                + "\n\nThe key cannot be rebuilt without them (forensic defense active).")
+            return
+        self.signals_used.emit([s.id for s in selected])
+
+        env_key, fp = derive_env_key(selected)   # token round-trip 2
+        blob = decrypt_payload(salt, nonce, ct, env_key, PAYLOAD_AAD)
+        name, data = unpack_payload(blob)
+        self._save_and_report(name, data, payload_kind(blob), fp, len(selected), how)
+
+    # -- legacy ENV2 format: signals come from the page's selection ----------------
+    def _decrypt_v2(self):
+        salt, nonce, ct = extract(self._stego)
+        selected, missing = _resolve_selection(self._selected_ids)
+        if not selected:
+            self.error.emit("This older image needs you to select, on the Signals page, the "
+                            "same signals used to encrypt it.")
+            return
+        if missing:
+            self.error.emit(
+                "Environment mismatch — these selected signals cannot be read here:\n  "
+                + "\n  ".join(s.name for s in missing)
+                + "\n\nThe key cannot be rebuilt without them (forensic defense active).")
+            return
+        env_key, fp = derive_env_key(selected)
+        blob = decrypt_payload(salt, nonce, ct, env_key, MAGIC)
+        name, data = unpack_payload(blob)
+        self._save_and_report(name, data, payload_kind(blob), fp, len(selected), "collected live at decrypt time")
+
+    def _save_and_report(self, name, data, kind, fp, n_signals, how):
+        out_dir = self._output_dir or str(Path(self._stego).parent)
+        if kind == KIND_FOLDER:
+            folder = _unique_path(out_dir, name)
+            written = safe_extract_zip(data, str(folder))   # zip-slip protected
+            recovered = f"folder {name}{os.sep}  ({len(written)} file{'s' if len(written) != 1 else ''})"
+            saved = str(folder)
+        else:
             out_path = _unique_path(out_dir, name)
             with open(out_path, "wb") as f:
                 f.write(data)
-
-            self.done.emit(
-                f"Payload extracted and decrypted\n"
-                f"  Signals used: {len(selected)} (collected live at decrypt time)\n"
-                f"  Recovered:    {name}  ({len(data):,} bytes)\n"
-                f"  Saved to:     {out_path}",
-                fp,
-                str(out_path),
-                data
-            )
-        except InvalidTag:
-            self.error.emit(
-                "Decryption failed — Authentication tag mismatch\n\n"
-                "The key rebuilt here does not match the one used during encryption:\n"
-                "  • Different signal selection  →  check the Signals page / preset\n"
-                "  • Different network   →  BSSID/gateway signals changed\n"
-                "  • Different machine   →  hardware serials changed\n"
-                "  • Different token     →  token reset or another token paired\n"
-                "  • Forensic lab/clone  →  no live environment signals\n\n"
-                "The payload is mathematically unrecoverable in this environment."
-            )
-        except Exception as e:
-            self.error.emit(str(e))
+            recovered = f"{name}  ({len(data):,} bytes)"
+            saved = str(out_path)
+        self.done.emit(
+            f"Payload extracted and decrypted\n"
+            f"  Signals used: {n_signals} ({how})\n"
+            f"  Recovered:    {recovered}\n"
+            f"  Saved to:     {saved}",
+            fp, saved, data)
 
 
 # ─── REUSABLE WIDGETS ────────────────────────────────────────────────────────
@@ -582,10 +752,12 @@ class FilePicker(QWidget):
     last_dir = ""   # shared across pickers so Browse opens where the user last was
 
     def __init__(self, label: str, mode: str = "open", filter_: str = "All Files (*.*)",
-                 placeholder: str = "Select or drop a file…", parent=None, step: int | None = None):
+                 placeholder: str = "Select or drop a file…", parent=None, step: int | None = None,
+                 allow_dir: bool = False):
         super().__init__(parent)
         self._mode   = mode
         self._filter = filter_
+        self._allow_dir = allow_dir   # also offer a "Folder…" button (payload can be a folder)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(6)
@@ -626,7 +798,21 @@ class FilePicker(QWidget):
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.clicked.connect(self._browse)
         row.addWidget(btn)
+        if allow_dir:
+            folder_btn = QPushButton("Folder…")
+            folder_btn.setMinimumWidth(80)
+            folder_btn.setMinimumHeight(36)
+            folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            folder_btn.setToolTip("Hide a whole folder (it is zipped into the image)")
+            folder_btn.clicked.connect(self._browse_folder)
+            row.addWidget(folder_btn)
         outer.addLayout(row)
+
+    def _browse_folder(self):
+        start = self.path() or FilePicker.last_dir
+        path = QFileDialog.getExistingDirectory(self, "Choose Folder to hide", start)
+        if path:
+            self.set_path(path)
 
     def _on_text(self, text: str):
         self._clear_btn.setVisible(bool(text))
@@ -653,6 +839,143 @@ class FilePicker(QWidget):
         if p:
             FilePicker.last_dir = p if self._mode == "dir" else os.path.dirname(p)
         self.path_edit.setText(p)
+
+
+class _DropListWidget(QListWidget):
+    """A list that also accepts files dragged in from Explorer."""
+    dropped = pyqtSignal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragMoveEvent(e)
+
+    def dropEvent(self, e):
+        if e.mimeData().hasUrls():
+            paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+            if paths:
+                self.dropped.emit(paths)
+                e.acceptProposedAction()
+                return
+        super().dropEvent(e)
+
+
+class MultiFilePicker(QWidget):
+    """A labelled list of image paths with Add / Remove / Clear, for multi-image split."""
+    changed = pyqtSignal()
+
+    def __init__(self, label: str, filter_: str = "PNG Images (*.png)", step: int | None = None,
+                 parent=None):
+        super().__init__(parent)
+        self._filter = filter_
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        if step is not None:
+            num = QLabel(str(step))
+            num.setObjectName("step_num")
+            num.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            head.addWidget(num)
+        lbl = QLabel(label)
+        lbl.setObjectName("field_label")
+        head.addWidget(lbl)
+        head.addStretch()
+        self._count_lbl = QLabel("none")
+        self._count_lbl.setObjectName("subtle")
+        head.addWidget(self._count_lbl)
+        outer.addLayout(head)
+
+        self._list = _DropListWidget()
+        self._list.setObjectName("carrier_list")
+        self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._list.setMinimumHeight(96)
+        self._list.setMaximumHeight(150)
+        self._list.setToolTip("Drop PNG/WAV files here, or use Add images…")
+        self._list.dropped.connect(self._on_dropped)
+        outer.addWidget(self._list)
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        add = QPushButton("Add images…")
+        add.setMinimumHeight(32)
+        add.setCursor(Qt.CursorShape.PointingHandCursor)
+        add.clicked.connect(self._add)
+        rm = QPushButton("Remove")
+        rm.setMinimumHeight(32)
+        rm.setCursor(Qt.CursorShape.PointingHandCursor)
+        rm.clicked.connect(self._remove_selected)
+        clr = QPushButton("Clear")
+        clr.setMinimumHeight(32)
+        clr.setCursor(Qt.CursorShape.PointingHandCursor)
+        clr.clicked.connect(self.clear)
+        row.addWidget(add)
+        row.addWidget(rm)
+        row.addWidget(clr)
+        row.addStretch()
+        outer.addLayout(row)
+
+    def _add(self):
+        start = FilePicker.last_dir
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add carrier images", start, self._filter)
+        if paths:
+            FilePicker.last_dir = os.path.dirname(paths[-1])
+            self._add_paths(*paths)
+
+    def _on_dropped(self, paths):
+        # Only accept carrier files (PNG/WAV); ignore folders and other junk drops.
+        good = [p for p in paths if os.path.isfile(p) and media.is_carrier(p)]
+        if good:
+            self._add_paths(*good)
+
+    def _add_paths(self, *paths):
+        """Add paths to the list, skipping duplicates. Also used by tests (no dialog)."""
+        existing = set(self.paths())
+        added = False
+        for p in paths:
+            p = os.path.normpath(p)
+            if p not in existing:
+                item = QListWidgetItem(os.path.basename(p))
+                item.setToolTip(p)
+                item.setData(Qt.ItemDataRole.UserRole, p)
+                self._list.addItem(item)
+                existing.add(p)
+                added = True
+        if added:
+            self._update()
+
+    def _remove_selected(self):
+        for item in self._list.selectedItems():
+            self._list.takeItem(self._list.row(item))
+        self._update()
+
+    def clear(self):
+        self._list.clear()
+        self._update()
+
+    def _update(self):
+        n = self._list.count()
+        self._count_lbl.setText("none" if n == 0 else f"{n} image{'s' if n != 1 else ''}")
+        self.changed.emit()
+
+    def paths(self) -> list[str]:
+        return [self._list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self._list.count())]
+
+    def count(self) -> int:
+        return self._list.count()
 
 
 class StatusPanel(QLabel):
@@ -698,12 +1021,18 @@ class StatusPanel(QLabel):
         self.setVisible(False)
 
 
+def _travel_safe(signal: EnvSignal) -> bool:
+    """A signal that does not change when the user moves location or network."""
+    return signal.category != "Network"
+
+
 class SignalRow(QWidget):
     toggled = pyqtSignal(str, bool)
 
-    def __init__(self, signal: EnvSignal, selected: bool, parent=None):
+    def __init__(self, signal: EnvSignal, selected: bool, parent=None, blocked: bool = False):
         super().__init__(parent)
         self._signal = signal
+        self._blocked = blocked      # disabled by portable mode (volatile signal)
         self.setObjectName("signal_row")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._build()
@@ -751,8 +1080,14 @@ class SignalRow(QWidget):
         layout.addWidget(self._badge)
 
         sig = self._signal
-        self._cb.setEnabled(self.readable)
-        if self.readable:
+        self._cb.setEnabled(self.readable and not self._blocked)
+        if self._blocked:
+            self._badge.setText("Off · portable")
+            self._badge.setObjectName("badge_na")
+            self.setToolTip("Disabled in portable mode — this signal changes when you move "
+                            "location or network.")
+            self.setProperty("blocked", True)
+        elif self.readable:
             self._badge.setText("Available")
             self._badge.setObjectName("badge_ok")
             self.setToolTip(f"Current value:\n{sig.value}")
@@ -769,7 +1104,7 @@ class SignalRow(QWidget):
 
     def mousePressEvent(self, e):
         # The whole row is a click target, not just the tiny checkbox
-        if self.readable and e.button() == Qt.MouseButton.LeftButton:
+        if self.readable and not self._blocked and e.button() == Qt.MouseButton.LeftButton:
             self._cb.toggle()
         super().mousePressEvent(e)
 
@@ -916,7 +1251,7 @@ class MainWindow(QMainWindow):
         TAB_SIGNALS:   ("Environment signals",
                         "Choose what the key is bound to. The same signals must be readable when you decrypt."),
         TAB_ENCRYPT:   ("Encrypt & hide",
-                        "Encrypt a file with your environment key and hide it inside a PNG image."),
+                        "Encrypt a file with your environment key and hide it inside a PNG image or WAV audio file."),
         TAB_DECRYPT:   ("Decrypt & extract",
                         "Recover a hidden file. Needs the same signals and the same token used to encrypt."),
         TAB_TOKEN:     ("Hardware token",
@@ -948,15 +1283,18 @@ class MainWindow(QMainWindow):
         self._signal_rows: list[SignalRow] = []
         self._selected_ids: set[str] = set(self._load_json("signals/selected", []))
         self._user_presets: dict[str, list[str]] = self._load_json("signals/presets", {})
-        self._active_preset: str | None = self._settings.value("signals/active_preset", "") or None
+        self._active_preset: str | None = unprotect_str(
+            self._settings.value("signals/active_preset", "")) or None
         self._token_cfg = load_config()
         self._workers: set[QThread] = set()
         self._busy = False
         self._collecting = False
-        self._last_test: tuple[frozenset, str] | None = None
+        self._last_test: tuple[frozenset, str, dict] | None = None
         self._enc_output_auto = False
         self._enc_capacity_ok = False
         self._pending_pair_msg: str | None = None
+        self._privacy = self._settings.value("privacy/mode", True, type=bool)
+        self._portable = self._settings.value("portable/mode", False, type=bool)
 
         self._ui_ready = False
         self._build_ui()
@@ -974,25 +1312,44 @@ class MainWindow(QMainWindow):
 
     # ── State persistence ────────────────────────────────────────────────────
 
+    # Settings that name the environment a payload is bound to are sealed (DPAPI on
+    # Windows) so a raw registry/ini dump does not reveal the signal selection.
+    _SENSITIVE_KEYS = {"signals/selected", "signals/presets", "signals/active_preset"}
+
     def _load_json(self, key, default):
         try:
-            return json.loads(self._settings.value(key, ""))
+            raw = self._settings.value(key, "")
+            if key in self._SENSITIVE_KEYS and raw:
+                raw = unprotect_str(raw)
+            return json.loads(raw)
         except (TypeError, ValueError):
             return default
 
     def _save_json(self, key, value):
-        self._settings.setValue(key, json.dumps(value))
+        raw = json.dumps(value)
+        if key in self._SENSITIVE_KEYS:
+            raw = protect_str(raw)
+        self._settings.setValue(key, raw)
 
     def _restore_state(self):
         geo = self._settings.value("window/geometry")
         if geo is not None:
             self.restoreGeometry(geo)
-        for picker, key in self._persisted_pickers():
-            path = self._settings.value(key, "")
-            if path and (os.path.exists(path) or picker._mode == "save"):
-                picker.set_path(path)
+        # Save recovered files to Downloads by default (overridden below if a path is
+        # remembered and privacy mode is off).
+        self._dec_output.set_path(downloads_dir())
         self._enc_output_auto = self._settings.value("enc/output_auto", False, type=bool)
-        FilePicker.last_dir = self._settings.value("files/last_dir", "")
+        # Privacy mode: never reload remembered file paths, and purge any that an
+        # earlier (possibly crashed) session left behind, so cleanup does not depend
+        # on a clean exit.
+        if self._privacy:
+            self._purge_file_paths()
+        else:
+            for picker, key in self._persisted_pickers():
+                path = self._settings.value(key, "")
+                if path and (os.path.exists(path) or picker._mode == "save"):
+                    picker.set_path(path)
+            FilePicker.last_dir = self._settings.value("files/last_dir", "")
         # Ending on the Token page after pairing is common, but starting there is not useful
         tab = self._settings.value("window/tab", 0, type=int)
         self._tabs.setCurrentIndex(tab if tab != self.TAB_TOKEN else 0)
@@ -1006,13 +1363,24 @@ class MainWindow(QMainWindow):
             (self._dec_output,  "dec/output_dir"),
         ]
 
+    def _purge_file_paths(self):
+        """Remove every remembered file path from settings right now (privacy mode)."""
+        for _picker, key in self._persisted_pickers():
+            self._settings.remove(key)
+        self._settings.remove("files/last_dir")
+        self._settings.sync()
+
     def closeEvent(self, event):
         self._settings.setValue("window/geometry", self.saveGeometry())
         self._settings.setValue("window/tab", self._tabs.currentIndex())
-        for picker, key in self._persisted_pickers():
-            self._settings.setValue(key, picker.path())
         self._settings.setValue("enc/output_auto", self._enc_output_auto)
-        self._settings.setValue("files/last_dir", FilePicker.last_dir)
+        self._settings.setValue("privacy/mode", self._privacy)
+        if self._privacy:
+            self._purge_file_paths()      # leave no trace of which files were used
+        else:
+            for picker, key in self._persisted_pickers():
+                self._settings.setValue(key, picker.path())
+            self._settings.setValue("files/last_dir", FilePicker.last_dir)
         for w in list(self._workers):
             w.wait(5000)
         super().closeEvent(event)
@@ -1093,11 +1461,50 @@ class MainWindow(QMainWindow):
             lay.addSpacing(16)
 
         lay.addStretch()
+
+        # Both persistent security modes live together at the foot of the sidebar
+        lay.addWidget(_label("MODES", "nav_group", wrap=False))
+        lay.addSpacing(6)
+
+        self._privacy_cb = QCheckBox("Privacy mode")
+        self._privacy_cb.setChecked(self._privacy)
+        self._privacy_cb.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._privacy_cb.setContentsMargins(12, 0, 0, 0)
+        self._privacy_cb.setToolTip(
+            "On: file paths are not remembered, the stego image copies the carrier's\n"
+            "date, and outputs default to Pictures/Downloads. Leaves less for a\n"
+            "forensic examiner to find.")
+        self._privacy_cb.toggled.connect(self._on_privacy_toggled)
+        lay.addWidget(self._privacy_cb)
+        lay.addSpacing(6)
+
+        self._portable_cb = QCheckBox("Portable mode")
+        self._portable_cb.setChecked(self._portable)
+        self._portable_cb.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._portable_cb.setContentsMargins(12, 0, 0, 0)
+        self._portable_cb.setToolTip(
+            "On: only signals that travel with this PC (hardware, OS) can be selected,\n"
+            "so you can encrypt and decrypt anywhere on this machine. Network/location\n"
+            "signals are disabled. Less location-specific, but still bound to this PC\n"
+            "and the token.")
+        self._portable_cb.toggled.connect(self._on_portable_toggled)
+        lay.addWidget(self._portable_cb)
+        lay.addSpacing(12)
+
         foot = QLabel("ICT3215 Digital Forensics · SIT")
         foot.setObjectName("sidebar_foot")
         foot.setContentsMargins(12, 0, 0, 0)
         lay.addWidget(foot)
         return side
+
+    def _on_privacy_toggled(self, on: bool):
+        self._privacy = on
+        self._settings.setValue("privacy/mode", on)
+        if on:
+            self._purge_file_paths()      # don't wait for a clean exit to clear them
+        self._status.showMessage(
+            "Privacy mode on — file paths are not saved and the stego image copies the carrier's date"
+            if on else "Privacy mode off — recent file paths are remembered between sessions")
 
     def _build_topbar(self) -> QWidget:
         bar = QWidget()
@@ -1219,6 +1626,14 @@ class MainWindow(QMainWindow):
         pc.addWidget(self._preset_desc)
         outer.addWidget(preset_card)
         self._rebuild_preset_combo()
+
+        # Shown only while portable mode (toggled in the sidebar) is on
+        self._portable_note = _label(
+            "⬡  Portable mode is on — network / location signals are disabled below. Files are "
+            "bound to this PC and the token, not to a place, so they open on this laptop anywhere.",
+            "hint")
+        self._portable_note.setVisible(self._portable)
+        outer.addWidget(self._portable_note)
 
         tip = _label("Click anywhere on a row to toggle it. Hover a row to see the value read "
                      "from this machine.", "subtle")
@@ -1367,17 +1782,37 @@ class MainWindow(QMainWindow):
 
     def _set_active_preset(self, key: str | None):
         self._active_preset = key
-        self._settings.setValue("signals/active_preset", key or "")
+        self._settings.setValue("signals/active_preset", protect_str(key or ""))
 
     # ── Selection ────────────────────────────────────────────────
 
+    def _volatile_ids(self) -> set:
+        """IDs of signals disabled by portable mode (change when you move)."""
+        return {s.id for s in self._all_signals if not _travel_safe(s)}
+
     def _apply_selection(self, ids: set, preset_key: str | None):
-        self._selected_ids = set(ids)
+        ids = set(ids)
+        if self._portable:
+            ids -= self._volatile_ids()          # portable mode never selects volatile signals
+        self._selected_ids = ids
         for row in self._signal_rows:
             row.set_checked(row.signal.id in self._selected_ids)
         self._set_active_preset(preset_key)
         self._rebuild_preset_combo()
         self._on_selection_changed()
+
+    def _on_portable_toggled(self, on: bool):
+        self._portable = on
+        self._settings.setValue("portable/mode", on)
+        self._portable_note.setVisible(on)
+        if self._all_signals:
+            self._populate_signal_rows(self._all_signals)    # re-block/unblock rows
+            if on and self._selected_ids & self._volatile_ids():
+                # drop any now-disabled signals from the current selection
+                self._apply_selection(self._selected_ids - self._volatile_ids(), None)
+        self._status.showMessage(
+            "Portable mode on — network/location signals are disabled; files open on this PC anywhere"
+            if on else "Portable mode off — you can include network/location signals again")
 
     def _on_row_toggled(self, signal_id: str, checked: bool):
         if checked:
@@ -1445,7 +1880,8 @@ class MainWindow(QMainWindow):
 
             cat_ids = []
             for sig in cat_signals:
-                row = SignalRow(sig, sig.id in self._selected_ids)
+                blocked = self._portable and not _travel_safe(sig)
+                row = SignalRow(sig, sig.id in self._selected_ids, blocked=blocked)
                 row.toggled.connect(self._on_row_toggled)
                 g_layout.addWidget(row)
                 self._signal_rows.append(row)
@@ -1496,25 +1932,48 @@ class MainWindow(QMainWindow):
         self._test_btn.setText("Testing…")
         self._fp_lbl.setText("Key fingerprint:  asking token…")
         w = TestKeyWorker(ids)
-        w.done.connect(lambda fp: self._on_test_done(ids, fp))
+        w.done.connect(lambda fp, snap: self._on_test_done(ids, fp, snap))
         w.error.connect(self._on_test_error)
         self._start_worker(w)
 
-    def _on_test_done(self, ids: frozenset, fp: str):
+    def _on_test_done(self, ids: frozenset, fp: str, snapshot: dict):
         self._set_busy(False)
         self._test_btn.setText("Test Key")
+        changed = []
+        note = ""
+        self._fp_lbl.setToolTip("")
         if self._last_test and self._last_test[0] == ids:
-            stable = self._last_test[1] == fp
-            note = "  ✓ stable" if stable else "  ⚠ changed since last test"
-        else:
-            note = ""
-        self._last_test = (ids, fp)
+            if self._last_test[1] == fp:
+                note = "  ✓ stable"
+            else:
+                # Name exactly which selected signals moved, so the cause is obvious.
+                prev = self._last_test[2] if len(self._last_test) > 2 else {}
+                for sid, (name, value) in snapshot.items():
+                    old = prev.get(sid, (None, None))[1]
+                    if old is not None and old != value:
+                        changed.append((name, old, value))
+                if changed:
+                    names = ", ".join(n for n, _o, _v in changed)
+                    note = f"  ⚠ changed — {names} differ(s) from last test"
+                    self._fp_lbl.setToolTip(
+                        "These selected signals changed value since the last Test Key:\n\n"
+                        + "\n".join(f"• {n}\n     was: {o}\n     now: {v}" for n, o, v in changed)
+                        + "\n\nAny file encrypted under the earlier fingerprint will not decrypt "
+                          "while these differ. Deselect the unstable signal(s), or use Portable "
+                          "mode / a Hardware-only preset to avoid network signals.")
+                else:
+                    note = "  ⚠ changed since last test"
+        self._last_test = (ids, fp, snapshot)
         self._fp_lbl.setText(f"Key fingerprint:  {fp}{note}")
-        self._status.showMessage(
-            f"Key fingerprint {fp} — "
-            + ("environment is stable" if note.strip().startswith("✓")
-               else "run Test Key again to confirm the environment is stable")
-        )
+        if changed:
+            self._status.showMessage(
+                f"Key changed — {', '.join(n for n, _o, _v in changed)} moved since last test "
+                f"(hover the fingerprint for details)")
+        else:
+            self._status.showMessage(
+                f"Key fingerprint {fp} — "
+                + ("environment is stable" if note.strip().startswith("✓")
+                   else "run Test Key again to confirm the environment is stable"))
 
     def _on_test_error(self, msg: str):
         self._set_busy(False)
@@ -1535,24 +1994,46 @@ class MainWindow(QMainWindow):
         files, il = _card(spacing=14)
         il.addWidget(_section("Files"))
 
-        self._enc_payload = FilePicker("File to hide", filter_="All Files (*.*)", step=1,
-                                       placeholder="Any file type — browse, or drop it here")
-        self._enc_carrier = FilePicker("Carrier image (PNG)", filter_="PNG Images (*.png);;All (*.*)", step=2,
-                                       placeholder="The PNG to hide it in — browse, or drop it here")
-        self._enc_output  = FilePicker("Save stego image as", mode="save", filter_="PNG Images (*.png)", step=3,
+        self._enc_payload = FilePicker("File or folder to hide", filter_="All Files (*.*)", step=1,
+                                       allow_dir=True,
+                                       placeholder="Any file, or a whole folder — browse, or drop it here")
+        self._enc_carrier = FilePicker(
+            "Carrier — PNG image or WAV audio", step=2,
+            filter_="Carriers (*.png *.wav);;PNG Images (*.png);;WAV Audio (*.wav);;All (*.*)",
+            placeholder="The PNG or WAV to hide it in — browse, or drop it here")
+        self._enc_output  = FilePicker("Save stego carrier as", mode="save", step=3,
+                                       filter_="Carrier (*.png *.wav)",
                                        placeholder="Suggested automatically next to the carrier")
+
+        # Multi-image split: the same payload spread across several carriers.
+        self._enc_carriers = MultiFilePicker(
+            "Carrier images/audio (PNG or WAV) — filled in order", step=2,
+            filter_="Carriers (*.png *.wav);;PNG Images (*.png);;WAV Audio (*.wav)")
+        self._enc_out_dir  = FilePicker("Save stego images to folder", mode="dir", step=3,
+                                        placeholder="The split images are written here")
 
         self._enc_carrier.changed.connect(self._on_carrier_changed)
         self._enc_payload.changed.connect(self._update_capacity)
         self._enc_output.changed.connect(self._on_output_edited)
+        self._enc_carriers.changed.connect(self._update_capacity)
+        self._enc_out_dir.changed.connect(self._refresh_actions)
+
+        self._enc_split = QCheckBox("Split across several carrier images (for payloads too big for one)")
+        self._enc_split.setObjectName("mode_check")
+        self._enc_split.toggled.connect(self._on_split_toggled)
 
         il.addWidget(self._enc_payload)
+        il.addWidget(self._enc_split)
         il.addWidget(self._enc_carrier)
         il.addWidget(self._enc_output)
+        il.addWidget(self._enc_carriers)
+        il.addWidget(self._enc_out_dir)
+        self._enc_carriers.setVisible(False)
+        self._enc_out_dir.setVisible(False)
         il.addWidget(_divider())
 
         cap_top = QHBoxLayout()
-        self._cap_label = QLabel("Select a carrier image to see capacity")
+        self._cap_label = QLabel("Select a carrier (PNG image or WAV audio) to see capacity")
         self._cap_label.setObjectName("muted")
         cap_top.addWidget(self._cap_label)
         cap_top.addStretch()
@@ -1584,21 +2065,43 @@ class MainWindow(QMainWindow):
         self._enc_fp_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         result_row.addWidget(self._enc_fp_lbl)
         result_row.addStretch()
+        self._enc_shred_btn = QPushButton("Shred original")
+        self._enc_shred_btn.setObjectName("btn_danger")
+        self._enc_shred_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._enc_shred_btn.setToolTip("Overwrite and delete the original payload file so the "
+                                       "plaintext does not linger on disk")
+        self._enc_shred_btn.setVisible(False)
+        self._enc_shred_btn.clicked.connect(self._shred_original)
+        result_row.addWidget(self._enc_shred_btn)
         self._enc_open_btn = QPushButton("Show in folder")
         self._enc_open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._enc_open_btn.setVisible(False)
-        self._enc_open_btn.clicked.connect(lambda: self._open_folder(self._enc_output.path()))
+        self._enc_open_btn.clicked.connect(lambda: self._open_folder(self._enc_last_output))
         result_row.addWidget(self._enc_open_btn)
         layout.addLayout(result_row)
+        self._enc_last_payload = ""
+        self._enc_last_output = ""
 
         layout.addStretch()
         return page
 
+    def _on_split_toggled(self, on: bool):
+        # Swap the single carrier/output pickers for the multi-image ones (or back).
+        self._enc_carrier.setVisible(not on)
+        self._enc_output.setVisible(not on)
+        self._enc_carriers.setVisible(on)
+        self._enc_out_dir.setVisible(on)
+        if on and not self._enc_out_dir.path():
+            self._enc_out_dir.set_path(pictures_dir() if self._privacy else "")
+        self._update_capacity()
+
     def _on_carrier_changed(self, carrier: str):
-        # Suggest an output path next to the carrier unless the user chose one themselves
+        # Suggest an output path unless the user chose one themselves. Privacy mode
+        # puts it in Pictures; otherwise next to the carrier.
         if carrier and (self._enc_output_auto or not self._enc_output.path()):
             p = Path(carrier)
-            suggestion = str(p.with_name(f"{p.stem}_stego.png"))
+            folder = pictures_dir() if self._privacy else str(p.parent)
+            suggestion = str(Path(folder) / f"{p.stem}_stego{media.output_suffix(carrier)}")
             self._enc_output.set_path(suggestion)
             self._enc_output_auto = True
         elif not carrier and self._enc_output_auto:
@@ -1610,29 +2113,49 @@ class MainWindow(QMainWindow):
         carrier = self._enc_carrier.path()
         if carrier:
             p = Path(carrier)
-            self._enc_output_auto = self._enc_output.path() == str(p.with_name(f"{p.stem}_stego.png"))
+            auto = str(p.with_name(f"{p.stem}_stego{media.output_suffix(carrier)}"))
+            self._enc_output_auto = self._enc_output.path() == auto
         else:
             self._enc_output_auto = False
         self._refresh_actions()
 
     def _update_capacity(self, *_):
+        if self._enc_split.isChecked():
+            self._update_capacity_split()
+            return
         carrier = self._enc_carrier.path()
         payload = self._enc_payload.path()
         self._enc_capacity_ok = False
         self._cap_bar.setObjectName("capacity_bar")
 
         if not carrier or not os.path.isfile(carrier):
-            self._cap_label.setText("Select a carrier image to see capacity")
+            self._cap_label.setText("Select a carrier (PNG image or WAV audio) to see capacity")
             self._img_info_lbl.setText("")
             self._cap_bar.setValue(0)
         else:
             try:
-                info = get_image_info(carrier)
-                cap  = info["capacity_bytes"]
+                info = media.carrier_info(carrier)
+                # Usable payload capacity = total LSB bytes minus the v3 header overhead
+                cap = max(0, lsb_capacity_bytes(carrier) - OUTER_SIZE)
                 self._img_info_lbl.setText(
-                    f"{info['width']} × {info['height']} px  |  capacity {cap:,} B  ({cap/1024:.1f} KB)"
+                    f"{info['summary']}  |  capacity {cap:,} B  ({cap/1024:.1f} KB)"
                 )
-                if payload and os.path.isfile(payload):
+                if payload and os.path.isdir(payload):
+                    # A folder is zipped at encrypt time, so the exact size is not known
+                    # yet. Show the uncompressed total as a rough upper bound and let the
+                    # encrypt step do the strict capacity check once zipped.
+                    total = _folder_size(payload)
+                    self._enc_capacity_ok = cap > 0
+                    if cap <= 0:
+                        self._cap_label.setText("Folder too large for this carrier — use a bigger image")
+                        self._cap_bar.setObjectName("capacity_over")
+                    elif total <= cap:
+                        self._cap_label.setText(f"Folder — up to {total:,} / {cap:,} bytes before zip (fits)")
+                    else:
+                        self._cap_label.setText(
+                            f"Folder — {total:,} B before zip; may fit in {cap:,} B after compression")
+                    self._cap_bar.setValue(min(100, int(total / cap * 100)) if cap > 0 else 100)
+                elif payload and os.path.isfile(payload):
                     needed = packed_size(payload, os.path.getsize(payload))
                     pct = min(100, int(needed / cap * 100)) if cap > 0 else 100
                     if needed > cap:
@@ -1656,9 +2179,51 @@ class MainWindow(QMainWindow):
         self._cap_bar.style().polish(self._cap_bar)
         self._refresh_actions()
 
+    def _update_capacity_split(self):
+        carriers = [c for c in self._enc_carriers.paths() if os.path.isfile(c)]
+        payload = self._enc_payload.path()
+        self._enc_capacity_ok = False
+        self._cap_bar.setObjectName("capacity_bar")
+        try:
+            if len(carriers) < 2:
+                self._cap_label.setText("Add at least two carrier images to split across")
+                self._img_info_lbl.setText("")
+                self._cap_bar.setValue(0)
+            else:
+                cap = mi.total_capacity(carriers)       # combined usable bytes (tags deducted)
+                self._img_info_lbl.setText(
+                    f"{len(carriers)} images  |  combined capacity {cap:,} B  ({cap/1024:.1f} KB)")
+                if payload and os.path.isdir(payload):
+                    total = _folder_size(payload)
+                    self._enc_capacity_ok = cap > OUTER_SIZE
+                    self._cap_label.setText(
+                        f"Folder — {total:,} B before zip; header+payload must fit in {cap:,} B")
+                    self._cap_bar.setValue(min(100, int(total / cap * 100)) if cap > 0 else 100)
+                elif payload and os.path.isfile(payload):
+                    needed = OUTER_SIZE + packed_size(payload, os.path.getsize(payload))
+                    pct = min(100, int(needed / cap * 100)) if cap > 0 else 100
+                    if needed > cap:
+                        self._cap_label.setText(
+                            f"⚠  Payload too large: needs {needed:,} B, images hold {cap:,} B")
+                        self._cap_bar.setObjectName("capacity_over")
+                    else:
+                        self._cap_label.setText(f"Using {needed:,} / {cap:,} bytes  ({pct}%)")
+                        self._enc_capacity_ok = True
+                    self._cap_bar.setValue(max(pct, 1))
+                else:
+                    self._cap_label.setText(f"Combined capacity: {cap:,} bytes  ({cap/1024:.1f} KB)")
+                    self._cap_bar.setValue(0)
+        except Exception as e:
+            self._cap_label.setText(f"Cannot read an image: {e}")
+            self._img_info_lbl.setText("")
+            self._cap_bar.setValue(0)
+        self._cap_bar.style().unpolish(self._cap_bar)
+        self._cap_bar.style().polish(self._cap_bar)
+        self._refresh_actions()
+
     def _encrypt_blockers(self) -> list[str]:
         active, missing = self._selection_breakdown()
-        carrier, payload, output = self._enc_carrier.path(), self._enc_payload.path(), self._enc_output.path()
+        payload = self._enc_payload.path()
         out = []
         if not self._token_cfg:
             out.append("pair a hardware token")
@@ -1666,27 +2231,51 @@ class MainWindow(QMainWindow):
             out.append("select signals")
         elif missing:
             out.append("deselect unreadable signals")
-        if not payload or not os.path.isfile(payload):
-            out.append("choose a payload file")
-        if not carrier or not os.path.isfile(carrier):
-            out.append("choose a carrier PNG")
-        elif payload and os.path.isfile(payload) and not self._enc_capacity_ok:
-            out.append("use a bigger carrier image")
-        if not output:
-            out.append("choose an output path")
-        elif carrier and os.path.normcase(os.path.abspath(output)) == os.path.normcase(os.path.abspath(carrier)):
-            out.append("pick an output different from the carrier")
+        if not payload or not os.path.exists(payload):
+            out.append("choose a file or folder")
+
+        if self._enc_split.isChecked():
+            if self._enc_carriers.count() < 2:
+                out.append("add at least two carrier images")
+            elif payload and os.path.exists(payload) and not self._enc_capacity_ok:
+                out.append("add more or larger carriers")
+            if not self._enc_out_dir.path():
+                out.append("choose an output folder")
+        else:
+            carrier, output = self._enc_carrier.path(), self._enc_output.path()
+            if not carrier or not os.path.isfile(carrier):
+                out.append("choose a carrier (PNG or WAV)")
+            elif payload and os.path.exists(payload) and not self._enc_capacity_ok:
+                out.append("use a bigger carrier image")
+            if not output:
+                out.append("choose an output path")
+            elif carrier and os.path.normcase(os.path.abspath(output)) == os.path.normcase(os.path.abspath(carrier)):
+                out.append("pick an output different from the carrier")
         return out
 
     def _do_encrypt(self):
         if self._encrypt_blockers():
             return
-        output = self._enc_output.path()
-        out_png = str(Path(output).with_suffix(".png"))
-        if os.path.exists(out_png):
-            if QMessageBox.question(self, "Overwrite file", f"{Path(out_png).name} already exists. Overwrite it?") \
-                    != QMessageBox.StandardButton.Yes:
-                return
+
+        if self._enc_split.isChecked():
+            carriers = [c for c in self._enc_carriers.paths() if os.path.isfile(c)]
+            outputs = mi.suggest_outputs(carriers, self._enc_out_dir.path())
+            existing = [o for o in outputs if os.path.exists(o)]
+            if existing:
+                if QMessageBox.question(
+                        self, "Overwrite files",
+                        f"{len(existing)} output image(s) already exist in that folder. Overwrite them?") \
+                        != QMessageBox.StandardButton.Yes:
+                    return
+        else:
+            carriers = [self._enc_carrier.path()]
+            outputs = [self._enc_output.path()]
+            out_final = str(Path(outputs[0]).with_suffix(media.output_suffix(carriers[0])))
+            if os.path.exists(out_final):
+                if QMessageBox.question(self, "Overwrite file",
+                                        f"{Path(out_final).name} already exists. Overwrite it?") \
+                        != QMessageBox.StandardButton.Yes:
+                    return
 
         self._set_busy(True)
         self._enc_btn.setText(self.ENC_BUSY)
@@ -1694,7 +2283,8 @@ class MainWindow(QMainWindow):
         self._enc_fp_lbl.setText("")
         self._enc_open_btn.setVisible(False)
 
-        w = EncryptWorker(self._selected_ids, self._enc_carrier.path(), self._enc_payload.path(), output)
+        w = EncryptWorker(self._selected_ids, carriers, self._enc_payload.path(), outputs,
+                          match_timestamps=self._privacy)
         w.done.connect(self._on_encrypt_done)
         w.error.connect(self._on_encrypt_error)
         self._start_worker(w)
@@ -1704,12 +2294,45 @@ class MainWindow(QMainWindow):
         self._enc_btn.setText(self.ENC_LABEL)
         self._enc_result.show_success(msg)
         self._enc_fp_lbl.setText(f"Key fingerprint:  {fp}")
-        self._enc_output.set_path(out_path)
+        self._enc_last_output = out_path
+        if not self._enc_split.isChecked():
+            self._enc_output.set_path(out_path)
         self._enc_open_btn.setVisible(True)
+        # Offer to wipe the original now that a stego copy exists
+        self._enc_last_payload = self._enc_payload.path()
+        self._enc_shred_btn.setVisible(bool(self._enc_last_payload)
+                                       and os.path.isfile(self._enc_last_payload))
         # Convenience: the image just made is the one most likely to be decrypted next
         if not self._dec_stego.path():
             self._dec_stego.set_path(out_path)
         self._status.showMessage(f"Encrypt complete — key fingerprint: {fp}")
+
+    def _shred_original(self):
+        path = self._enc_last_payload
+        if not path or not os.path.isfile(path):
+            self._enc_shred_btn.setVisible(False)
+            return
+        if QMessageBox.warning(
+                self, "Shred the original?",
+                f"This overwrites and deletes:\n{path}\n\n"
+                "The encrypted copy is already saved, so you will still be able to decrypt it.\n\n"
+                "Note: on SSDs and USB flash drives, overwriting cannot guarantee the data is "
+                "unrecoverable (wear-levelling writes elsewhere). The surest protection is to keep "
+                "originals only on media you can fully control.\n\nDelete the original now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            from winutils import shred_file
+            shred_file(path)
+        except OSError as e:
+            self._enc_result.show_error(f"Could not shred the original:\n{e}")
+            return
+        self._enc_last_payload = ""
+        self._enc_shred_btn.setVisible(False)
+        if self._enc_payload.path() == path:
+            self._enc_payload.set_path("")
+        self._status.showMessage("Original payload securely overwritten and deleted")
 
     def _on_encrypt_error(self, msg: str):
         self._set_busy(False)
@@ -1735,13 +2358,25 @@ class MainWindow(QMainWindow):
 
         files, il = _card(spacing=14)
         il.addWidget(_section("Files"))
-        self._dec_stego  = FilePicker("Stego image", filter_="PNG Images (*.png)", step=1,
-                                      placeholder="A PNG made by Encrypt — browse, or drop it here")
+        self._dec_stego  = FilePicker(
+            "Stego carrier (PNG or WAV)", step=1,
+            filter_="Carriers (*.png *.wav);;PNG Images (*.png);;WAV Audio (*.wav)",
+            placeholder="A PNG or WAV made by Encrypt — browse, or drop it here")
+        self._dec_stegos = MultiFilePicker(
+            "Stego carriers (the full split set)", step=1,
+            filter_="Carriers (*.png *.wav);;PNG Images (*.png);;WAV Audio (*.wav)")
         self._dec_output = FilePicker("Save recovered file to", mode="dir", step=2,
                                       placeholder="Same folder as the stego image")
+        self._dec_split = QCheckBox("This file was split across several images")
+        self._dec_split.setObjectName("mode_check")
+        self._dec_split.toggled.connect(self._on_dec_split_toggled)
         self._dec_stego.changed.connect(self._refresh_actions)
+        self._dec_stegos.changed.connect(self._refresh_actions)
+        il.addWidget(self._dec_split)
         il.addWidget(self._dec_stego)
+        il.addWidget(self._dec_stegos)
         il.addWidget(self._dec_output)
+        self._dec_stegos.setVisible(False)
         il.addWidget(_label("The file is restored under its original name. Existing files are "
                             "never overwritten.", "subtle"))
         layout.addWidget(files)
@@ -1783,16 +2418,24 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return page
 
+    def _on_dec_split_toggled(self, on: bool):
+        self._dec_stego.setVisible(not on)
+        self._dec_stegos.setVisible(on)
+        self._refresh_actions()
+
     def _decrypt_blockers(self) -> list[str]:
-        active, _ = self._selection_breakdown()
-        stego = self._dec_stego.path()
+        # v3 images carry their own (encrypted) signal list, so no manual selection is
+        # needed to decrypt. Only the token and a stego image are required.
         out = []
         if not self._token_cfg:
             out.append("pair a hardware token")
-        if not active:
-            out.append("select the signals used to encrypt")
-        if not stego or not os.path.isfile(stego):
-            out.append("choose a stego image")
+        if self._dec_split.isChecked():
+            if self._dec_stegos.count() < 2:
+                out.append("add the split images")
+        else:
+            stego = self._dec_stego.path()
+            if not stego or not os.path.isfile(stego):
+                out.append("choose a stego image")
         return out
 
     def _do_decrypt(self):
@@ -1806,10 +2449,18 @@ class MainWindow(QMainWindow):
         self._dec_preview.setVisible(False)
         self._dec_preview_lbl.setVisible(False)
 
-        w = DecryptWorker(self._selected_ids, self._dec_stego.path(), self._dec_output.path())
+        stego_arg = self._dec_stegos.paths() if self._dec_split.isChecked() else self._dec_stego.path()
+        w = DecryptWorker(self._selected_ids, stego_arg, self._dec_output.path())
         w.done.connect(self._on_decrypt_done)
         w.error.connect(self._on_decrypt_error)
+        w.signals_used.connect(self._on_decrypt_signals_used)
         self._start_worker(w)
+
+    def _on_decrypt_signals_used(self, ids: list):
+        # Reflect the signals the image actually used (read from its header) on the
+        # Signals page, so the user can see what environment it is bound to.
+        if ids and self._all_signals:
+            self._apply_selection(set(ids), None)
 
     def _on_decrypt_done(self, msg: str, fp: str, out_path: str, plaintext: bytes):
         self._set_busy(False)
@@ -2048,7 +2699,10 @@ class MainWindow(QMainWindow):
 
     def _refresh_ports(self):
         saved = self._settings.value("token/port", "")
-        ports = list_serial_ports()
+        try:
+            ports = list_serial_ports()
+        except Exception:
+            ports = []      # a device mid-reset can make enumeration throw
         self._port_combo.blockSignals(True)
         self._port_combo.clear()
         for dev, desc in ports:
@@ -2063,8 +2717,11 @@ class MainWindow(QMainWindow):
     def _poll_ports(self):
         if self._busy or self._tabs.currentIndex() != self.TAB_TOKEN:
             return
+        try:
+            found = [dev for dev, _ in list_serial_ports()]
+        except Exception:
+            return      # serial enumeration can throw if a device is mid-reset; just skip
         listed = [self._port_combo.itemData(i) for i in range(self._port_combo.count())]
-        found = [dev for dev, _ in list_serial_ports()]
         if found != [d for d in listed if d]:
             self._refresh_ports()
 
@@ -2165,6 +2822,17 @@ class MainWindow(QMainWindow):
             "Selected signals are hashed together on this PC and only the hash is sent to the token, "
             "which mixes in its master secret (HMAC-SHA256). Raw values never leave this machine.", "muted"))
 
+        bar = QHBoxLayout()
+        self._inspector_redact = QCheckBox("Hide sensitive values (safe for screenshots)")
+        self._inspector_redact.setObjectName("mode_check")
+        self._inspector_redact.setToolTip(
+            "Mask the raw signal values (disk serial, machine GUID, SID, …) so this page can be "
+            "screenshotted for a report without exposing this machine's real identifiers.")
+        self._inspector_redact.toggled.connect(lambda _on: self._populate_inspector())
+        bar.addWidget(self._inspector_redact)
+        bar.addStretch()
+        layout.addLayout(bar)
+
         self._inspector_table = QTableWidget()
         self._inspector_table.setColumnCount(6)
         self._inspector_table.setHorizontalHeaderLabels(
@@ -2187,18 +2855,33 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._inspector_table, stretch=1)
         return page
 
+    @staticmethod
+    def _redact_value(value: str) -> str:
+        """Mask an identifier for safe screenshots: keep a hint of shape, hide the rest."""
+        v = value or ""
+        if len(v) <= 6:
+            return "•" * max(4, len(v))
+        return f"{v[:2]}{'•' * 6}{v[-2:]}"
+
     def _populate_inspector(self):
+        redact = getattr(self, "_inspector_redact", None) and self._inspector_redact.isChecked()
         self._inspector_table.setRowCount(0)
         for sig in self._all_signals:
             row = self._inspector_table.rowCount()
             self._inspector_table.insertRow(row)
+            if not sig.available:
+                shown_value = f"[N/A]  {sig.error or ''}"
+            elif redact:
+                shown_value = self._redact_value(sig.value)
+            else:
+                shown_value = sig.value
             items = [
                 "✓" if sig.id in self._selected_ids else "",
                 sig.id,
                 sig.name,
                 sig.category,
                 f"{sig.stability}/10",
-                sig.value if sig.available else f"[N/A]  {sig.error or ''}",
+                shown_value,
             ]
             for col, text in enumerate(items):
                 item = QTableWidgetItem(str(text))

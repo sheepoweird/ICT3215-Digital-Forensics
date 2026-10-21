@@ -499,7 +499,13 @@ def collect_router_bssid() -> EnvSignal:
 def collect_ipv6_linklocal() -> EnvSignal:
     sig = EnvSignal(
         "net_ipv6", "IPv6 Link-Local Address", "Network",
-        "Derived from NIC MAC via EUI-64 — hardware-bound and stable", 9
+        # NOTE: only EUI-64 addresses (…ff:fe… in the middle) are MAC-derived and stable.
+        # Modern Windows defaults to a RANDOMISED interface identifier (RFC 7217), which is
+        # stable while the adapter stays up but is regenerated when it is reset — e.g. when
+        # Wi-Fi is toggled off/on. So this signal is only moderately stable; do not rely on
+        # it for a key you must reopen after a network change (use Portable mode instead).
+        "Link-local IPv6 address. On modern Windows the interface ID is randomised and can "
+        "change when the adapter is reset (e.g. toggling Wi-Fi), so it is only moderately stable", 4
     )
     try:
         addrs = []

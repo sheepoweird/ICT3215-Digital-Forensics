@@ -5,12 +5,14 @@
 #include <BLE2902.h>
 #include <Preferences.h>
 #include <esp_system.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 #include "encryption.h"
 
 #define SERVICE_UUID        "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define CHARACTERISTIC_UUID "beb5483f-36e1-4688-b7f5-ea07361b26a8"
-#define FIRMWARE_VERSION    2
+#define FIRMWARE_VERSION    3   // v3 adds ECDH-encrypted USB pairing
 
 // --- ESP32-CAM FLASH LED CONFIGURATION ---
 // Pin 4 is the bright white LED on the front. Uses standard logic (HIGH = ON).
@@ -281,31 +283,18 @@ bool isValidField(const String &s, unsigned int maxLen) {
     return true;
 }
 
-// PAIR_DEVICE:<host_id>:<request_id>
-// The host repeats the command until the token answers, so a repeated
-// request_id gets the same reply instead of rotating the auth key again.
-void handlePairCommand(const String &args) {
-    int sep = args.indexOf(':');
-    String hostID = sep >= 0 ? args.substring(0, sep) : args;
-    String reqID  = sep >= 0 ? args.substring(sep + 1) : "";
-
-    if (!isValidField(hostID, 32) || !isValidField(reqID, 32)) {
-        Serial.println("PAIRING_REFUSED;REASON=BAD_FORMAT");
-        return;
-    }
-    if (reqID == lastPairRequest && lastPairReply.length() > 0) {
-        Serial.println(lastPairReply);
-        return;
-    }
-
+// Ensure the token has a master secret + token ID and rotate a fresh auth key
+// bound to hostID. Returns false (with a REFUSED reply queued in lastPairReply)
+// if the token is already bound to a different host. On success, authKey/tokenId
+// hold the new material. Shared by the legacy and ECDH pairing handlers.
+bool rotatePairing(const String &hostID, const String &reqID) {
     // A token bound to another host must be factory reset (destroying its
     // master secret) before it can be bound again.
     if (devicePaired && preferences.getString("host_id", "") != hostID) {
         lastPairRequest = reqID;
         lastPairReply = "PAIRING_REFUSED;REQ=" + reqID + ";REASON=BOUND_TO_OTHER_HOST";
-        Serial.println(lastPairReply);
         playPattern(2, PAT_LONG_MS, 300);
-        return;
+        return false;
     }
 
     // The master secret is created once and survives re-pairing with the same
@@ -328,9 +317,31 @@ void handlePairCommand(const String &args) {
     devicePaired = true;
     challengeActive = false;
     authFailures = 0;
+    return true;
+}
+
+// PAIR_DEVICE:<host_id>:<request_id>  (legacy: auth key crosses the wire in plaintext)
+// The host repeats the command until the token answers, so a repeated
+// request_id gets the same reply instead of rotating the auth key again.
+void handlePairCommand(const String &args) {
+    int sep = args.indexOf(':');
+    String hostID = sep >= 0 ? args.substring(0, sep) : args;
+    String reqID  = sep >= 0 ? args.substring(sep + 1) : "";
+
+    if (!isValidField(hostID, 32) || !isValidField(reqID, 32)) {
+        Serial.println("PAIRING_REFUSED;REASON=BAD_FORMAT");
+        return;
+    }
+    if (reqID == lastPairRequest && lastPairReply.length() > 0) {
+        Serial.println(lastPairReply);
+        return;
+    }
+    if (!rotatePairing(hostID, reqID)) {
+        Serial.println(lastPairReply);
+        return;
+    }
 
     std::string mac = BLEDevice::getAddress().toString();
-
     lastPairRequest = reqID;
     lastPairReply = "PAIRING_SUCCESS;REQ=" + reqID +
                     ";TOKEN_ID=" + toHex(tokenId, TOKEN_ID_LEN) +
@@ -339,11 +350,94 @@ void handlePairCommand(const String &args) {
                     ";CHAR_UUID=" + String(CHARACTERISTIC_UUID) +
                     ";FW=" + String(FIRMWARE_VERSION);
     Serial.println(lastPairReply);
+    playPattern(3, PAT_SHORT_MS, PAT_SHORT_MS);
+}
 
+// PAIR_ECDH:<host_id>:<request_id>:<pc_pub hex(32)>  (encrypted: auth key is wrapped)
+// The auth key is sealed under an X25519 shared secret, so it never appears in
+// plaintext on the wire. Must match Python/pair_crypto.py.
+void handlePairEcdh(const String &args) {
+    int s1 = args.indexOf(':');
+    int s2 = (s1 >= 0) ? args.indexOf(':', s1 + 1) : -1;
+    if (s1 < 0 || s2 < 0) {
+        Serial.println("PAIRING_REFUSED;REASON=BAD_FORMAT");
+        return;
+    }
+    String hostID = args.substring(0, s1);
+    String reqID  = args.substring(s1 + 1, s2);
+    String pcPubHex = args.substring(s2 + 1);
+
+    uint8_t pcPub[X25519_LEN];
+    if (!isValidField(hostID, 32) || !isValidField(reqID, 32) ||
+            !fromHex(pcPubHex, pcPub, X25519_LEN)) {
+        Serial.println("PAIRING_REFUSED;REQ=" + reqID + ";REASON=BAD_FORMAT");
+        return;
+    }
+    if (reqID == lastPairRequest && lastPairReply.length() > 0) {
+        Serial.println(lastPairReply);
+        return;
+    }
+    if (!rotatePairing(hostID, reqID)) {
+        Serial.println(lastPairReply);
+        return;
+    }
+
+    // X25519: our ephemeral key pair, then the shared secret with the host
+    uint8_t tokPriv[X25519_LEN], tokPub[X25519_LEN], shared[X25519_LEN];
+    if (!x25519Keypair(tokPriv, tokPub) || !x25519Shared(tokPriv, pcPub, shared)) {
+        secureWipe(tokPriv, sizeof(tokPriv));
+        secureWipe(shared, sizeof(shared));
+        Serial.println("PAIRING_REFUSED;REQ=" + reqID + ";REASON=CRYPTO_ERROR");
+        return;
+    }
+
+    // Wrapping key = HKDF(shared, salt=none, info = "EnvStego-pair-v1" | pc_pub | tok_pub | token_id)
+    uint8_t info[16 + X25519_LEN + X25519_LEN + TOKEN_ID_LEN];
+    memcpy(info, "EnvStego-pair-v1", 16);
+    memcpy(info + 16, pcPub, X25519_LEN);
+    memcpy(info + 16 + X25519_LEN, tokPub, X25519_LEN);
+    memcpy(info + 16 + 2 * X25519_LEN, tokenId, TOKEN_ID_LEN);
+    uint8_t wrapKey[32];
+    hkdfSha256(NULL, 0, shared, X25519_LEN, info, sizeof(info), wrapKey, sizeof(wrapKey));
+
+    // AES-256-GCM encrypt the auth key, AAD = pc_pub | tok_pub | token_id
+    uint8_t aad[X25519_LEN + X25519_LEN + TOKEN_ID_LEN];
+    memcpy(aad, pcPub, X25519_LEN);
+    memcpy(aad + X25519_LEN, tokPub, X25519_LEN);
+    memcpy(aad + 2 * X25519_LEN, tokenId, TOKEN_ID_LEN);
+
+    uint8_t enc[GCM_IV_LEN + AUTH_KEY_LEN + GCM_TAG_LEN];
+    uint8_t *iv = enc, *ct = enc + GCM_IV_LEN, *tag = ct + AUTH_KEY_LEN;
+    secureRandom(iv, GCM_IV_LEN);
+    gcmEncrypt(wrapKey, iv, aad, sizeof(aad), authKey, AUTH_KEY_LEN, ct, tag);
+
+    secureWipe(tokPriv, sizeof(tokPriv));
+    secureWipe(shared, sizeof(shared));
+    secureWipe(wrapKey, sizeof(wrapKey));
+
+    std::string mac = BLEDevice::getAddress().toString();
+    lastPairRequest = reqID;
+    lastPairReply = "PAIRING_SUCCESS;REQ=" + reqID + ";MODE=ECDH" +
+                    ";TOKEN_ID=" + toHex(tokenId, TOKEN_ID_LEN) +
+                    ";TOK_PUB=" + toHex(tokPub, X25519_LEN) +
+                    ";ENC=" + toHex(enc, sizeof(enc)) +
+                    ";BLE_MAC=" + String(mac.c_str()) +
+                    ";CHAR_UUID=" + String(CHARACTERISTIC_UUID) +
+                    ";FW=" + String(FIRMWARE_VERSION);
+    Serial.println(lastPairReply);
     playPattern(3, PAT_SHORT_MS, PAT_SHORT_MS);
 }
 
 void setup() {
+    // --- Brownout mitigation for the ESP32-CAM on weak USB power ---
+    // The current spike when BLE starts can dip the supply below the brownout
+    // threshold and reset the board in a loop. We lower the baseline draw and stop
+    // the detector from resetting mid-start-up. A lower CPU clock and BLE TX power
+    // keep the actual voltage up, so running with the detector off is far safer than
+    // it would be at full power. A good USB port / powered hub is still preferable.
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);   // stop the detector resetting us
+    setCpuFrequencyMhz(80);                       // ~half the current of 240 MHz
+
     Serial.begin(115200);
 
     // Initialize LED Pin and turn it OFF to start
@@ -387,6 +481,9 @@ void setup() {
 
     // Initialize BLE with V4 name to bypass Windows cache
     BLEDevice::init("3T-Token-v4");
+    // Lower the radio TX power to cut the current spike that causes brownouts.
+    // The PC pairs over USB first, so a shorter BLE range is an acceptable trade.
+    BLEDevice::setPower(ESP_PWR_LVL_N9);
     // Protocol messages are up to 78 bytes, above the 20-byte default payload
     BLEDevice::setMTU(185);
     BLEServer *pServer = BLEDevice::createServer();
@@ -425,7 +522,9 @@ void loop() {
         String command = Serial.readStringUntil('\n');
         command.trim();
 
-        if (command.startsWith("PAIR_DEVICE:")) {
+        if (command.startsWith("PAIR_ECDH:")) {
+            handlePairEcdh(command.substring(10));
+        } else if (command.startsWith("PAIR_DEVICE:")) {
             handlePairCommand(command.substring(12));
         }
     }

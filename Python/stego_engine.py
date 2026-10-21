@@ -46,7 +46,8 @@ def get_capacity_bytes(image_path: str) -> int:
     return max(0, (total_bits // 8) - HEADER_SIZE)
 
 
-def embed(carrier_path: str, salt: bytes, nonce: bytes, ciphertext: bytes, output_path: str) -> str:
+def embed(carrier_path: str, salt: bytes, nonce: bytes, ciphertext: bytes, output_path: str,
+          match_timestamps: bool = False) -> str:
     """
     Embed an encrypted payload (salt + nonce + ciphertext) into a PNG carrier image.
 
@@ -114,7 +115,72 @@ def embed(carrier_path: str, salt: bytes, nonce: bytes, ciphertext: bytes, outpu
         out_path = out_path.with_suffix(".png")
 
     out_img.save(str(out_path), format="PNG", optimize=False, compress_level=1)
+
+    # Optionally make the stego image inherit the carrier's dates so it blends into
+    # a photo library instead of showing a fresh timestamp.
+    if match_timestamps:
+        from winutils import copy_file_times
+        copy_file_times(carrier_path, str(out_path))
+
     return str(out_path)
+
+
+def embed_blob(carrier_path: str, blob: bytes, output_path: str,
+               match_timestamps: bool = False) -> str:
+    """
+    Embed raw bytes into a PNG's LSBs, with no magic header or length field.
+
+    Used by the v3 format, whose own token-encrypted header carries the length.
+    The written bits therefore look like random noise. Returns the output path.
+    """
+    img = Image.open(carrier_path).convert("RGB")
+    arr = np.array(img, dtype=np.uint8)
+    if len(blob) > arr.size // 8:
+        raise ValueError(
+            f"Carrier image is too small.\n"
+            f"  Needs:          {len(blob):,} bytes\n"
+            f"  Image capacity: {arr.size // 8:,} bytes\n"
+            f"  Use a larger carrier image."
+        )
+
+    bits = np.unpackbits(np.frombuffer(blob, dtype=np.uint8))
+    flat = arr.flatten().copy()
+    n = len(bits)
+    flat[:n] = (flat[:n] & np.uint8(0xFE)) | bits.astype(np.uint8)
+    out_img = Image.fromarray(flat.reshape(arr.shape).astype(np.uint8), "RGB")
+
+    out_path = Path(output_path)
+    if out_path.suffix.lower() != ".png":
+        out_path = out_path.with_suffix(".png")
+    out_img.save(str(out_path), format="PNG", optimize=False, compress_level=1)
+
+    if match_timestamps:
+        from winutils import copy_file_times
+        copy_file_times(carrier_path, str(out_path))
+    return str(out_path)
+
+
+def extract_lsb_bytes(stego_path: str, nbytes: int) -> bytes:
+    """
+    Read the first nbytes bytes carried in a PNG's LSBs (raster order, RGB).
+
+    The v3 format reads the fixed-size header first, learns the ciphertext length
+    from it, then reads the header-plus-payload in a second call.
+    """
+    img = Image.open(stego_path).convert("RGB")
+    arr = np.array(img, dtype=np.uint8)
+    flat = arr.flatten()
+    nbits = nbytes * 8
+    if nbits > flat.size:
+        raise ValueError("Image is too small for the requested data — it may be corrupted.")
+    lsbs = (flat[:nbits] & np.uint8(1)).astype(np.uint8)
+    return np.packbits(lsbs).tobytes()
+
+
+def lsb_capacity_bytes(image_path: str) -> int:
+    """Total bytes carriable in a PNG's LSBs (no header subtracted)."""
+    img = Image.open(image_path).convert("RGB")
+    return (img.size[0] * img.size[1] * 3) // 8
 
 
 def extract(stego_path: str) -> tuple:

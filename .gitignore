@@ -46,3 +46,9 @@ pip-log.txt
 DF Main Doc.docx
 Project Assignment.html
 Python/token_config.json
+
+# ─── Local dev / verification tools (not part of the app) ─────
+# Screenshot renderer + live token security checker. They drive or
+# verify the app but are not needed to run it; kept local, not shipped.
+/devtools/
+/Images/

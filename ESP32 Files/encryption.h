@@ -39,4 +39,23 @@ void secureWipe(void *buf, size_t len);
 
 String toHex(const uint8_t *buf, size_t len);
 
+// ── ECDH encrypted pairing (X25519), must match Python/pair_crypto.py ──
+#define X25519_LEN 32
+
+// Generate an ephemeral X25519 key pair. Returns false on error.
+bool x25519Keypair(uint8_t priv[X25519_LEN], uint8_t pub[X25519_LEN]);
+
+// X25519 shared secret from our private key and the peer's public key. False on error.
+bool x25519Shared(const uint8_t priv[X25519_LEN], const uint8_t peerPub[X25519_LEN],
+                  uint8_t out[X25519_LEN]);
+
+// HKDF-SHA256 (extract + expand). salt may be NULL (treated as 32 zero bytes).
+void hkdfSha256(const uint8_t *salt, size_t saltLen,
+                const uint8_t *ikm, size_t ikmLen,
+                const uint8_t *info, size_t infoLen,
+                uint8_t *out, size_t outLen);
+
+// Parse a hex string into buf. Returns false if the length is wrong or a char is not hex.
+bool fromHex(const String &hex, uint8_t *buf, size_t len);
+
 #endif

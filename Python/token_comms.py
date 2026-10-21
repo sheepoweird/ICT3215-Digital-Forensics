@@ -215,26 +215,65 @@ def _open_port(com_port: str) -> serial.Serial:
     return ser
 
 
-def pair_token_usb(com_port: str, progress=None) -> tuple[bool, str]:
-    """
-    Binds the token over USB by repeating the pairing command until it answers.
+# After this long of a responsive-but-silent token, assume old firmware and fall back
+ECDH_PROBE_S = 8.0
 
-    progress, if given, is called with short status lines for the UI. A port that
-    drops mid-exchange (the token resetting, a cable nudge) is reopened within the
-    pairing window, and a token stuck restarting from low power is reported as such.
-    """
-    report = progress or (lambda _msg: None)
-    host_id = get_host_id()
-    request_id = os.urandom(8).hex()
-    command = f"PAIR_DEVICE:{host_id}:{request_id}\n".encode("utf-8")
 
-    ser = None
-    opened = False
-    open_error = None
-    drops = 0
-    restarts = 0
-    deadline = time.time() + PAIR_WINDOW_S
-    report(f"Connecting to {com_port}…")
+def _save_pairing(host_id, token_id, auth_key, mac, fields) -> tuple[bool, str]:
+    key_blob, scheme = _protect_secret(auth_key)
+    config = {
+        "version": CONFIG_VERSION,
+        "host_id": host_id,
+        "token_id": token_id.hex(),
+        "ble_mac": mac,
+        "char_uuid": fields.get("CHAR_UUID", CHARACTERISTIC_UUID),
+        "firmware": fields.get("FW", "?"),
+        "pairing": "ecdh" if fields.get("MODE") == "ECDH" else "legacy",
+        "auth_key": key_blob,
+        "auth_key_protection": scheme,
+        "paired_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+    return True, f"Token {token_fingerprint(token_id.hex())} bound (BLE {mac})"
+
+
+def _extract_auth_key(fields, pc_priv, pc_pub):
+    """Return (token_id, auth_key) from a reply, decrypting the ECDH form. Raises ValueError."""
+    token_id = bytes.fromhex(fields["TOKEN_ID"])
+    if len(token_id) != TOKEN_ID_LEN:
+        raise ValueError("bad token id")
+    if fields.get("MODE") == "ECDH":
+        from pair_crypto import open_auth_key
+        from cryptography.exceptions import InvalidTag
+        tok_pub = bytes.fromhex(fields["TOK_PUB"])
+        enc = bytes.fromhex(fields["ENC"])
+        try:
+            auth_key = open_auth_key(pc_priv, pc_pub, tok_pub, token_id, enc)
+        except InvalidTag:
+            raise ValueError("encrypted pairing failed authentication")
+    else:
+        auth_key = bytes.fromhex(fields["AUTH_KEY"])
+    if len(auth_key) != 32:
+        raise ValueError("bad auth key length")
+    return token_id, auth_key
+
+
+def _pair_once(com_port, mode, host_id, request_id, pc_priv, pc_pub, report, deadline):
+    """
+    Run one pairing attempt in 'ecdh' or 'legacy' mode until the deadline.
+
+    Returns (result, message): result True = paired, False = definitive failure,
+    None = no usable reply (the token is old firmware / silent — try the other mode).
+    """
+    if mode == "ecdh":
+        command = f"PAIR_ECDH:{host_id}:{request_id}:{pc_pub.hex()}\n".encode()
+    else:
+        command = f"PAIR_DEVICE:{host_id}:{request_id}\n".encode()
+
+    ser, opened, open_error = None, False, None
+    drops = restarts = 0
+    alive_since = None
     try:
         while time.time() < deadline:
             if ser is None:
@@ -244,19 +283,14 @@ def pair_token_usb(com_port: str, progress=None) -> tuple[bool, str]:
                     open_error = e
                     time.sleep(0.5)
                     continue
-                if not opened:
-                    report("Waiting for the token to answer. No buttons need pressing…")
                 opened = True
-
             try:
-                # The token answers a repeated request ID with the same reply, so repeating is safe
-                ser.write(command)
+                ser.write(command)          # repeating the same request ID is safe
                 ser.flush()
                 line = ser.readline().decode("utf-8", errors="ignore").strip()
             except serial.SerialException:
                 drops += 1
-                ser.close()
-                ser = None
+                ser.close(); ser = None
                 report("Lost the connection to the token. Reconnecting…")
                 time.sleep(0.5)
                 continue
@@ -267,48 +301,33 @@ def pair_token_usb(com_port: str, progress=None) -> tuple[bool, str]:
                     return False, POWER_MESSAGE
                 report("The token restarted (low power). Still trying…")
                 continue
+            if line:
+                alive_since = alive_since or time.time()
             if not line.startswith("PAIRING_"):
+                # Old firmware ignores PAIR_ECDH entirely: if it is clearly alive but
+                # never answers our ECDH command, stop probing and fall back to legacy.
+                if (mode == "ecdh" and alive_since
+                        and time.time() - alive_since > ECDH_PROBE_S):
+                    return None, "fallback"
                 continue
             fields = _parse_fields(line)
             if fields.get("REQ") != request_id:
                 continue
-
             if line.startswith("PAIRING_REFUSED"):
                 if fields.get("REASON") == "BOUND_TO_OTHER_HOST":
                     return False, (
                         "This token is already bound to a different PC.\n"
                         "Hold the IO0 button while it boots to factory reset it. "
                         "Note: a reset destroys its master secret, so files encrypted "
-                        "with it can never be decrypted again."
-                    )
+                        "with it can never be decrypted again.")
                 return False, f"Token refused pairing ({fields.get('REASON', 'unknown')})."
-
             try:
-                token_id = bytes.fromhex(fields["TOKEN_ID"])
-                auth_key = bytes.fromhex(fields["AUTH_KEY"])
+                token_id, auth_key = _extract_auth_key(fields, pc_priv, pc_pub)
                 mac = fields["BLE_MAC"]
-            except (KeyError, ValueError):
-                return False, "Token sent an unreadable pairing reply. Is the firmware up to date?"
-            if len(token_id) != TOKEN_ID_LEN or len(auth_key) != 32:
-                return False, "Token sent invalid key material. Is the firmware up to date?"
-
+            except (KeyError, ValueError) as e:
+                return False, f"Token sent an unreadable pairing reply ({e}). Is the firmware up to date?"
             report("Token answered. Saving the pairing…")
-            key_blob, scheme = _protect_secret(auth_key)
-            config = {
-                "version": CONFIG_VERSION,
-                "host_id": host_id,
-                "token_id": token_id.hex(),
-                "ble_mac": mac,
-                "char_uuid": fields.get("CHAR_UUID", CHARACTERISTIC_UUID),
-                "firmware": fields.get("FW", "?"),
-                "auth_key": key_blob,
-                "auth_key_protection": scheme,
-                "paired_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            }
-            with open(CONFIG_FILE, "w") as f:
-                json.dump(config, f, indent=2)
-
-            return True, f"Token {token_fingerprint(token_id.hex())} bound (BLE {mac})"
+            return _save_pairing(host_id, token_id, auth_key, mac, fields)
     finally:
         if ser is not None:
             ser.close()
@@ -320,6 +339,37 @@ def pair_token_usb(com_port: str, progress=None) -> tuple[bool, str]:
     if drops:
         return False, (f"The connection to the token kept dropping. Check the cable and close any "
                        f"other program using {com_port}, then try again.")
+    return None, "timeout"       # no reply at all — let the caller fall back / report
+
+
+def pair_token_usb(com_port: str, progress=None) -> tuple[bool, str]:
+    """
+    Bind the token over USB. Encrypted (ECDH) pairing is tried first so the auth key
+    never crosses the wire in plaintext; if the token runs older firmware that does
+    not understand it, pairing falls back to the legacy plaintext handshake.
+
+    progress, if given, is called with short status lines for the UI.
+    """
+    from pair_crypto import new_keypair
+    report = progress or (lambda _msg: None)
+    host_id = get_host_id()
+    request_id = os.urandom(8).hex()
+    pc_priv, pc_pub = new_keypair()
+
+    report(f"Connecting to {com_port}…")
+    report("Pairing securely (encrypted key exchange). No buttons need pressing…")
+    result, msg = _pair_once(com_port, "ecdh", host_id, request_id, pc_priv, pc_pub,
+                             report, time.time() + PAIR_WINDOW_S)
+    if result is not None:
+        return result, msg
+
+    # Old firmware: fall back to the legacy plaintext handshake.
+    report("This token uses older firmware without encrypted pairing — using legacy pairing…")
+    result, msg = _pair_once(com_port, "legacy", host_id, request_id, pc_priv, pc_pub,
+                             report, time.time() + PAIR_WINDOW_S)
+    if result is not None:
+        return result, msg
+
     return False, ("The token did not answer. Check its firmware is flashed and no serial monitor is "
                    "open. After start-up its light should give 2 short flashes; if it doesn't, see "
                    "Troubleshooting on this page.")
