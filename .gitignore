@@ -52,3 +52,7 @@ Python/token_config.json
 # verify the app but are not needed to run it; kept local, not shipped.
 /devtools/
 /Images/
+# ─── Evidence (local only — report artifacts, not app code) ───
+# Logs + screenshots documenting test/verification runs. Kept locally
+# for the report; not pushed. The app and tests do not depend on them.
+/evidence/
