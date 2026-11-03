@@ -135,7 +135,7 @@ def idle(w):
 # ── Startup ──────────────────────────────────────────────────────────────────
 
 def test_startup_shows_paired_token_and_all_pages(win):
-    assert win._tabs.count() == 5
+    assert win._tabs.count() == 6
     assert win._token_cfg is not None
     assert win._ping_btn.isEnabled() and win._forget_btn.isEnabled()
     assert win._pair_btn.isEnabled()                      # a port is available
@@ -434,6 +434,143 @@ def test_single_shard_decrypt_suggests_split_mode(win):
     win._enc_payload.set_path(str(win.files / "secret.txt"))
     win._enc_carrier.set_path(str(win.files / "carrier.png"))
     win._enc_output.set_path(str(win.files / "carrier_stego.png"))
+
+
+def test_token_chip_tracks_reachability(win, monkeypatch):
+    win._token_reachable = None
+    win._refresh_token_chip()
+    assert "Paired" in win._token_chip.text()          # paired, not yet contacted
+
+    win._start_ping()
+    assert idle(win)
+    assert "Connected" in win._token_chip.text()
+
+    def offline():
+        raise ui_main.TokenError(f"{ui_main.TOKEN_UNREACHABLE_HINT} Is it powered on and in range?")
+    monkeypatch.setattr(ui_main, "ping_token", offline)
+    win._start_ping()
+    assert idle(win)
+    assert "Not in range" in win._token_chip.text()
+
+    # A failure that is not about connectivity (the token answered) leaves it alone
+    win._note_token_result(False, "Decryption failed — Authentication tag mismatch")
+    assert "Not in range" in win._token_chip.text()
+
+    monkeypatch.undo()
+    win._start_ping()
+    assert idle(win)
+    assert "Connected" in win._token_chip.text()
+
+
+def test_decrypt_key_card_says_signals_come_from_the_image(win):
+    win._apply_selection(set(), None)
+    text = win._dec_key_lbl.text()
+    assert "read from the image" in text
+    assert "No signals selected" not in text           # no misleading warning on Decrypt
+    assert "No signals selected" in win._enc_key_lbl.text()   # Encrypt still warns
+    win._apply_selection(DEVICE_BOUND, "builtin:Device-bound")
+
+
+def test_signal_rows_fit_without_clipping(win):
+    win.resize(1200, 800)
+    win._tabs.setCurrentIndex(win.TAB_SIGNALS)
+    loop = QEventLoop()
+    for _ in range(5):
+        loop.processEvents()
+    rows = [r for r in win._signal_rows if r.isVisible()]
+    assert rows
+    for row in rows:
+        badge = row._badge
+        assert badge.geometry().right() <= row.width(), (
+            f"{row._signal.id}: badge ends at {badge.geometry().right()} > row width {row.width()}")
+
+
+def test_vault_create_add_open_lock_unlock(win, monkeypatch, tmp_path):
+    vdir = tmp_path / "EnvVault"
+    win._vault_loc.setText(str(vdir))
+    win._apply_selection(DEVICE_BOUND, "builtin:Device-bound")
+
+    # Don't let the one-time recovery dialog or shred prompt block the offscreen run
+    monkeypatch.setattr(ui_main.MainWindow, "_show_recovery_code", lambda self, code: None)
+
+    win._vault_create()
+    assert idle(win)
+    assert win._vault is not None and win._vault.count() == 0
+    assert ui_main.V.is_vault(str(vdir))
+
+    # Add a file (keep the original: answer "No" to the shred prompt)
+    src = tmp_path / "secret_note.txt"
+    src.write_text("vault body content", encoding="utf-8")
+    monkeypatch.setattr(ui_main.QFileDialog, "getOpenFileNames",
+                        staticmethod(lambda *a, **k: ([str(src)], "")))
+    monkeypatch.setattr(ui_main.QMessageBox, "question",
+                        staticmethod(lambda *a, **k: ui_main.QMessageBox.StandardButton.No))
+    win._vault_add_files()
+    assert idle(win)
+    assert win._vault.count() == 1
+    assert win._vault_table.rowCount() == 1
+    assert src.exists()                                   # original kept (said No)
+
+    # Open in the in-memory viewer (don't actually exec a modal)
+    opened = {}
+    class FakeViewer:
+        def __init__(self, name, data, parent=None): opened["name"], opened["data"] = name, data
+        def exec(self): return 0
+    monkeypatch.setattr(ui_main, "VaultViewer", FakeViewer)
+    win._vault_table.selectRow(0)
+    win._vault_open_selected()
+    assert idle(win)
+    assert opened == {"name": "secret_note.txt", "data": b"vault body content"}
+
+    # Lock, then unlock again with the token+environment
+    win._vault_do_lock("locked for test")
+    assert win._vault is None
+    win._vault_unlock()
+    assert idle(win)
+    assert win._vault is not None and win._vault.count() == 1
+
+
+def test_vault_viewer_decodes_jpeg(win, tmp_path):
+    # Regression: QPixmap.loadFromData can't decode JPEG without Qt's plugin;
+    # the viewer must fall back to Pillow and show the image, not "can't preview".
+    import io
+    arr = (np.random.rand(60, 80, 3) * 255).astype("uint8")
+    buf = io.BytesIO()
+    Image.fromarray(arr, "RGB").save(buf, format="JPEG")
+    jpeg = buf.getvalue()
+
+    pm = ui_main.VaultViewer._pixmap_from(jpeg)
+    assert pm is not None and not pm.isNull()
+    assert pm.width() == 80 and pm.height() == 60
+
+
+def test_vault_viewer_downscales_huge_images(win):
+    # Regression: a large image must be capped (Qt's 256 MB allocation limit / memory).
+    import io
+    arr = (np.random.rand(600, 9000, 3) * 255).astype("uint8")   # 9000 px wide
+    buf = io.BytesIO()
+    Image.fromarray(arr, "RGB").save(buf, format="PNG")
+    pm = ui_main.VaultViewer._pixmap_from(buf.getvalue())
+    assert pm is not None and not pm.isNull()
+    assert max(pm.width(), pm.height()) <= ui_main.VaultViewer.MAX_DIM
+
+
+def test_vault_auto_locks_when_token_unreachable(win, monkeypatch, tmp_path):
+    vdir = tmp_path / "EnvVault2"
+    win._vault_loc.setText(str(vdir))
+    win._apply_selection(DEVICE_BOUND, "builtin:Device-bound")
+    monkeypatch.setattr(ui_main.MainWindow, "_show_recovery_code", lambda self, code: None)
+    win._vault_create()
+    assert idle(win)
+    assert win._vault is not None
+
+    # Token drops off: the heartbeat should auto-lock the vault
+    def gone():
+        raise ui_main.TokenError(f"{ui_main.TOKEN_UNREACHABLE_HINT} Is it powered on and in range?")
+    monkeypatch.setattr(ui_main, "ping_token", gone)
+    win._vault_heartbeat_tick()
+    assert wait_until(lambda: win._vault is None)         # heartbeat thread locks it
+    assert "Auto-locked" in win._vault_result.text()
 
 
 def test_multi_picker_drop_filters_non_carriers(win):

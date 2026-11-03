@@ -3,7 +3,9 @@ EnvStego - winutils.py
 Small Windows / OS platform helpers, grouped in one place:
 
   • copy_file_times      — copy a file's timestamps onto another (blend-in dates)
+  • timestomp            — reset a file's timestamps to a fixed generic value
   • shred_file           — overwrite a file's bytes, then delete it
+  • wipe_free_space      — overwrite a volume's free space (cipher /w)
   • pictures_dir / downloads_dir — locate the user's standard folders
   • protect_str / unprotect_str  — DPAPI-seal small settings values
 
@@ -18,8 +20,8 @@ import base64
 import os
 
 __all__ = [
-    "copy_file_times",
-    "shred_file",
+    "copy_file_times", "timestomp",
+    "shred_file", "wipe_free_space",
     "pictures_dir", "downloads_dir",
     "protect_str", "unprotect_str",
 ]
@@ -76,6 +78,36 @@ def copy_file_times(src: str, dst: str) -> bool:
         return False
 
 
+# A fixed, unremarkable timestamp (2001-09-09 01:46:40 UTC). Using a constant —
+# rather than "now" or a random date — means a stomped remnant carries no useful
+# timeline and does not stand out as freshly touched either.
+_NEUTRAL_EPOCH = 1_000_000_000
+
+
+def timestomp(path: str, when: float = _NEUTRAL_EPOCH) -> bool:
+    """
+    Reset a file's accessed/modified and (on Windows) created times to a fixed,
+    generic value. Done just before deletion so the freed $MFT record leaves no
+    meaningful timeline behind.
+
+    HONEST LIMITATION: this changes the file's *current* timestamps only. NTFS
+    also records the original create/modify/delete times in the change journal
+    ($UsnJrnl) and transaction log ($LogFile); those are not reachable here, so a
+    forensic timeline can still be reconstructed from them. Best-effort; never
+    raises.
+    """
+    try:
+        os.utime(path, (when, when))
+        if os.name == "nt":
+            try:
+                _windows_set_creation_time(path, when)
+            except OSError:
+                pass
+        return True
+    except OSError:
+        return False
+
+
 # ─── Secure delete ────────────────────────────────────────────────────────────
 # After encrypting, the original plaintext is still on disk; an ordinary delete
 # only unlinks it. This overwrites the data first.
@@ -85,8 +117,13 @@ def copy_file_times(src: str, dst: str) -> bool:
 # possible. The only sure approach is never to write the plaintext to such a disk.
 # The UI states this; this function does the best-effort overwrite.
 
-def shred_file(path: str, passes: int = 3) -> bool:
+def shred_file(path: str, passes: int = 3, neutralize_timeline: bool = True) -> bool:
     """Overwrite path with random data (passes times), truncate, then delete it.
+
+    With neutralize_timeline (default), the file's timestamps are reset to a
+    generic value before deletion so the freed directory/$MFT entry leaves no
+    meaningful timeline. The original name is also removed by renaming to a random
+    name before unlinking.
 
     Returns True on success. Returns False if the path is not a regular file.
     Raises OSError if the file exists but cannot be overwritten or removed.
@@ -109,6 +146,9 @@ def shred_file(path: str, passes: int = 3) -> bool:
         f.flush()
         os.fsync(f.fileno())
 
+    if neutralize_timeline:
+        timestomp(path)
+
     # Rename to a random name before unlinking so the original name is not left in
     # the directory entry.
     folder = os.path.dirname(path) or "."
@@ -116,6 +156,40 @@ def shred_file(path: str, passes: int = 3) -> bool:
     os.replace(path, scratch)
     os.remove(scratch)
     return True
+
+
+# ─── Free-space wipe ───────────────────────────────────────────────────────────
+# Shredding overwrites a file in place, but on NTFS the data may have been
+# relocated (e.g. by defrag) and the freed clusters of earlier copies still hold
+# plaintext. `cipher /w` overwrites all *free* space on the volume, clobbering
+# those remnants. It needs no admin rights.
+#
+# HONEST LIMITATION: this is SLOW (it fills the free space three times) and is
+# largely ineffective on SSD/flash, where wear-levelling means the physical cells
+# are not the ones the OS can address. Offer it explicitly; never run it silently.
+
+def wipe_free_space(folder: str, timeout: float | None = None) -> bool:
+    """
+    Overwrite the free space on the volume that contains `folder`, using Windows'
+    built-in `cipher /w`. Returns True if the command ran and reported success.
+
+    Returns False off Windows, if the folder does not exist, or if the command
+    fails. Blocking and potentially very slow; callers should run it off the GUI
+    thread and warn the user first.
+    """
+    if os.name != "nt" or not os.path.isdir(folder):
+        return False
+    import subprocess
+    try:
+        # CREATE_NO_WINDOW keeps the console cipher.exe would otherwise pop up hidden.
+        proc = subprocess.run(
+            ["cipher", f"/w:{folder}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=0x08000000, timeout=timeout,
+        )
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 # ─── User folders ─────────────────────────────────────────────────────────────

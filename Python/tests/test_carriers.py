@@ -292,6 +292,27 @@ def test_dispatcher_embed_extract_wav(tmp_path):
     assert media.extract_lsb_bytes(out, len(blob)) == blob
 
 
+def test_read_lsb_all_matches_piecewise_png(tmp_path):
+    # The single-pass reader (used by the decrypt worker) must agree byte-for-byte
+    # with reading prefixes via extract_lsb_bytes, and be capacity-long.
+    carrier = _png(tmp_path / "c.png", 60, 40)
+    blob = bytes((i * 13) % 256 for i in range(900))
+    out = media.embed_blob(str(carrier), blob, str(tmp_path / "o.png"))
+    full = media.read_lsb_all(out)
+    assert len(full) == media.lsb_capacity_bytes(out)
+    assert full[:len(blob)] == blob
+    assert full[:ce.OUTER_SIZE] == media.extract_lsb_bytes(out, ce.OUTER_SIZE)
+
+
+def test_read_lsb_all_matches_piecewise_wav(tmp_path):
+    carrier = _wav(tmp_path / "c.wav")
+    blob = bytes((i * 29) % 256 for i in range(1500))
+    out = media.embed_blob(carrier, blob, str(tmp_path / "o.wav"))
+    full = media.read_lsb_all(out)
+    assert len(full) == media.lsb_capacity_bytes(out)
+    assert full[:len(blob)] == blob
+
+
 def test_v3_header_and_payload_in_wav(tmp_path):
     carrier = _wav(tmp_path / "song.wav", seconds=2.0)
     salt, nonce = bytes(16), bytes(12)

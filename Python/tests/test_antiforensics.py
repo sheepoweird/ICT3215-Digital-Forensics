@@ -27,8 +27,8 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 import stego_engine
-from winutils import (copy_file_times, shred_file, pictures_dir, downloads_dir,
-                      protect_str, unprotect_str)
+from winutils import (copy_file_times, timestomp, shred_file, pictures_dir,
+                      downloads_dir, protect_str, unprotect_str)
 
 
 def _carrier(path, dt_epoch=None):
@@ -121,6 +121,18 @@ def test_shred_empty_file(tmp_path):
     f.touch()
     assert shred_file(str(f)) is True
     assert not f.exists()
+
+
+def test_timestomp_resets_mtime_to_neutral(tmp_path):
+    f = tmp_path / "fresh.txt"
+    f.write_bytes(b"just created, so mtime is 'now'")
+    assert timestomp(str(f)) is True
+    # Timestamp is pinned to the fixed neutral epoch, not the recent write time
+    assert abs(os.path.getmtime(str(f)) - 1_000_000_000) < 2
+
+
+def test_timestomp_missing_file_never_raises(tmp_path):
+    assert timestomp(str(tmp_path / "gone.txt")) is False
 
 
 # ── Settings sealing (DPAPI) ──────────────────────────────────────────────────

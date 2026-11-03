@@ -23,6 +23,7 @@ import html
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -30,29 +31,30 @@ from PyQt6.QtWidgets import (
     QPushButton, QCheckBox, QProgressBar, QFileDialog, QTextEdit, QButtonGroup,
     QScrollArea, QFrame, QTableWidget, QTableWidgetItem, QLineEdit, QStatusBar,
     QGridLayout, QHeaderView, QMessageBox, QComboBox, QInputDialog, QToolButton,
-    QApplication, QListWidget, QListWidgetItem,
+    QApplication, QListWidget, QListWidgetItem, QSizePolicy, QDialog,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QUrl, QPointF, QTimer
-from PyQt6.QtGui import QColor, QDesktopServices, QPainter, QPainterPath, QPen, QPixmap
+from PyQt6.QtGui import QColor, QDesktopServices, QPainter, QPainterPath, QPen, QPixmap, QImage
 
 from signals import EnvSignal, collect_all_signals
 from crypto_engine import (
     derive_env_key, encrypt_payload, decrypt_payload, estimate_entropy_bits,
     pack_payload, unpack_payload, packed_size,
     request_index_key, pack_header, unpack_header, OUTER_SIZE, PAYLOAD_AAD,
-    SHARD_OUTER_SIZE, KIND_FILE, KIND_FOLDER, payload_kind,
+    SHARD_OUTER_SIZE, unpack_shard_tag, KIND_FILE, KIND_FOLDER, payload_kind,
 )
 import multi_image as mi
 import media
+import vault as V
 from archive import zip_folder, safe_extract_zip
 from stego_engine import extract, MAGIC, LEGACY_MAGIC
-from media import embed_blob, extract_lsb_bytes, lsb_capacity_bytes
+from media import embed_blob, lsb_capacity_bytes, read_lsb_all
 from winutils import pictures_dir, downloads_dir
 from winutils import protect_str, unprotect_str
 from cryptography.exceptions import InvalidTag
 from token_comms import (
     pair_token_usb, ping_token, load_config, forget_pairing, list_serial_ports,
-    token_fingerprint, TokenError,
+    token_fingerprint, TokenError, UNREACHABLE_MSG as TOKEN_UNREACHABLE_HINT,
 )
 
 
@@ -177,6 +179,14 @@ QPushButton#chip_off {
     background: #2d1a1a; color: #f85149; border: 1px solid #da3633; border-radius: 15px; padding: 4px 14px;
 }
 QPushButton#chip_off:hover { border-color: #f85149; }
+QPushButton#chip_idle {
+    background: #161b22; color: #adbac7; border: 1px solid #30363d; border-radius: 15px; padding: 4px 14px;
+}
+QPushButton#chip_idle:hover { border-color: #58a6ff; }
+QPushButton#chip_warn {
+    background: #272115; color: #d29922; border: 1px solid #9e6a03; border-radius: 15px; padding: 4px 14px;
+}
+QPushButton#chip_warn:hover { border-color: #d29922; }
 
 QToolButton {
     background: transparent; color: #6e7681; border: none; padding: 0 6px; font-size: 13px;
@@ -566,11 +576,11 @@ class DecryptWorker(QThread):
                 self._decrypt_multi()        # a payload split across several images
                 return
 
-            cap = lsb_capacity_bytes(self._stego)
-            if cap < 4:
+            stream = read_lsb_all(self._stego)   # decode the carrier once, then slice
+            if len(stream) < 4:
                 self.error.emit("This image is too small to contain an EnvStego payload.")
                 return
-            marker = extract_lsb_bytes(self._stego, 4)
+            marker = stream[:4]
 
             if marker == LEGACY_MAGIC:
                 self.error.emit(
@@ -580,28 +590,31 @@ class DecryptWorker(QThread):
             if marker == MAGIC:
                 self._decrypt_v2()           # legacy ENV2 image, uses the page's selection
             else:
-                self._decrypt_v3(cap)        # current format, signals read from the header
+                self._decrypt_v3(stream)     # current format, signals read from the header
         except InvalidTag:
             self.error.emit(ENV_MISMATCH_MSG)
         except Exception as e:
             self.error.emit(str(e))
 
     # -- current format: token-encrypted header, signals auto-detected -------------
-    def _decrypt_v3(self, cap: int):
+    def _decrypt_v3(self, stream: bytes):
+        cap = len(stream)
         if cap < OUTER_SIZE:
             self.error.emit("No EnvStego payload detected in this image.")
             return
         index_key = request_index_key()          # token round-trip 1
         try:
-            salt, nonce, ct_len, ids = unpack_header(index_key, extract_lsb_bytes(self._stego, OUTER_SIZE))
+            salt, nonce, ct_len, ids = unpack_header(index_key, stream[:OUTER_SIZE])
         except InvalidTag:
             # The header did not decrypt. Before blaming the token, check whether this
             # image is actually one piece of a split set — a common mistake is to pick a
-            # single shard without enabling split mode.
-            try:
-                _mid, _idx, total, _slen = mi.inspect_shard(index_key, self._stego)
-            except InvalidTag:
-                total = None
+            # single shard without enabling split mode. Reuse the decoded stream.
+            total = None
+            if cap >= SHARD_OUTER_SIZE:
+                try:
+                    _mid, _idx, total, _slen = unpack_shard_tag(index_key, stream[:SHARD_OUTER_SIZE])
+                except InvalidTag:
+                    total = None
             if total:
                 self.error.emit(
                     f"This carrier is one piece of a set split across {total} carriers.\n\n"
@@ -616,7 +629,7 @@ class DecryptWorker(QThread):
         if ct_len <= 0 or ct_len > cap - OUTER_SIZE:
             self.error.emit("The image header is corrupted or the image was recompressed.")
             return
-        ct = extract_lsb_bytes(self._stego, OUTER_SIZE + ct_len)[OUTER_SIZE:]
+        ct = stream[OUTER_SIZE:OUTER_SIZE + ct_len]
         self._finish_v3(salt, nonce, ids, ct, "read from the image header")
 
     # -- current format, split across several images -------------------------------
@@ -703,6 +716,103 @@ class DecryptWorker(QThread):
             f"  Recovered:    {recovered}\n"
             f"  Saved to:     {saved}",
             fp, saved, data)
+
+
+# ─── VAULT WORKERS (token-bound; run off the GUI thread) ─────────────────────
+
+class VaultCreateWorker(QThread):
+    done  = pyqtSignal(object, str)   # (Vault, recovery_code)
+    error = pyqtSignal(str)
+
+    def __init__(self, path, selected_ids):
+        super().__init__()
+        self._path = path
+        self._ids = set(selected_ids)
+
+    def run(self):
+        try:
+            selected, missing = _resolve_selection(self._ids)
+            if not selected:
+                self.error.emit("Select at least one readable signal on the Signals page first.")
+                return
+            if missing:
+                self.error.emit("Some selected signals are unreadable: "
+                                + ", ".join(s.name for s in missing))
+                return
+            index_key = request_index_key()
+            env_key, _fp = derive_env_key(selected)
+            v, code = V.create_vault(self._path, index_key, env_key, [s.id for s in selected])
+            self.done.emit(v, code)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class VaultUnlockWorker(QThread):
+    done  = pyqtSignal(object, list, str)   # (Vault, signal_ids, fingerprint)
+    error = pyqtSignal(str)
+
+    def __init__(self, path):
+        super().__init__()
+        self._path = path
+
+    def run(self):
+        try:
+            index_key = request_index_key()
+            try:
+                sig_ids = V.read_signal_ids(self._path, index_key)
+            except InvalidTag:
+                self.error.emit("This vault was made with a different token — it cannot be opened here.")
+                return
+            selected, missing = _resolve_selection(set(sig_ids))
+            if missing:
+                self.error.emit(
+                    "The vault needs these signals, which cannot be read here:\n  "
+                    + "\n  ".join(s.name for s in missing)
+                    + "\n\nMove back to the original environment, or unlock with the recovery code.")
+                return
+            env_key, fp = derive_env_key(selected)
+            try:
+                v = V.unlock_env(self._path, env_key)
+            except InvalidTag:
+                self.error.emit(
+                    "The environment does not match — the vault key could not be rebuilt.\n\n"
+                    "A signal changed (network/location?), or this is a different machine. "
+                    "Use the recovery code, then re-bind the vault to this environment.")
+                return
+            self.done.emit(v, sig_ids, fp)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class VaultHeartbeatWorker(QThread):
+    """A lightweight reachability check for auto-lock (the dead-man's switch)."""
+    result = pyqtSignal(bool, str)
+
+    def run(self):
+        try:
+            ping_token()
+            self.result.emit(True, "")
+        except TokenError as e:
+            self.result.emit(False, str(e))
+        except Exception as e:
+            self.result.emit(False, str(e))
+
+
+class VaultTaskWorker(QThread):
+    """Runs a local vault operation (add/read/export) off the GUI thread so a big
+    file does not freeze the window. No token/BLE involved — the vault is unlocked."""
+    done  = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self._fn())
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 # ─── REUSABLE WIDGETS ────────────────────────────────────────────────────────
@@ -978,6 +1088,92 @@ class MultiFilePicker(QWidget):
         return self._list.count()
 
 
+def _looks_textual(data: bytes) -> bool:
+    if b"\x00" in data[:8192]:
+        return False
+    try:
+        data[:8192].decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
+class VaultViewer(QDialog):
+    """Shows a decrypted file from RAM only — nothing is written to disk."""
+    _IMG = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
+
+    MAX_DIM = 4096      # cap the displayed image so a huge photo can't exhaust memory
+
+    @staticmethod
+    def _pixmap_from(data: bytes):
+        """
+        Decode an image with Pillow (handles JPEG/PNG/etc. without Qt's image plugins)
+        and downscale very large images. A small JPEG can decode to hundreds of MB of
+        pixels, which Qt refuses to allocate and which there is no point rendering at
+        full size, so cap it to screen size here.
+        """
+        try:
+            import io
+            from PIL import Image
+            im = Image.open(io.BytesIO(data))
+            # JPEG can decode directly at a reduced scale — much faster and lighter.
+            im.draft("RGB", (VaultViewer.MAX_DIM, VaultViewer.MAX_DIM))
+            im.load()
+            if max(im.size) > VaultViewer.MAX_DIM:
+                im.thumbnail((VaultViewer.MAX_DIM, VaultViewer.MAX_DIM), Image.LANCZOS)
+            im = im.convert("RGBA")
+            qimg = QImage(im.tobytes("raw", "RGBA"), im.width, im.height,
+                          QImage.Format.Format_RGBA8888)
+            return QPixmap.fromImage(qimg.copy())      # copy so the pixmap owns the pixels
+        except Exception:
+            pm = QPixmap()                             # last resort: Qt's own loader
+            return pm if pm.loadFromData(data) else None
+
+    def __init__(self, name: str, data: bytes, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Vault · {name}")
+        self.resize(780, 640)
+        lay = QVBoxLayout(self)
+        head = QLabel(f"{name}  ·  {len(data):,} bytes  ·  shown from memory (no copy on disk)")
+        head.setObjectName("subtle")
+        lay.addWidget(head)
+
+        shown = False
+        if Path(name).suffix.lower() in self._IMG:
+            pm = self._pixmap_from(data)
+            if pm is not None:
+                lbl = QLabel()
+                lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                lbl.setPixmap(pm)
+                area = QScrollArea()
+                area.setWidgetResizable(True)
+                area.setWidget(lbl)
+                lay.addWidget(area, stretch=1)
+                shown = True
+        if not shown and _looks_textual(data):
+            te = QTextEdit()
+            te.setReadOnly(True)
+            te.setStyleSheet("font-family:Consolas,monospace;")
+            text = data.decode("utf-8", errors="replace")
+            te.setPlainText(text[:200_000] + ("\n…(truncated)…" if len(text) > 200_000 else ""))
+            lay.addWidget(te, stretch=1)
+            shown = True
+        if not shown:
+            info = QLabel("This file type can't be previewed in memory.\n\nUse <b>Export</b> to open it "
+                          "in its own program — that writes a decrypted copy to disk, which you should "
+                          "delete when done.")
+            info.setWordWrap(True)
+            info.setObjectName("muted")
+            lay.addWidget(info, stretch=1)
+
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(close)
+        lay.addLayout(row)
+
+
 class StatusPanel(QLabel):
     """Result/status panel below action buttons."""
 
@@ -1055,9 +1251,15 @@ class SignalRow(QWidget):
         name_lbl.setProperty("readable", self.readable)
         desc_lbl = QLabel(self._signal.description)
         desc_lbl.setObjectName("sig_desc")
+        # Wrap and allow shrinking, so a long description never pushes the stability
+        # column and badge past the right edge (the list has no horizontal scrollbar).
+        for lbl in (name_lbl, desc_lbl):
+            lbl.setWordWrap(True)
+            lbl.setMinimumWidth(0)
+            lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         info.addWidget(name_lbl)
         info.addWidget(desc_lbl)
-        layout.addLayout(info, stretch=4)
+        layout.addLayout(info, stretch=1)
 
         stab_col = QVBoxLayout()
         stab_col.setSpacing(4)
@@ -1244,7 +1446,7 @@ class NavButton(QPushButton):
 
 class MainWindow(QMainWindow):
 
-    TAB_SIGNALS, TAB_ENCRYPT, TAB_DECRYPT, TAB_TOKEN, TAB_INSPECTOR = range(5)
+    TAB_SIGNALS, TAB_ENCRYPT, TAB_DECRYPT, TAB_TOKEN, TAB_INSPECTOR, TAB_VAULT = range(6)
 
     # Page titles shown in the top bar, keyed by page index
     PAGE_INFO = {
@@ -1258,11 +1460,13 @@ class MainWindow(QMainWindow):
                         "Pair, test and manage the 3T token that holds the master secret."),
         TAB_INSPECTOR: ("Signal inspector",
                         "Raw values read from this machine, and which ones feed the key."),
+        TAB_VAULT:     ("Env Vault",
+                        "An encrypted store bound to this PC and the token. Locks itself when the token leaves."),
     }
     # Sidebar layout: (group, [(page index, label)]) in workflow order
     NAV_LAYOUT = [
         ("SETUP",       [(TAB_TOKEN, "Token"), (TAB_SIGNALS, "Signals")]),
-        ("PROTECT",     [(TAB_ENCRYPT, "Encrypt"), (TAB_DECRYPT, "Decrypt")]),
+        ("PROTECT",     [(TAB_ENCRYPT, "Encrypt"), (TAB_DECRYPT, "Decrypt"), (TAB_VAULT, "Vault")]),
         ("DIAGNOSTICS", [(TAB_INSPECTOR, "Inspector")]),
     ]
 
@@ -1290,6 +1494,9 @@ class MainWindow(QMainWindow):
         self._busy = False
         self._collecting = False
         self._last_test: tuple[frozenset, str, dict] | None = None
+        self._token_reachable: bool | None = None   # None = not contacted this session
+        self._vault: V.Vault | None = None           # unlocked vault instance, else None
+        self._vault_sig_ids: list[str] = []          # signals the open vault is bound to
         self._enc_output_auto = False
         self._enc_capacity_ok = False
         self._pending_pair_msg: str | None = None
@@ -1371,6 +1578,11 @@ class MainWindow(QMainWindow):
         self._settings.sync()
 
     def closeEvent(self, event):
+        # Lock the vault on exit so its key never outlives the window.
+        if self._vault is not None:
+            self._vault_timer.stop()
+            self._vault.lock()
+            self._vault = None
         self._settings.setValue("window/geometry", self.saveGeometry())
         self._settings.setValue("window/tab", self._tabs.currentIndex())
         self._settings.setValue("enc/output_auto", self._enc_output_auto)
@@ -1416,6 +1628,7 @@ class MainWindow(QMainWindow):
         self._tabs.addWidget(self._build_decrypt_tab())
         self._tabs.addWidget(self._build_token_tab())
         self._tabs.addWidget(self._build_inspector_tab())
+        self._tabs.addWidget(self._build_vault_tab())
         self._tabs.currentChanged.connect(self._on_page_changed)
         vbox.addWidget(self._tabs, stretch=1)
         hbox.addWidget(main, stretch=1)
@@ -1938,6 +2151,7 @@ class MainWindow(QMainWindow):
 
     def _on_test_done(self, ids: frozenset, fp: str, snapshot: dict):
         self._set_busy(False)
+        self._note_token_result(True)
         self._test_btn.setText("Test Key")
         changed = []
         note = ""
@@ -1977,6 +2191,7 @@ class MainWindow(QMainWindow):
 
     def _on_test_error(self, msg: str):
         self._set_busy(False)
+        self._note_token_result(False, msg)
         self._test_btn.setText("Test Key")
         self._fp_lbl.setText("Key fingerprint:  error")
         QMessageBox.warning(self, "Test Key failed", msg)
@@ -2291,6 +2506,7 @@ class MainWindow(QMainWindow):
 
     def _on_encrypt_done(self, msg: str, fp: str, out_path: str):
         self._set_busy(False)
+        self._note_token_result(True)
         self._enc_btn.setText(self.ENC_LABEL)
         self._enc_result.show_success(msg)
         self._enc_fp_lbl.setText(f"Key fingerprint:  {fp}")
@@ -2336,6 +2552,7 @@ class MainWindow(QMainWindow):
 
     def _on_encrypt_error(self, msg: str):
         self._set_busy(False)
+        self._note_token_result(False, msg)
         self._enc_btn.setText(self.ENC_LABEL)
         self._enc_result.show_error(msg)
         self._status.showMessage("Encryption failed")
@@ -2435,7 +2652,7 @@ class MainWindow(QMainWindow):
         else:
             stego = self._dec_stego.path()
             if not stego or not os.path.isfile(stego):
-                out.append("choose a stego image")
+                out.append("choose a stego carrier (PNG or WAV)")
         return out
 
     def _do_decrypt(self):
@@ -2464,6 +2681,7 @@ class MainWindow(QMainWindow):
 
     def _on_decrypt_done(self, msg: str, fp: str, out_path: str, plaintext: bytes):
         self._set_busy(False)
+        self._note_token_result(True)
         self._dec_btn.setText(self.DEC_LABEL)
         self._dec_result.show_success(msg)
         self._dec_fp_lbl.setText(f"Key fingerprint:  {fp}")
@@ -2482,6 +2700,7 @@ class MainWindow(QMainWindow):
 
     def _on_decrypt_error(self, msg: str):
         self._set_busy(False)
+        self._note_token_result(False, msg)
         self._dec_btn.setText(self.DEC_LABEL)
         self._dec_result.show_error(msg)
         self._status.showMessage("Decryption failed")
@@ -2666,12 +2885,45 @@ class MainWindow(QMainWindow):
         self._trouble_toggle = toggle
         return card
 
+    def _refresh_token_chip(self):
+        """Header chip: paired? and, if known, did the token last answer over Bluetooth?"""
+        cfg = self._token_cfg
+        chip = self._token_chip
+        if not cfg:
+            chip.setObjectName("chip_off")
+            chip.setText("○  No token paired")
+            chip.setToolTip("Pair the hardware token on the Token page")
+        else:
+            fp = token_fingerprint(cfg["token_id"])
+            if self._token_reachable is True:
+                chip.setObjectName("chip_ok")
+                chip.setText(f"●  Connected · {fp}")
+                chip.setToolTip("The token answered over Bluetooth this session")
+            elif self._token_reachable is False:
+                chip.setObjectName("chip_warn")
+                chip.setText(f"●  Not in range · {fp}")
+                chip.setToolTip("The last attempt could not reach the token over Bluetooth.\n"
+                                "Is it powered on and nearby? Click to open the Token page.")
+            else:
+                chip.setObjectName("chip_idle")
+                chip.setText(f"●  Paired · {fp}")
+                chip.setToolTip("Paired, not contacted yet this session.\n"
+                                "Use Test connection on the Token page to check it is in range.")
+        chip.style().unpolish(chip)
+        chip.style().polish(chip)
+
+    def _note_token_result(self, ok: bool, msg: str = ""):
+        """Record a real token operation's outcome for the header chip."""
+        if not ok and TOKEN_UNREACHABLE_HINT not in msg:
+            return   # failed for another reason (e.g. wrong environment) — token did answer
+        self._token_reachable = ok
+        self._refresh_token_chip()
+
     def _refresh_token_ui(self):
         cfg = self._token_cfg
+        self._refresh_token_chip()
         if cfg:
             fp = token_fingerprint(cfg["token_id"])
-            self._token_chip.setObjectName("chip_ok")
-            self._token_chip.setText(f"●  Token {fp}")
             self._tok_title.setText(f"✓  Paired with token {fp}")
             self._tok_title.setStyleSheet("font-size:20px; font-weight:600; color:#3fb950;")
             prot = {"dpapi": "Windows DPAPI (bound to your Windows account)",
@@ -2685,8 +2937,6 @@ class MainWindow(QMainWindow):
             }
             self._pair_btn.setText("Re-pair Token")
         else:
-            self._token_chip.setObjectName("chip_off")
-            self._token_chip.setText("○  No token paired")
             self._tok_title.setText("No hardware token paired")
             self._tok_title.setStyleSheet("font-size:20px; font-weight:600; color:#f85149;")
             values = {}
@@ -2778,6 +3028,7 @@ class MainWindow(QMainWindow):
 
     def _on_ping_done(self, ok: bool, msg: str):
         self._set_busy(False)
+        self._note_token_result(ok, msg)
         self._ping_btn.setText("Test connection")
         paired_msg, self._pending_pair_msg = self._pending_pair_msg, None
         if paired_msg and ok:
@@ -2895,6 +3146,413 @@ class MainWindow(QMainWindow):
                 self._inspector_table.setItem(row, col, item)
 
     # ─────────────────────────────────────────────────────────────
+    #  TAB 6 — ENV VAULT
+    # ─────────────────────────────────────────────────────────────
+
+    def _vault_default_path(self) -> str:
+        saved = self._settings.value("vault/path", "")
+        if saved:
+            return saved
+        return os.path.join(os.path.expanduser("~"), "EnvVault")
+
+    def _build_vault_tab(self) -> QWidget:
+        page, layout = _page()
+
+        layout.addWidget(_label(
+            "An encrypted store bound to the token + this PC. Files go in encrypted (originals "
+            "shredded); open them from here while unlocked. It locks itself when the token goes "
+            "out of range. While a file is open its plaintext is only in memory.", "muted"))
+
+        # — status / location card —
+        card, cl = _card(spacing=10)
+        cl.addWidget(_section("Vault"))
+        self._vault_status = QLabel()
+        self._vault_status.setStyleSheet("font-size:16px; font-weight:600;")
+        cl.addWidget(self._vault_status)
+        loc = QHBoxLayout()
+        loc.addWidget(_label("Location:", "subtle"))
+        self._vault_loc = QLabel(self._vault_default_path())
+        self._vault_loc.setObjectName("mono")
+        self._vault_loc.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        loc.addWidget(self._vault_loc)
+        loc.addStretch()
+        self._vault_change_loc = QPushButton("Change…")
+        self._vault_change_loc.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._vault_change_loc.clicked.connect(self._vault_choose_location)
+        loc.addWidget(self._vault_change_loc)
+        cl.addLayout(loc)
+        layout.addWidget(card)
+
+        # — action bar (changes with state) —
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self._vault_create_btn = QPushButton("Create Env Vault")
+        self._vault_create_btn.setObjectName("btn_primary")
+        self._vault_create_btn.clicked.connect(self._vault_create)
+        self._vault_unlock_btn = QPushButton("Unlock")
+        self._vault_unlock_btn.setObjectName("btn_primary")
+        self._vault_unlock_btn.clicked.connect(self._vault_unlock)
+        self._vault_recovery_btn = QPushButton("Unlock with recovery code")
+        self._vault_recovery_btn.clicked.connect(self._vault_unlock_recovery)
+        self._vault_lock_btn = QPushButton("Lock now")
+        self._vault_lock_btn.setObjectName("btn_danger")
+        self._vault_lock_btn.clicked.connect(lambda: self._vault_do_lock("Locked."))
+        for b in (self._vault_create_btn, self._vault_unlock_btn,
+                  self._vault_recovery_btn, self._vault_lock_btn):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            actions.addWidget(b)
+        actions.addStretch()
+        self._vault_add_btn = QPushButton("Add files…")
+        self._vault_add_btn.clicked.connect(self._vault_add_files)
+        self._vault_open_btn = QPushButton("Open")
+        self._vault_open_btn.clicked.connect(self._vault_open_selected)
+        self._vault_export_btn = QPushButton("Export…")
+        self._vault_export_btn.clicked.connect(self._vault_export_selected)
+        self._vault_remove_btn = QPushButton("Remove")
+        self._vault_remove_btn.setObjectName("btn_danger")
+        self._vault_remove_btn.clicked.connect(self._vault_remove_selected)
+        for b in (self._vault_add_btn, self._vault_open_btn,
+                  self._vault_export_btn, self._vault_remove_btn):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            actions.addWidget(b)
+        layout.addLayout(actions)
+
+        self._vault_result = StatusPanel()
+        layout.addWidget(self._vault_result)
+
+        # — file table (visible only when unlocked) —
+        self._vault_table = QTableWidget()
+        self._vault_table.setColumnCount(3)
+        self._vault_table.setHorizontalHeaderLabels(["Name", "Size", "Added"])
+        self._vault_table.verticalHeader().setVisible(False)
+        self._vault_table.setShowGrid(False)
+        self._vault_table.setAlternatingRowColors(True)
+        self._vault_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._vault_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._vault_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        self._vault_table.doubleClicked.connect(lambda *_: self._vault_open_selected())
+        hdr = self._vault_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self._vault_table, stretch=1)
+        layout.addStretch()
+
+        # heartbeat timer for auto-lock (started only while unlocked)
+        self._vault_timer = QTimer(self)
+        self._vault_timer.setInterval(25_000)
+        self._vault_timer.timeout.connect(self._vault_heartbeat_tick)
+        return page
+
+    # -- state / rendering ----------------------------------------------------
+    def _refresh_vault_ui(self):
+        if not getattr(self, "_ui_ready", False):
+            return
+        path = self._vault_loc.text()
+        unlocked = self._vault is not None
+        exists = V.is_vault(path)
+        idle = not self._busy and not self._collecting
+
+        self._vault_create_btn.setVisible(not exists and not unlocked)
+        self._vault_create_btn.setEnabled(idle and bool(self._token_cfg) and bool(self._selected_ids))
+        self._vault_unlock_btn.setVisible(exists and not unlocked)
+        self._vault_unlock_btn.setEnabled(idle and bool(self._token_cfg))
+        self._vault_recovery_btn.setVisible(exists and not unlocked)
+        self._vault_lock_btn.setVisible(unlocked)
+        self._vault_change_loc.setEnabled(not unlocked and idle)
+        for b in (self._vault_add_btn, self._vault_open_btn,
+                  self._vault_export_btn, self._vault_remove_btn):
+            b.setVisible(unlocked)
+            b.setEnabled(unlocked and idle)
+        self._vault_table.setVisible(unlocked)
+
+        if unlocked:
+            reach = {True: "token in range", False: "⚠ token not answering",
+                     None: "token not checked yet"}[self._token_reachable]
+            self._vault_status.setText(
+                f"🔓 Unlocked · {self._vault.count()} item(s) · "
+                f"{self._vault.total_bytes():,} bytes · auto-lock on ({reach})")
+            self._vault_status.setStyleSheet("font-size:16px; font-weight:600; color:#3fb950;")
+        elif exists:
+            self._vault_status.setText("🔒 Locked")
+            self._vault_status.setStyleSheet("font-size:16px; font-weight:600; color:#adbac7;")
+        else:
+            self._vault_status.setText("No vault here yet")
+            self._vault_status.setStyleSheet("font-size:16px; font-weight:600; color:#8b949e;")
+            if not self._token_cfg:
+                self._vault_result.show_info("Pair a token (Token page) and pick signals (Signals page) "
+                                             "before creating a vault.")
+
+    def _populate_vault_table(self):
+        self._vault_table.setRowCount(0)
+        if self._vault is None:
+            return
+        for e in self._vault.list_entries():
+            r = self._vault_table.rowCount()
+            self._vault_table.insertRow(r)
+            name_item = QTableWidgetItem(e["name"])
+            name_item.setData(Qt.ItemDataRole.UserRole, e["blob"])
+            size = e["size"]
+            size_txt = f"{size:,} B" if size < 1024 else (f"{size/1024:.1f} KB" if size < 2**20
+                                                           else f"{size/2**20:.1f} MB")
+            added = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.get("added", 0)))
+            for c, item in enumerate((name_item, QTableWidgetItem(size_txt), QTableWidgetItem(added))):
+                self._vault_table.setItem(r, c, item)
+
+    def _selected_vault_blobs(self) -> list[str]:
+        rows = {ix.row() for ix in self._vault_table.selectedIndexes()}
+        return [self._vault_table.item(r, 0).data(Qt.ItemDataRole.UserRole) for r in sorted(rows)]
+
+    # -- location -------------------------------------------------------------
+    def _vault_choose_location(self):
+        start = self._vault_loc.text() or os.path.expanduser("~")
+        path = QFileDialog.getExistingDirectory(self, "Choose or create a vault folder", start)
+        if path:
+            self._vault_loc.setText(os.path.normpath(path))
+            self._settings.setValue("vault/path", self._vault_loc.text())
+            self._vault_result.clear()
+            self._refresh_vault_ui()
+
+    # -- create ---------------------------------------------------------------
+    def _vault_create(self):
+        path = self._vault_loc.text()
+        if os.path.isdir(path) and os.listdir(path):
+            self._vault_result.show_error("Pick an empty folder (or a new one) for the vault.")
+            return
+        self._set_busy(True)
+        self._vault_result.show_info("Creating vault and sealing its key with the token…")
+        w = VaultCreateWorker(path, self._selected_ids)
+        w.done.connect(self._on_vault_created)
+        w.error.connect(self._on_vault_error)
+        self._start_worker(w)
+
+    def _on_vault_error(self, msg: str):
+        self._set_busy(False)
+        self._note_token_result(False, msg)
+        self._vault_result.show_error(msg)
+        self._refresh_vault_ui()
+
+    def _on_vault_created(self, v, code: str):
+        self._set_busy(False)
+        self._vault = v
+        self._note_token_result(True)
+        self._settings.setValue("vault/path", self._vault_loc.text())
+        self._show_recovery_code(code)
+        self._populate_vault_table()
+        self._start_vault_heartbeat()
+        self._vault_result.show_success("Vault created and unlocked. Keep the recovery code safe.")
+        self._refresh_vault_ui()
+
+    def _show_recovery_code(self, code: str):
+        box = QMessageBox(self)
+        box.setWindowTitle("Recovery code — write this down now")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            "This is the <b>only</b> way to open the vault if the token is lost or the "
+            "environment changes permanently.<br><br>"
+            f"<div style='font-family:Consolas,monospace; font-size:16px; color:#3fb950;'>{code}</div>"
+            "<br>It is <b>not stored anywhere</b> in readable form. Save it somewhere safe and offline.")
+        copy = box.addButton("Copy", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("I've saved it", QMessageBox.ButtonRole.AcceptRole)
+        box.exec()
+        if box.clickedButton() is copy:
+            QApplication.clipboard().setText(code)
+
+    # -- unlock ---------------------------------------------------------------
+    def _vault_unlock(self):
+        self._set_busy(True)
+        self._vault_result.show_info("Reading the vault's signal list, collecting them and asking the token…")
+        w = VaultUnlockWorker(self._vault_loc.text())
+        w.done.connect(self._on_vault_unlocked)
+        w.error.connect(self._on_vault_unlock_error)
+        self._start_worker(w)
+
+    def _on_vault_unlocked(self, v, sig_ids: list, fp: str):
+        self._set_busy(False)
+        self._vault = v
+        self._vault_sig_ids = sig_ids
+        self._note_token_result(True)
+        self._populate_vault_table()
+        self._start_vault_heartbeat()
+        self._vault_result.show_success(
+            f"Vault unlocked · key fingerprint {fp} · {v.count()} item(s).")
+        self._refresh_vault_ui()
+
+    def _on_vault_unlock_error(self, msg: str):
+        self._set_busy(False)
+        self._note_token_result(False, msg)
+        self._vault_result.show_error(msg)
+        self._refresh_vault_ui()
+
+    def _vault_unlock_recovery(self):
+        code, ok = QInputDialog.getText(self, "Unlock with recovery code",
+                                        "Enter the recovery code shown when the vault was created:")
+        if not ok or not code.strip():
+            return
+        try:
+            self._vault = V.unlock_recovery(self._vault_loc.text(), code)
+        except Exception:
+            self._vault_result.show_error("That recovery code did not open the vault.")
+            return
+        self._vault_sig_ids = []
+        self._populate_vault_table()
+        self._start_vault_heartbeat()
+        self._vault_result.show_success(
+            "Vault unlocked with the recovery code. Tip: re-bind it to this environment "
+            "below so the token can open it normally again.")
+        self._refresh_vault_ui()
+
+    # -- lock / auto-lock -----------------------------------------------------
+    def _vault_do_lock(self, reason: str):
+        if self._vault is None:
+            return
+        self._vault_timer.stop()
+        self._vault.lock()
+        self._vault = None
+        self._vault_table.setRowCount(0)
+        self._vault_result.show_info(reason)
+        self._refresh_vault_ui()
+
+    def _start_vault_heartbeat(self):
+        self._vault_timer.start()
+
+    def _vault_heartbeat_tick(self):
+        if self._vault is None or self._busy:
+            return
+        w = VaultHeartbeatWorker()
+        w.result.connect(self._on_vault_heartbeat)
+        self._start_worker(w)
+
+    def _on_vault_heartbeat(self, ok: bool, msg: str):
+        self._note_token_result(ok, msg)
+        if not ok and self._vault is not None:
+            self._vault_do_lock("Auto-locked — the token went out of range. "
+                                "Unlock again when it is back.")
+
+    # -- file operations ------------------------------------------------------
+    def _vault_add_files(self):
+        if self._vault is None:
+            return
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add files to the vault", FilePicker.last_dir)
+        if not paths:
+            return
+        shred = QMessageBox.question(
+            self, "Shred originals?",
+            f"Add {len(paths)} file(s) to the vault and securely delete the originals?\n\n"
+            "Choose No to keep the originals in place.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes
+
+        big = sum(os.path.getsize(p) for p in paths if os.path.isfile(p)) > 256 * 2**20
+        self._set_busy(True)
+        self._vault_result.show_info(
+            "Encrypting into the vault…" + ("  (large file — this can take a moment)" if big else ""))
+        vault, keep = self._vault, not shred
+
+        def work():
+            n = 0
+            for p in paths:
+                vault.add_file(p, shred_original=not keep)
+                n += 1
+            return n
+
+        w = VaultTaskWorker(work)
+        w.done.connect(lambda n: self._on_vault_added(n, shred))
+        w.error.connect(self._on_vault_task_error)
+        self._start_worker(w)
+
+    def _on_vault_added(self, n, shred):
+        self._set_busy(False)
+        self._populate_vault_table()
+        self._vault_result.show_success(
+            f"Added {n} file(s)." + (" Originals shredded." if shred else ""))
+        self._refresh_vault_ui()
+
+    def _on_vault_task_error(self, msg):
+        self._set_busy(False)
+        self._populate_vault_table()
+        self._vault_result.show_error(msg)
+        self._refresh_vault_ui()
+
+    def _vault_open_selected(self):
+        if self._vault is None:
+            return
+        blobs = self._selected_vault_blobs()
+        if not blobs:
+            self._vault_result.show_info("Select an item to open.")
+            return
+        vault, blob = self._vault, blobs[0]
+        self._set_busy(True)
+        self._vault_result.show_info("Decrypting in memory…")
+        w = VaultTaskWorker(lambda: vault.read_bytes(blob))
+        w.done.connect(self._on_vault_opened)
+        w.error.connect(self._on_vault_task_error)
+        self._start_worker(w)
+
+    def _on_vault_opened(self, result):
+        self._set_busy(False)
+        self._vault_result.clear()
+        name, data = result
+        VaultViewer(name, data, self).exec()
+
+    def _vault_export_selected(self):
+        if self._vault is None:
+            return
+        blobs = self._selected_vault_blobs()
+        if not blobs:
+            self._vault_result.show_info("Select item(s) to export.")
+            return
+        if QMessageBox.warning(
+                self, "Export decrypted copy",
+                f"Write {len(blobs)} decrypted file(s) to a folder?\n\n"
+                "These are plaintext copies on disk, outside the vault's protection.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Yes:
+            return
+        dest = QFileDialog.getExistingDirectory(self, "Export to folder", downloads_dir())
+        if not dest:
+            return
+        vault = self._vault
+        self._set_busy(True)
+        self._vault_result.show_info("Exporting decrypted copies…")
+
+        def work():
+            for b in blobs:
+                vault.export(b, dest)
+            return len(blobs), dest
+
+        w = VaultTaskWorker(work)
+        w.done.connect(lambda r: self._on_vault_exported(*r))
+        w.error.connect(self._on_vault_task_error)
+        self._start_worker(w)
+
+    def _on_vault_exported(self, n, dest):
+        self._set_busy(False)
+        self._vault_result.show_success(f"Exported {n} file(s) to {dest}")
+
+    def _vault_remove_selected(self):
+        if self._vault is None:
+            return
+        blobs = self._selected_vault_blobs()
+        if not blobs:
+            return
+        if QMessageBox.warning(
+                self, "Remove from vault",
+                f"Permanently shred and remove {len(blobs)} item(s) from the vault?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Yes:
+            return
+        for b in blobs:
+            try:
+                self._vault.remove(b)
+            except Exception as e:
+                self._vault_result.show_error(f"Could not remove item: {e}")
+                break
+        self._populate_vault_table()
+        self._vault_result.show_success("Removed.")
+        self._refresh_vault_ui()
+
+    # ─────────────────────────────────────────────────────────────
     #  SIGNAL COLLECTION
     # ─────────────────────────────────────────────────────────────
 
@@ -2965,6 +3623,7 @@ class MainWindow(QMainWindow):
         self._ping_btn.setEnabled(not self._busy and paired)
         self._forget_btn.setEnabled(not self._busy and paired)
         self._populate_inspector_marks()
+        self._refresh_vault_ui()
         self._refresh_nav(enc_block, dec_block)
 
     def _populate_inspector_marks(self):
@@ -3009,6 +3668,13 @@ class MainWindow(QMainWindow):
         else:
             self._nav[self.TAB_INSPECTOR].set_status("Scanning…")
 
+        if self._vault is not None:
+            self._nav[self.TAB_VAULT].set_status(f"Unlocked · {self._vault.count()} item(s)", "ok")
+        elif V.is_vault(self._vault_loc.text() if self._ui_ready else self._vault_default_path()):
+            self._nav[self.TAB_VAULT].set_status("Locked", "muted")
+        else:
+            self._nav[self.TAB_VAULT].set_status("Not set up", "muted")
+
     def _update_key_cards(self):
         if not self._ui_ready:
             return
@@ -3027,6 +3693,10 @@ class MainWindow(QMainWindow):
             tok_txt = f"token <b>{token_fingerprint(self._token_cfg['token_id'])}</b>"
         else:
             tok_txt = "<span style='color:#f85149'>no token paired</span>"
-        text = f"{sig_txt} &nbsp;<span style='color:#6e7681'>+</span>&nbsp; {tok_txt}"
-        self._enc_key_lbl.setText(text)
-        self._dec_key_lbl.setText(text)
+        plus = "&nbsp;<span style='color:#6e7681'>+</span>&nbsp;"
+        self._enc_key_lbl.setText(f"{sig_txt} {plus} {tok_txt}")
+        # Decrypt does not use the page selection: current images carry their own
+        # (encrypted) signal list, read from the header with the token's help.
+        self._dec_key_lbl.setText(
+            f"signals <b>read from the image</b> {plus} {tok_txt} {plus} "
+            f"<span style='color:#8b949e'>this PC's live values</span>")

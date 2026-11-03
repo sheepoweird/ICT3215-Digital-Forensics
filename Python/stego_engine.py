@@ -100,8 +100,8 @@ def embed(carrier_path: str, salt: bytes, nonce: bytes, ciphertext: bytes, outpu
     # Convert payload to individual bits (0 or 1)
     payload_bits = np.unpackbits(np.frombuffer(payload, dtype=np.uint8))
 
-    # Flatten image, clear LSBs, write payload bits
-    flat = arr.flatten().copy()
+    # Flatten image (flatten() already returns a copy), clear LSBs, write payload bits
+    flat = arr.flatten()
     n = len(payload_bits)
     flat[:n] = (flat[:n] & np.uint8(0xFE)) | payload_bits.astype(np.uint8)
 
@@ -144,7 +144,7 @@ def embed_blob(carrier_path: str, blob: bytes, output_path: str,
         )
 
     bits = np.unpackbits(np.frombuffer(blob, dtype=np.uint8))
-    flat = arr.flatten().copy()
+    flat = arr.flatten()        # flatten() already returns a copy, so arr is untouched
     n = len(bits)
     flat[:n] = (flat[:n] & np.uint8(0xFE)) | bits.astype(np.uint8)
     out_img = Image.fromarray(flat.reshape(arr.shape).astype(np.uint8), "RGB")
@@ -181,6 +181,21 @@ def lsb_capacity_bytes(image_path: str) -> int:
     """Total bytes carriable in a PNG's LSBs (no header subtracted)."""
     img = Image.open(image_path).convert("RGB")
     return (img.size[0] * img.size[1] * 3) // 8
+
+
+def read_lsb_all(stego_path: str) -> bytes:
+    """
+    Decode the carrier once and return its entire LSB byte stream.
+
+    Extraction needs the header, then the header-plus-payload; calling
+    extract_lsb_bytes twice decodes the PNG twice. Reading the whole stream once
+    and slicing it avoids the repeat decode, which dominates the cost on large
+    carriers. The returned length equals lsb_capacity_bytes(path).
+    """
+    img = Image.open(stego_path).convert("RGB")
+    flat = np.array(img, dtype=np.uint8).flatten()
+    usable = (flat.size // 8) * 8                     # whole bytes only
+    return np.packbits(flat[:usable] & np.uint8(1)).tobytes()
 
 
 def extract(stego_path: str) -> tuple:

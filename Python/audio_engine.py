@@ -93,6 +93,14 @@ def extract_lsb_bytes_wav(stego_path: str, nbytes: int) -> bytes:
     return np.packbits(lsbs).tobytes()
 
 
+def read_lsb_all_wav(stego_path: str) -> bytes:
+    """Read the whole LSB byte stream from a WAV in one pass (see stego_engine.read_lsb_all)."""
+    _params, samples = _read_wav(stego_path)
+    usable = (samples.size // 8) * 8
+    lsbs = (samples[:usable] & samples.dtype.type(1)).astype(np.uint8)
+    return np.packbits(lsbs).tobytes()
+
+
 def get_audio_info(path: str) -> dict:
     """Metadata for the UI capacity display (mirrors stego_engine.get_image_info)."""
     with wave.open(path, "rb") as w:

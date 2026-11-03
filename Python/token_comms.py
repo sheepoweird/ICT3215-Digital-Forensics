@@ -447,6 +447,10 @@ def _load_credentials() -> tuple[dict, bytes, bytes]:
     return cfg, auth_key, bytes.fromhex(cfg["token_id"])
 
 
+# The UI looks for this phrase to tell "token offline" apart from other failures.
+UNREACHABLE_MSG = "Could not reach the hardware token over Bluetooth."
+
+
 async def _transaction(op: int, env_hash: bytes) -> bytes:
     cfg, auth_key, token_id = _load_credentials()
     uuid = cfg.get("char_uuid", CHARACTERISTIC_UUID)
@@ -478,8 +482,7 @@ async def _transaction(op: int, env_hash: bytes) -> bytes:
         raise
     except Exception as e:
         raise TokenError(
-            "Could not reach the hardware token over Bluetooth. "
-            f"Is it powered on and in range?\n\nDetails: {e}"
+            f"{UNREACHABLE_MSG} Is it powered on and in range?\n\nDetails: {e}"
         )
 
 

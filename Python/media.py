@@ -52,6 +52,13 @@ def extract_lsb_bytes(stego_path: str, nbytes: int) -> bytes:
     return se.extract_lsb_bytes(stego_path, nbytes)
 
 
+def read_lsb_all(stego_path: str) -> bytes:
+    """Whole LSB byte stream in one decode, so extraction need not re-decode the carrier."""
+    if is_audio(stego_path):
+        return ae.read_lsb_all_wav(stego_path)
+    return se.read_lsb_all(stego_path)
+
+
 def carrier_info(path: str) -> dict:
     """
     Uniform metadata for the capacity display. Always includes capacity_bytes and
