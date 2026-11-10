@@ -119,8 +119,13 @@ refreshes and restarts.
 
 ### Setup › Signals
 - The app scans your machine on launch. **Refresh** re-scans and keeps your selection
-- Pick a **preset** (Device-bound, Location-bound, Hardware only, Everything) or tick signals
-  yourself. Clicking anywhere on a row toggles it, and hovering shows the current value
+- Pick a **preset** or tick signals yourself. On first run the **Recommended** preset (a
+  strong, steady default) is selected automatically; others are Device-bound,
+  Location-bound, Hardware only, and Everything. Clicking anywhere on a row toggles it,
+  and hovering shows the current value
+- Each signal shows a plain stability label instead of a number: **Stable** (green, a
+  permanent identifier), **May change** (amber), or **Volatile** (red — changes in
+  everyday use). Categories are collapsible and sorted steadiest-first
 - **Save as preset…** stores your own combinations. **Clear selection** unticks everything
 - Click **Test Key** twice. A matching fingerprint (`✓ stable`) means the environment is stable
 
@@ -171,6 +176,23 @@ file), so leave it **off** if you want a file that only opens in one place — u
    **under its original filename**, and existing files are never overwritten
 4. The same signals (use the same preset) and the same token are required, otherwise
    authentication fails (forensic defense)
+
+### Protect › Vault
+An encrypted store bound to the token + this PC, for files you keep and reopen (rather
+than hiding a single file in an image).
+1. Pick a **location** (an empty folder) and click **Create Env Vault**. Creation needs a
+   paired token and a signal selection; a one-time **recovery code** is shown — save it,
+   as it is the only way back in if the token is lost
+2. **Add files…** (or **drag files from Explorer onto the list**) encrypts each file into
+   the vault and (optionally) shreds the original. Names, sizes and dates live only in an
+   encrypted index; on disk you see only random-named ciphertext, so nothing reveals what
+   is inside
+3. **Open** decrypts a file **in memory only** to view it — nothing plaintext is written to
+   disk. **Export…** writes a decrypted copy out when you explicitly want one
+4. The vault **auto-locks** when the token goes out of BLE range. **Lock now**, or
+   **Ctrl+Shift+L** from anywhere (panic lock), locks it immediately and drops the key
+5. If the environment drifts (e.g. you change network), unlock with the recovery code and
+   re-bind to the new environment
 
 ### Diagnostics › Inspector
 - Shows raw values of every collected signal and which ones are in the key

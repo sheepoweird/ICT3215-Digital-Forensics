@@ -113,6 +113,9 @@ def test_empty_folder_extracts_to_an_empty_dir(tmp_path):
     "sub/../../escape.txt",
     "/abs/escape.txt",
     "..\\winescape.txt",
+    "C:/Windows/winabs.txt",        # Windows drive-letter path (zip-slip variant)
+    "C:winabs.txt",                 # drive-relative, no root
+    "//server/share/unc.txt",       # UNC path
 ])
 def test_zip_slip_is_blocked(tmp_path, evil_name):
     buf = io.BytesIO()
@@ -122,8 +125,8 @@ def test_zip_slip_is_blocked(tmp_path, evil_name):
     with pytest.raises(ValueError):
         safe_extract_zip(buf.getvalue(), str(dest))
     # Nothing was written outside the destination
-    assert not (tmp_path / "escape.txt").exists()
-    assert not (tmp_path / "winescape.txt").exists()
+    for stray in ("escape.txt", "winescape.txt", "winabs.txt", "unc.txt"):
+        assert not (tmp_path / stray).exists()
 
 
 def test_bad_archive_raises_value_error(tmp_path):

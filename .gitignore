@@ -43,9 +43,19 @@ pip-log.txt
 # ─── Logs ─────────────────────────────────────────────────────
 *.log
 
+# ─── Report / office documents (local only — never push to GitHub) ───
+# Only app code and markdown setup docs belong in the repo; the written
+# report, proposal and templates stay out of git.
+*.docx
+*.doc
+*.pdf
+*.odt
+*.pptx
+*.rtf
 DF Main Doc.docx
 Project Assignment.html
 Python/token_config.json
+Python/envstego_settings.ini
 
 # ─── Local dev / verification tools (not part of the app) ─────
 # Screenshot renderer + live token security checker. They drive or

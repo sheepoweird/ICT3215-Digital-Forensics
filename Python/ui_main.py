@@ -22,6 +22,7 @@ ICT3215 Digital Forensics — SIT
 import html
 import json
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -34,12 +35,13 @@ from PyQt6.QtWidgets import (
     QApplication, QListWidget, QListWidgetItem, QSizePolicy, QDialog,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QUrl, QPointF, QTimer
-from PyQt6.QtGui import QColor, QDesktopServices, QPainter, QPainterPath, QPen, QPixmap, QImage
+from PyQt6.QtGui import (QColor, QDesktopServices, QPainter, QPainterPath, QPen, QPixmap, QImage,
+                         QShortcut, QKeySequence)
 
 from signals import EnvSignal, collect_all_signals
 from crypto_engine import (
     derive_env_key, encrypt_payload, decrypt_payload, estimate_entropy_bits,
-    pack_payload, unpack_payload, packed_size,
+    assess_selection, recommended_ids, pack_payload, unpack_payload, packed_size,
     request_index_key, pack_header, unpack_header, OUTER_SIZE, PAYLOAD_AAD,
     SHARD_OUTER_SIZE, unpack_shard_tag, KIND_FILE, KIND_FOLDER, payload_kind,
 )
@@ -338,6 +340,16 @@ QMessageBox, QInputDialog { background-color: #161b22; }
 """
 
 
+def _app_dir() -> Path:
+    """Folder the app runs from: next to the executable when frozen, else this file's
+    directory. Settings are kept here as an .ini so the app writes nothing to the
+    Windows registry, which forensic tools parse comprehensively and which lingers in
+    hives and shadow copies even after the app is deleted."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent
+
+
 def _runtime_style() -> str:
     """
     Stylesheet rules that need images: the check-box tick and the combo-box arrow.
@@ -347,26 +359,34 @@ def _runtime_style() -> str:
     folder = Path(tempfile.gettempdir()) / "envstego_ui"
     folder.mkdir(exist_ok=True)
 
-    def draw(name: str, w: int, h: int, color: str, points: list[tuple[float, float]], width: float):
+    def draw(name: str, w: int, h: int, color: str, points: list[tuple[float, float]],
+             width: float, fill: bool = False):
         for scale, suffix in ((1, ""), (2, "@2x")):
             pm = QPixmap(w * scale, h * scale)
             pm.fill(Qt.GlobalColor.transparent)
             p = QPainter(pm)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            pen = QPen(QColor(color), width * scale)
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            p.setPen(pen)
             path = QPainterPath(QPointF(points[0][0] * scale, points[0][1] * scale))
             for x, y in points[1:]:
                 path.lineTo(QPointF(x * scale, y * scale))
-            p.drawPath(path)
+            if fill:
+                path.closeSubpath()
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(color))
+                p.drawPath(path)
+            else:
+                pen = QPen(QColor(color), width * scale)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                p.setPen(pen)
+                p.drawPath(path)
             p.end()
             pm.save(str(folder / f"{name}{suffix}.png"))
         return (folder / f"{name}.png").as_posix()
 
     tick = draw("tick", 16, 16, "#ffffff", [(4, 8.5), (7, 11.5), (12.5, 5)], 2.0)
-    arrow = draw("arrow", 12, 8, "#8b949e", [(2, 2), (6, 6), (10, 2)], 1.6)
+    # A solid, brighter down-triangle so the dropdown control is obvious.
+    arrow = draw("arrow", 12, 8, "#c9d1d9", [(1.5, 2.5), (10.5, 2.5), (6, 7)], 0, fill=True)
     return (
         f"QCheckBox::indicator:checked {{ image: url({tick}); }}\n"
         f"QComboBox::down-arrow {{ image: url({arrow}); width: 12px; height: 8px; }}\n"
@@ -379,7 +399,25 @@ def _stable_identity(s: EnvSignal) -> bool:
     return s.category in ("Hardware", "OS") and s.stability >= 8
 
 
+# The raw 1–10 stability rating is not meaningful to a user, so each row shows a plain
+# word and colour instead: green = a permanent identifier that will not change, amber =
+# usually steady but can change if hardware/network changes, red = changes in everyday use.
+def _stability_display(stability: int) -> tuple[str, str, str]:
+    """Return (word, colour, tooltip) for a stability rating."""
+    if stability >= 8:
+        return ("Stable", "#3fb950",
+                "Permanent: a hardware or firmware identifier that does not change in normal use.")
+    if stability >= 5:
+        return ("May change", "#d29922",
+                "Usually steady, but changes if you swap the hardware or change network.")
+    return ("Volatile", "#f85149",
+            "Changes during everyday use; not safe to rely on by itself.")
+
+
 BUILTIN_PRESETS = [
+    ("Recommended",
+     "A strong, steady default. The best choice if you are unsure.",
+     None),            # special: selected via recommended_ids(), not a predicate
     ("Device-bound",
      "Stable hardware and OS identifiers. Opens on this PC on any network.",
      _stable_identity),
@@ -981,6 +1019,36 @@ class _DropListWidget(QListWidget):
         super().dropEvent(e)
 
 
+class _VaultDropTable(QTableWidget):
+    """The vault's file table, which also accepts files dragged in from Explorer."""
+    filesDropped = pyqtSignal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragMoveEvent(e)
+
+    def dropEvent(self, e):
+        if e.mimeData().hasUrls():
+            paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+            if paths:
+                self.filesDropped.emit(paths)
+                e.acceptProposedAction()
+                return
+        super().dropEvent(e)
+
+
 class MultiFilePicker(QWidget):
     """A labelled list of image paths with Add / Remove / Clear, for multi-image split."""
     changed = pyqtSignal()
@@ -1261,20 +1329,14 @@ class SignalRow(QWidget):
         info.addWidget(desc_lbl)
         layout.addLayout(info, stretch=1)
 
-        stab_col = QVBoxLayout()
-        stab_col.setSpacing(4)
-        s = self._signal.stability
-        stab_lbl = QLabel(f"Stability {s}/10")
-        stab_lbl.setObjectName("subtle")
-        stab_bar = QProgressBar()
-        stab_bar.setFixedWidth(96)
-        stab_bar.setFixedHeight(6)
-        stab_bar.setTextVisible(False)
-        stab_bar.setValue(s * 10)
-        stab_bar.setObjectName("stab_high" if s >= 8 else ("stab_med" if s >= 6 else "stab_low"))
-        stab_col.addWidget(stab_lbl)
-        stab_col.addWidget(stab_bar)
-        layout.addLayout(stab_col)
+        word, colour, tip = _stability_display(self._signal.stability)
+        stab_lbl = QLabel(word)
+        stab_lbl.setObjectName("stab_word")
+        stab_lbl.setFixedWidth(96)
+        stab_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        stab_lbl.setStyleSheet(f"color:{colour}; font-size:12px; font-weight:600;")
+        stab_lbl.setToolTip(tip)
+        layout.addWidget(stab_lbl)
 
         self._badge = QLabel()
         self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1410,15 +1472,17 @@ class NavButton(QPushButton):
         self._marker.setFixedSize(3, 26)
         row.addWidget(self._marker)
 
-        col = QVBoxLayout()
-        col.setSpacing(1)
-        col.setContentsMargins(0, 0, 0, 0)
         self._title = QLabel(title)
         self._title.setObjectName("nav_title")
         self._sub = QLabel("")
         self._sub.setObjectName("nav_sub")
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.addStretch()                 # centre the title/status block vertically
         col.addWidget(self._title)
         col.addWidget(self._sub)
+        col.addStretch()
         row.addLayout(col, 1)
 
         for w in (self._marker, self._title, self._sub):
@@ -1437,6 +1501,9 @@ class NavButton(QPushButton):
 
     def set_status(self, text: str, tone: str = "muted"):
         self._sub.setText(text)
+        has = bool(text)
+        self._sub.setVisible(has)
+        self.setFixedHeight(52 if has else 38)   # title-only entries are shorter
         if self._sub.property("tone") != tone:
             self._sub.setProperty("tone", tone)
             self._repolish(self._sub)
@@ -1482,7 +1549,9 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.setStyleSheet(app.styleSheet() + _runtime_style())
 
-        self._settings = QSettings("SIT-ICT3215", "EnvStego")
+        # Keep settings in an .ini beside the app, not in the Windows registry.
+        self._settings = QSettings(str(_app_dir() / "envstego_settings.ini"),
+                                   QSettings.Format.IniFormat)
         self._all_signals: list[EnvSignal] = []
         self._signal_rows: list[SignalRow] = []
         self._selected_ids: set[str] = set(self._load_json("signals/selected", []))
@@ -1493,6 +1562,10 @@ class MainWindow(QMainWindow):
         self._workers: set[QThread] = set()
         self._busy = False
         self._collecting = False
+        # First launch with nothing chosen falls back to the Recommended preset once.
+        self._did_default_preset = bool(self._selected_ids) or bool(self._active_preset)
+        # Which signal categories are collapsed on the Signals page (remembered).
+        self._collapsed_cats: set[str] = set(self._load_json("signals/collapsed_cats", []))
         self._last_test: tuple[frozenset, str, dict] | None = None
         self._token_reachable: bool | None = None   # None = not contacted this session
         self._vault: V.Vault | None = None           # unlocked vault instance, else None
@@ -1506,6 +1579,9 @@ class MainWindow(QMainWindow):
         self._ui_ready = False
         self._build_ui()
         self._ui_ready = True
+        # Panic lock: instantly lock the vault from anywhere in the app.
+        self._panic_sc = QShortcut(QKeySequence("Ctrl+Shift+L"), self)
+        self._panic_sc.activated.connect(self._panic_lock)
         self._restore_state()
         self._refresh_token_ui()
         self._refresh_ports()
@@ -1595,6 +1671,13 @@ class MainWindow(QMainWindow):
             self._settings.setValue("files/last_dir", FilePicker.last_dir)
         for w in list(self._workers):
             w.wait(5000)
+        # Remove the throwaway UI glyphs from %TEMP% so the app leaves nothing behind
+        # there. They are only tick/arrow images, but a clean exit leaves no trace.
+        try:
+            import shutil
+            shutil.rmtree(Path(tempfile.gettempdir()) / "envstego_ui", ignore_errors=True)
+        except Exception:
+            pass
         super().closeEvent(event)
 
     def _start_worker(self, worker: QThread):
@@ -1667,6 +1750,8 @@ class MainWindow(QMainWindow):
             lay.addSpacing(4)
             for index, title in items:
                 btn = NavButton(title)
+                if index in self.PAGE_INFO:
+                    btn.setToolTip(self.PAGE_INFO[index][1])   # hover shows what the page does
                 btn.clicked.connect(lambda _=False, i=index: self._tabs.setCurrentIndex(i))
                 self._nav_group.addButton(btn)
                 self._nav[index] = btn
@@ -1675,18 +1760,39 @@ class MainWindow(QMainWindow):
 
         lay.addStretch()
 
-        # Both persistent security modes live together at the foot of the sidebar
-        lay.addWidget(_label("MODES", "nav_group", wrap=False))
+        # Both persistent security modes live together at the foot of the sidebar,
+        # with a "?" badge on the right that explains them on hover.
+        modes_row = QHBoxLayout()
+        # No left margin: the "nav_group" style already pads 12px, matching the other
+        # section headers and the checkboxes below. Right margin keeps the "?" in place.
+        modes_row.setContentsMargins(0, 0, 10, 0)
+        modes_row.setSpacing(6)
+        modes_row.addWidget(_label("MODES", "nav_group", wrap=False),
+                            0, Qt.AlignmentFlag.AlignVCenter)
+        modes_row.addStretch()
+        modes_help = QLabel("?")
+        modes_help.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        modes_help.setCursor(Qt.CursorShape.WhatsThisCursor)
+        modes_help.setFixedSize(16, 16)
+        modes_help.setStyleSheet(
+            "QLabel{color:#8b949e; font-weight:700; font-size:11px; border:1px solid #30363d;"
+            " border-radius:8px;} QLabel:hover{color:#e6edf3; border-color:#8b949e;}")
+        modes_help.setToolTip(
+            "Privacy mode\n"
+            "File paths are not remembered, the stego image copies the carrier's date, and\n"
+            "outputs default to Pictures/Downloads. Leaves less for a forensic examiner to find.\n\n"
+            "Portable mode\n"
+            "Only signals that travel with this PC (hardware, OS) can be selected, so you can\n"
+            "encrypt and decrypt anywhere on this machine. Network and location signals are\n"
+            "disabled, so the data is bound to this PC and the token, not to a place.")
+        modes_row.addWidget(modes_help, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addLayout(modes_row)
         lay.addSpacing(6)
 
         self._privacy_cb = QCheckBox("Privacy mode")
         self._privacy_cb.setChecked(self._privacy)
         self._privacy_cb.setCursor(Qt.CursorShape.PointingHandCursor)
         self._privacy_cb.setContentsMargins(12, 0, 0, 0)
-        self._privacy_cb.setToolTip(
-            "On: file paths are not remembered, the stego image copies the carrier's\n"
-            "date, and outputs default to Pictures/Downloads. Leaves less for a\n"
-            "forensic examiner to find.")
         self._privacy_cb.toggled.connect(self._on_privacy_toggled)
         lay.addWidget(self._privacy_cb)
         lay.addSpacing(6)
@@ -1695,11 +1801,6 @@ class MainWindow(QMainWindow):
         self._portable_cb.setChecked(self._portable)
         self._portable_cb.setCursor(Qt.CursorShape.PointingHandCursor)
         self._portable_cb.setContentsMargins(12, 0, 0, 0)
-        self._portable_cb.setToolTip(
-            "On: only signals that travel with this PC (hardware, OS) can be selected,\n"
-            "so you can encrypt and decrypt anywhere on this machine. Network/location\n"
-            "signals are disabled. Less location-specific, but still bound to this PC\n"
-            "and the token.")
         self._portable_cb.toggled.connect(self._on_portable_toggled)
         lay.addWidget(self._portable_cb)
         lay.addSpacing(12)
@@ -1715,9 +1816,6 @@ class MainWindow(QMainWindow):
         self._settings.setValue("privacy/mode", on)
         if on:
             self._purge_file_paths()      # don't wait for a clean exit to clear them
-        self._status.showMessage(
-            "Privacy mode on — file paths are not saved and the stego image copies the carrier's date"
-            if on else "Privacy mode off — recent file paths are remembered between sessions")
 
     def _build_topbar(self) -> QWidget:
         bar = QWidget()
@@ -1956,7 +2054,10 @@ class MainWindow(QMainWindow):
         kind, _, name = data.partition(":")
         if kind == "builtin":
             rule = next(r for n, _, r in BUILTIN_PRESETS if n == name)
-            ids = {s.id for s in self._all_signals if s.available and s.value and rule(s)}
+            if rule is None:                      # "Recommended" — top strong, steady signals
+                ids = set(recommended_ids(self._all_signals))
+            else:
+                ids = {s.id for s in self._all_signals if s.available and s.value and rule(s)}
         else:
             ids = set(self._user_presets.get(name, []))
         self._apply_selection(ids, f"{kind}:{name}")
@@ -2023,9 +2124,6 @@ class MainWindow(QMainWindow):
             if on and self._selected_ids & self._volatile_ids():
                 # drop any now-disabled signals from the current selection
                 self._apply_selection(self._selected_ids - self._volatile_ids(), None)
-        self._status.showMessage(
-            "Portable mode on — network/location signals are disabled; files open on this PC anywhere"
-            if on else "Portable mode off — you can include network/location signals again")
 
     def _on_row_toggled(self, signal_id: str, checked: bool):
         if checked:
@@ -2058,12 +2156,23 @@ class MainWindow(QMainWindow):
             if not cat_signals:
                 continue
 
+            collapsed = cat_name in self._collapsed_cats
+
             header_widget = QWidget()
             header_layout = QHBoxLayout(header_widget)
             header_layout.setContentsMargins(2, 10, 0, 2)
             header_layout.setSpacing(8)
 
             readable = sum(1 for s in cat_signals if s.available and s.value)
+
+            # A chevron button collapses/expands the whole category.
+            chevron = QToolButton()
+            chevron.setObjectName("chevron")
+            chevron.setText("▸" if collapsed else "▾")
+            chevron.setCursor(Qt.CursorShape.PointingHandCursor)
+            chevron.setToolTip("Collapse or expand this category")
+            chevron.setStyleSheet("QToolButton{border:none;background:transparent;color:#8b949e;"
+                                  "font-size:13px;padding:0 2px;} QToolButton:hover{color:#e6edf3;}")
             cat_label = _section(f"{cat_name}  ·  {readable}/{len(cat_signals)} available")
 
             sel_btn = QPushButton("Select all")
@@ -2077,8 +2186,9 @@ class MainWindow(QMainWindow):
             desel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             desel_btn.setToolTip(f"Unselect every {cat_name} signal")
 
-            # Bulk actions sit on the left, directly above the checkbox column they
-            # control; the section label and a divider rule fill the row to the right.
+            # Chevron, then the bulk actions above the checkbox column they control,
+            # then the section label and a divider rule filling the row to the right.
+            header_layout.addWidget(chevron)
             header_layout.addWidget(sel_btn)
             header_layout.addWidget(desel_btn)
             header_layout.addSpacing(8)
@@ -2090,9 +2200,22 @@ class MainWindow(QMainWindow):
             g_layout = QVBoxLayout(group)
             g_layout.setContentsMargins(6, 6, 6, 6)
             g_layout.setSpacing(2)
+            group.setVisible(not collapsed)
+
+            def _toggle_cat(_=False, cat=cat_name, grp=group, chev=chevron):
+                now_collapsed = grp.isVisible()
+                grp.setVisible(not now_collapsed)
+                chev.setText("▸" if now_collapsed else "▾")
+                if now_collapsed:
+                    self._collapsed_cats.add(cat)
+                else:
+                    self._collapsed_cats.discard(cat)
+                self._save_json("signals/collapsed_cats", sorted(self._collapsed_cats))
+            chevron.clicked.connect(_toggle_cat)
 
             cat_ids = []
-            for sig in cat_signals:
+            # Show the steadiest signals first within each category.
+            for sig in sorted(cat_signals, key=lambda s: s.stability, reverse=True):
                 blocked = self._portable and not _travel_safe(sig)
                 row = SignalRow(sig, sig.id in self._selected_ids, blocked=blocked)
                 row.toggled.connect(self._on_row_toggled)
@@ -2125,7 +2248,14 @@ class MainWindow(QMainWindow):
         count   = len(active)
         entropy = estimate_entropy_bits(active)
 
-        self._entropy_lbl.setText(f"Estimated entropy:  {entropy} bits")
+        # Rate the selection for strength + lock-out risk, and reflect it on the
+        # entropy label's colour and tooltip (blue = ok, amber = caution, red = weak).
+        level, advice = assess_selection(active)
+        colour = {"ok": "#58a6ff", "caution": "#d29922", "weak": "#f85149"}[level]
+        prefix = {"ok": "", "caution": "⚠ ", "weak": "⚠ "}[level]
+        self._entropy_lbl.setText(f"{prefix}Estimated entropy:  {entropy} bits")
+        self._entropy_lbl.setStyleSheet(f"color:{colour}; font-size:13px; font-weight:600;")
+        self._entropy_lbl.setToolTip(advice or "Solid environment binding.")
         self._entropy_bar.setValue(min(entropy, 256))
         self._fp_lbl.setText("Key fingerprint:  —")
 
@@ -3159,9 +3289,8 @@ class MainWindow(QMainWindow):
         page, layout = _page()
 
         layout.addWidget(_label(
-            "An encrypted store bound to the token + this PC. Files go in encrypted (originals "
-            "shredded); open them from here while unlocked. It locks itself when the token goes "
-            "out of range. While a file is open its plaintext is only in memory.", "muted"))
+            "An encrypted store bound to the token + this PC — it locks itself when the token "
+            "goes out of range.", "muted"))
 
         # — status / location card —
         card, cl = _card(spacing=10)
@@ -3183,6 +3312,30 @@ class MainWindow(QMainWindow):
         cl.addLayout(loc)
         layout.addWidget(card)
 
+        # — "how it works" panel (shown only before a vault exists, so the empty
+        #    page is not a bare button and a new user understands the feature) —
+        self._vault_howto, hl = _card(spacing=8)
+        hl.addWidget(_section("How the vault works"))
+        for icon, text in [
+            ("📥", "Add any file — it is encrypted into the vault and the original is securely shredded."),
+            ("🔑", "The key is bound to this token + this PC. A copied disk, or the wrong "
+                   "environment, cannot open it."),
+            ("👁", "Open files right here while unlocked — the plaintext stays in memory only. "
+                   "The vault auto-locks when the token goes out of range."),
+        ]:
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            ic = QLabel(icon)
+            ic.setStyleSheet("font-size:16px;")
+            ic.setFixedWidth(24)
+            ic.setAlignment(Qt.AlignmentFlag.AlignTop)
+            row.addWidget(ic)
+            row.addWidget(_label(text, "muted"), stretch=1)
+            hl.addLayout(row)
+        hl.addWidget(_label("Use the vault for files you keep and reopen on this PC. Use Encrypt & "
+                            "hide instead to tuck a single file inside a PNG or WAV to share.", "subtle"))
+        layout.addWidget(self._vault_howto)
+
         # — action bar (changes with state) —
         actions = QHBoxLayout()
         actions.setSpacing(8)
@@ -3196,6 +3349,7 @@ class MainWindow(QMainWindow):
         self._vault_recovery_btn.clicked.connect(self._vault_unlock_recovery)
         self._vault_lock_btn = QPushButton("Lock now")
         self._vault_lock_btn.setObjectName("btn_danger")
+        self._vault_lock_btn.setToolTip("Lock the vault now  (Ctrl+Shift+L from anywhere)")
         self._vault_lock_btn.clicked.connect(lambda: self._vault_do_lock("Locked."))
         for b in (self._vault_create_btn, self._vault_unlock_btn,
                   self._vault_recovery_btn, self._vault_lock_btn):
@@ -3221,7 +3375,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._vault_result)
 
         # — file table (visible only when unlocked) —
-        self._vault_table = QTableWidget()
+        self._vault_table = _VaultDropTable()
+        self._vault_table.filesDropped.connect(self._vault_add_files)
         self._vault_table.setColumnCount(3)
         self._vault_table.setHorizontalHeaderLabels(["Name", "Size", "Added"])
         self._vault_table.verticalHeader().setVisible(False)
@@ -3259,6 +3414,7 @@ class MainWindow(QMainWindow):
         self._vault_unlock_btn.setEnabled(idle and bool(self._token_cfg))
         self._vault_recovery_btn.setVisible(exists and not unlocked)
         self._vault_lock_btn.setVisible(unlocked)
+        self._vault_howto.setVisible(not exists and not unlocked)
         self._vault_change_loc.setEnabled(not unlocked and idle)
         for b in (self._vault_add_btn, self._vault_open_btn,
                   self._vault_export_btn, self._vault_remove_btn):
@@ -3279,9 +3435,15 @@ class MainWindow(QMainWindow):
         else:
             self._vault_status.setText("No vault here yet")
             self._vault_status.setStyleSheet("font-size:16px; font-weight:600; color:#8b949e;")
+            # Explain exactly what is still needed before "Create" becomes available.
             if not self._token_cfg:
-                self._vault_result.show_info("Pair a token (Token page) and pick signals (Signals page) "
-                                             "before creating a vault.")
+                self._vault_result.show_info("Pair a token on the Token page, then pick signals on the "
+                                             "Signals page, before creating a vault.")
+            elif not self._selected_ids:
+                self._vault_result.show_info("Pick the environment signals to bind this vault to on the "
+                                             "Signals page (or click ✨ Recommended), then create it.")
+            else:
+                self._vault_result.clear()
 
     def _populate_vault_table(self):
         self._vault_table.setRowCount(0)
@@ -3404,6 +3566,12 @@ class MainWindow(QMainWindow):
         self._refresh_vault_ui()
 
     # -- lock / auto-lock -----------------------------------------------------
+    def _panic_lock(self):
+        """Lock the vault immediately (Ctrl+Shift+L), from any page."""
+        if self._vault is not None:
+            self._vault_do_lock("Locked (panic).")
+            self._status.showMessage("Vault locked.")
+
     def _vault_do_lock(self, reason: str):
         if self._vault is None:
             return
@@ -3431,10 +3599,13 @@ class MainWindow(QMainWindow):
                                 "Unlock again when it is back.")
 
     # -- file operations ------------------------------------------------------
-    def _vault_add_files(self):
+    def _vault_add_files(self, paths=None):
         if self._vault is None:
             return
-        paths, _ = QFileDialog.getOpenFileNames(self, "Add files to the vault", FilePicker.last_dir)
+        # A list comes from a drag-and-drop onto the table; the button passes a bool.
+        if not isinstance(paths, list):
+            paths, _ = QFileDialog.getOpenFileNames(self, "Add files to the vault", FilePicker.last_dir)
+        paths = [p for p in paths if os.path.isfile(p)]      # ignore dropped folders
         if not paths:
             return
         shred = QMessageBox.question(
@@ -3574,6 +3745,14 @@ class MainWindow(QMainWindow):
         self._populate_inspector()
         self._refresh_btn.setText("↻  Refresh signals")
 
+        # On a first run with no saved selection, start from the Recommended preset.
+        if not self._did_default_preset:
+            self._did_default_preset = True
+            idx = self._preset_combo.findData("builtin:Recommended")
+            if idx >= 0:
+                self._preset_combo.setCurrentIndex(idx)
+                self._on_preset_chosen(idx)
+
         available_count = sum(1 for s in signals if s.available)
         self._status.showMessage(
             f"Environment profiled — {available_count}/{len(signals)} signals available"
@@ -3651,29 +3830,15 @@ class MainWindow(QMainWindow):
             sig = ("None selected", "warn")
         self._nav[self.TAB_SIGNALS].set_status(*sig)
 
-        for index, block in ((self.TAB_ENCRYPT, enc_block), (self.TAB_DECRYPT, dec_block)):
-            if self._busy:
-                state = ("Working…", "muted")
-            elif self._collecting:
-                state = ("Waiting for signals…", "muted")
-            elif not block:
-                state = ("Ready", "ok")
-            else:
-                state = (f"{len(block)} step{'s' if len(block) != 1 else ''} to go", "muted")
-            self._nav[index].set_status(*state)
+        # Encrypt / Decrypt / Vault show the title only (no status line).
+        for index in (self.TAB_ENCRYPT, self.TAB_DECRYPT, self.TAB_VAULT):
+            self._nav[index].set_status("")
 
         if self._all_signals:
             readable = sum(1 for s in self._all_signals if s.available)
             self._nav[self.TAB_INSPECTOR].set_status(f"{readable}/{len(self._all_signals)} readable")
         else:
             self._nav[self.TAB_INSPECTOR].set_status("Scanning…")
-
-        if self._vault is not None:
-            self._nav[self.TAB_VAULT].set_status(f"Unlocked · {self._vault.count()} item(s)", "ok")
-        elif V.is_vault(self._vault_loc.text() if self._ui_ready else self._vault_default_path()):
-            self._nav[self.TAB_VAULT].set_status("Locked", "muted")
-        else:
-            self._nav[self.TAB_VAULT].set_status("Not set up", "muted")
 
     def _update_key_cards(self):
         if not self._ui_ready:

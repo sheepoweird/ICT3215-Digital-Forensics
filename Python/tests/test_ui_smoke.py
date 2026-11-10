@@ -163,6 +163,49 @@ def test_preset_selects_expected_signals(win):
     assert win._test_btn.isEnabled()
 
 
+def test_recommended_preset_selects_a_strong_readable_set(win):
+    win._apply_selection(set(), None)          # start empty
+    idx = win._preset_combo.findData("builtin:Recommended")
+    assert idx >= 0                            # Recommended is a built-in preset
+    win._on_preset_chosen(idx)
+    # Only readable signals, more than one, and never the unreadable ones.
+    assert len(win._selected_ids) >= 2
+    assert "net_bssid" not in win._selected_ids and "hw_battery" not in win._selected_ids
+    chosen = [s for s in win._all_signals if s.id in win._selected_ids]
+    assert all(s.available and s.value for s in chosen)
+    assert crypto_engine.assess_selection(chosen)[0] == "ok"
+    assert win._active_preset == "builtin:Recommended"
+    assert win._test_btn.isEnabled()
+
+
+def test_signal_rows_sorted_by_stability_within_category(win):
+    # Steadiest signals appear first within each category.
+    by_cat = {}
+    for row in win._signal_rows:
+        by_cat.setdefault(row.signal.category, []).append(row.signal.stability)
+    for cat, stabs in by_cat.items():
+        assert stabs == sorted(stabs, reverse=True), f"{cat} not sorted: {stabs}"
+
+
+def test_stability_display_maps_to_words_and_colours():
+    assert ui_main._stability_display(10)[0] == "Stable"
+    assert ui_main._stability_display(8)[0] == "Stable"
+    assert ui_main._stability_display(7)[0] == "May change"
+    assert ui_main._stability_display(5)[0] == "May change"
+    assert ui_main._stability_display(4)[0] == "Volatile"
+    assert ui_main._stability_display(10)[1] == "#3fb950"   # green
+    assert ui_main._stability_display(3)[1] == "#f85149"    # red
+
+
+def test_category_collapse_toggles_and_is_remembered(win):
+    # Collapsing a category records it; the state persists for the next rebuild.
+    assert "Hardware" not in win._collapsed_cats
+    win._collapsed_cats.add("Hardware")
+    win._populate_signal_rows(win._all_signals)          # rebuild with Hardware collapsed
+    assert "Hardware" in win._collapsed_cats             # still remembered
+    win._collapsed_cats.discard("Hardware")
+
+
 def test_test_key_reports_fingerprint(win):
     win._test_key()
     assert idle(win)
@@ -485,6 +528,35 @@ def test_signal_rows_fit_without_clipping(win):
             f"{row._signal.id}: badge ends at {badge.geometry().right()} > row width {row.width()}")
 
 
+def test_panic_lock_locks_the_vault(win):
+    class _FakeVault:
+        def lock(self): pass
+        def count(self): return 0
+        def total_bytes(self): return 0
+    win._vault = _FakeVault()
+    win._panic_lock()                 # Ctrl+Shift+L handler
+    assert win._vault is None
+    win._panic_lock()                 # no-op when already locked (no error)
+
+
+def test_vault_empty_state_shows_howto(win, tmp_path):
+    # With no vault yet, the "how it works" intro is shown; once a vault is open
+    # it gives way to the file table.
+    win._vault = None
+    win._vault_loc.setText(str(tmp_path / "no_vault_here"))
+    win._refresh_vault_ui()
+    assert not win._vault_howto.isHidden()
+
+    class _FakeVault:
+        def count(self): return 0
+        def total_bytes(self): return 0
+    win._vault = _FakeVault()
+    win._refresh_vault_ui()
+    assert win._vault_howto.isHidden()
+    win._vault = None
+    win._refresh_vault_ui()
+
+
 def test_vault_create_add_open_lock_unlock(win, monkeypatch, tmp_path):
     vdir = tmp_path / "EnvVault"
     win._vault_loc.setText(str(vdir))
@@ -511,6 +583,13 @@ def test_vault_create_add_open_lock_unlock(win, monkeypatch, tmp_path):
     assert win._vault_table.rowCount() == 1
     assert src.exists()                                   # original kept (said No)
 
+    # Drag-and-drop path: a list of files goes straight in (no file dialog).
+    drop = tmp_path / "dropped.txt"
+    drop.write_text("dropped content", encoding="utf-8")
+    win._vault_add_files([str(drop)])
+    assert idle(win)
+    assert win._vault.count() == 2 and win._vault_table.rowCount() == 2
+
     # Open in the in-memory viewer (don't actually exec a modal)
     opened = {}
     class FakeViewer:
@@ -527,7 +606,7 @@ def test_vault_create_add_open_lock_unlock(win, monkeypatch, tmp_path):
     assert win._vault is None
     win._vault_unlock()
     assert idle(win)
-    assert win._vault is not None and win._vault.count() == 1
+    assert win._vault is not None and win._vault.count() == 2   # both files survive re-unlock
 
 
 def test_vault_viewer_decodes_jpeg(win, tmp_path):

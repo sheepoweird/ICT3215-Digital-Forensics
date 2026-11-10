@@ -153,6 +153,17 @@ def test_bad_recovery_code_rejected(tmp_path):
 
 # ── sealed signal list ───────────────────────────────────────────────────────
 
+def test_created_time_is_sealed_under_index_key(tmp_path):
+    v, _ = _new(tmp_path)
+    meta = (Path(v.path) / V.META_NAME).read_text(encoding="utf-8")
+    # 'created' is not a plaintext integer timestamp in the file
+    assert '"created": 1' not in meta and '"created":1' not in meta
+    # it reads back with the index key, and not with the wrong one
+    ts = V.read_created(v.path, INDEX_KEY)
+    assert isinstance(ts, int) and ts > 1_700_000_000
+    assert V.read_created(v.path, bytes(32)) is None
+
+
 def test_signal_list_is_sealed_under_index_key(tmp_path):
     v, _ = _new(tmp_path)
     assert V.read_signal_ids(v.path, INDEX_KEY) == sorted(SIGNALS)

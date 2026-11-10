@@ -40,7 +40,11 @@ def is_zip(data: bytes) -> bool:
 def _is_within(base: str, target: str) -> bool:
     base = os.path.abspath(base)
     target = os.path.abspath(target)
-    return os.path.commonpath([base]) == os.path.commonpath([base, target])
+    try:
+        return os.path.commonpath([base, target]) == base
+    except ValueError:
+        # Raised when the paths are on different drives (e.g. C: vs D:) — not within.
+        return False
 
 
 def safe_extract_zip(data: bytes, dest_dir: str) -> list[str]:
@@ -59,9 +63,19 @@ def safe_extract_zip(data: bytes, dest_dir: str) -> list[str]:
 
     for info in zf.infolist():
         name = info.filename.replace("\\", "/")
-        if name.startswith("/") or ".." in name.split("/"):
+        parts = name.split("/")
+        # Reject anything that is not a plain relative path: a leading "/" (absolute),
+        # "//" (UNC), a ".." component, or any component carrying a drive letter such
+        # as "C:" — on Windows os.path.join treats a drive-lettered component as a new
+        # root, which can silently escape the destination.
+        if (name.startswith("/")
+                or ".." in parts
+                or any(os.path.splitdrive(p)[0] for p in parts)):
             raise ValueError(f"Archive entry tries to escape the folder: {info.filename!r}")
-        target = os.path.join(dest_dir, *name.split("/"))
+        safe_parts = [p for p in parts if p not in ("", ".")]
+        if not safe_parts:
+            continue                       # "." / "" / bare separators address no file
+        target = os.path.join(dest_dir, *safe_parts)
         if not _is_within(dest_dir, target):
             raise ValueError(f"Archive entry escapes the destination: {info.filename!r}")
         if name.endswith("/"):

@@ -57,6 +57,7 @@ _ENV_AAD = b"EnvVault-envwrap-v1"
 _REC_AAD = b"EnvVault-recwrap-v1"
 _INDEX_AAD = b"EnvVault-index-v1"
 _BLOB_AAD = b"EnvVault-blob-v1"
+_CREATED_AAD = b"EnvVault-created-v1"
 
 
 def _b64(b: bytes) -> str:
@@ -262,7 +263,9 @@ def create_vault(path: str, index_key: bytes, env_key: bytes,
     env_salt, rec_salt = os.urandom(SALT_LEN), os.urandom(SALT_LEN)
     meta = {
         "version": VERSION,
-        "created": int(time.time()),
+        # Creation time is sealed under the token-only index key: a disk image must
+        # not reveal when the vault was made (it is not needed to unlock).
+        "created": _seal(index_key, str(int(time.time())).encode(), _CREATED_AAD),
         "signals": _seal(index_key, json.dumps(sorted(signal_ids)).encode(), _SIG_AAD),
         "env_salt": _b64(env_salt),
         "env_wrapped": _seal(_wrap_key(env_key, env_salt, _ENV_AAD), vault_key, _ENV_AAD),
@@ -279,6 +282,21 @@ def read_signal_ids(path: str, index_key: bytes) -> list[str]:
     """Which signals the vault is bound to (needs the token-only index key)."""
     meta = _read_meta(path)
     return json.loads(_open(index_key, meta["signals"], _SIG_AAD).decode("utf-8"))
+
+
+def read_created(path: str, index_key: bytes):
+    """Vault creation time as a Unix int (needs the index key). None if unreadable.
+
+    Tolerates the old format where 'created' was a plaintext int."""
+    c = _read_meta(path).get("created")
+    if isinstance(c, int):                         # legacy plaintext vaults
+        return c
+    if isinstance(c, str):
+        try:
+            return int(_open(index_key, c, _CREATED_AAD).decode("utf-8"))
+        except Exception:
+            return None
+    return None
 
 
 def _load_index(path, vault_key) -> list[dict]:

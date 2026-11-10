@@ -7,6 +7,7 @@ Team member: Environmental Profiling Engine
 ICT3215 Digital Forensics — SIT
 """
 
+import concurrent.futures
 import subprocess
 import ctypes
 import winreg
@@ -337,7 +338,8 @@ def collect_volume_serial() -> EnvSignal:
 def collect_battery() -> EnvSignal:
     sig = EnvSignal(
         "hw_battery", "Battery Design Capacity", "Hardware",
-        "Laptop battery mWh — unique per aging cell chemistry", 6
+        "Laptop battery design capacity (mWh) from firmware — a fixed spec that does not "
+        "age; absent on desktops and VMs", 6
     )
     try:
         out, err, rc = _run_ps_ex(
@@ -476,7 +478,8 @@ def collect_monitor_edid() -> EnvSignal:
 def collect_router_bssid() -> EnvSignal:
     sig = EnvSignal(
         "net_bssid", "Connected AP BSSID", "Network",
-        "MAC address of the Wi-Fi access point you are currently connected to", 8
+        "MAC of the connected Wi-Fi access point — stable on one AP, but changes if you "
+        "switch network or roam between Wi-Fi bands / mesh nodes", 6
     )
     try:
         # Use 'show interfaces' not 'show networks' — reads only the AP you are
@@ -697,7 +700,8 @@ def collect_install_date() -> EnvSignal:
 def collect_usb_history() -> EnvSignal:
     sig = EnvSignal(
         "os_usbhistory", "USB Device History Hash", "OS",
-        "Hash of all USB devices ever connected — machine forensic fingerprint", 8
+        "Hash of USB storage devices ever connected — changes PERMANENTLY the next time "
+        "any new USB drive is plugged in (the old value never returns)", 3
     )
     try:
         key = winreg.OpenKey(
@@ -729,7 +733,8 @@ def collect_usb_history() -> EnvSignal:
 def collect_prefetch_seed() -> EnvSignal:
     sig = EnvSignal(
         "os_prefetchseed", "OS Build & Patch String", "OS",
-        "Windows build number + UBR — unique per exact patch state", 7
+        "Windows build + UBR patch revision — the UBR increments on every Windows "
+        "cumulative update, so this drifts about monthly", 4
     )
     try:
         key = winreg.OpenKey(
@@ -751,7 +756,8 @@ def collect_prefetch_seed() -> EnvSignal:
 def collect_cert_thumbprints() -> EnvSignal:
     sig = EnvSignal(
         "os_certs", "Root Certificate Store Hash", "OS",
-        "Hash of installed root cert thumbprints — unique per machine history", 7
+        "Hash of root certificate thumbprints — drifts as Windows automatically updates "
+        "its root certificates and as software adds its own", 5
     )
     try:
         out, err, rc = _run_cmd_ex(["certutil.exe", "-store", "root"], timeout=20)
@@ -774,7 +780,8 @@ def collect_cert_thumbprints() -> EnvSignal:
 def collect_audio_endpoint() -> EnvSignal:
     sig = EnvSignal(
         "os_audio", "Audio Endpoint GUIDs", "OS",
-        "WASAPI render device GUIDs — assigned per audio hardware installation", 7
+        "WASAPI render-device GUIDs — stable for existing devices, but a new USB/HDMI/"
+        "Bluetooth audio device adds one permanently", 5
     )
     try:
         key = winreg.OpenKey(
@@ -853,26 +860,42 @@ ALL_COLLECTORS = [
 ]
 
 
+def _safe_collect(collector) -> "EnvSignal":
+    """Run one collector, turning any crash into an unavailable signal.
+
+    Individual collector failures are non-fatal, but they must still appear in the
+    result as an unavailable signal — dropping them silently makes a crashed
+    collector indistinguishable from one that was never registered.
+    """
+    try:
+        return collector()
+    except Exception as e:
+        return EnvSignal(
+            id=getattr(collector, "__name__", "unknown"),
+            name=getattr(collector, "__name__", "unknown"),
+            category="Unknown",
+            description="Collector raised an unexpected exception",
+            stability=0,
+            error=f"{type(e).__name__}: {e}",
+        )
+
+
 def collect_all_signals() -> list:
-    """Collect all environment signals. Returns list of EnvSignal objects."""
-    signals = []
-    for collector in ALL_COLLECTORS:
-        try:
-            signals.append(collector())
-        except Exception as e:
-            # Individual collector failures are non-fatal, but they must still
-            # appear in the result as an unavailable signal — dropping them
-            # silently makes a crashed collector indistinguishable from one
-            # that was never registered.
-            signals.append(EnvSignal(
-                id=getattr(collector, "__name__", "unknown"),
-                name=getattr(collector, "__name__", "unknown"),
-                category="Unknown",
-                description="Collector raised an unexpected exception",
-                stability=0,
-                error=f"{type(e).__name__}: {e}",
-            ))
-    return signals
+    """
+    Collect all environment signals. Returns a list of EnvSignal objects in the
+    fixed ALL_COLLECTORS order.
+
+    Each collector is an independent, I/O-bound subprocess / registry read, so they
+    run in a thread pool instead of one-at-a-time; this cuts the Signals page load
+    from ~20 s (21 serial PowerShell/WMI launches) to a few seconds. ThreadPool.map
+    preserves input order, so the result order is unchanged.
+    """
+    if not ALL_COLLECTORS:
+        return []
+    workers = min(len(ALL_COLLECTORS), 16)
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="signal") as pool:
+        return list(pool.map(_safe_collect, ALL_COLLECTORS))
 
 
 def diagnose_environment() -> str:

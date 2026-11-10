@@ -52,6 +52,55 @@ def estimate_entropy_bits(signals: list) -> int:
     return sum(getattr(s, 'stability', 5) * 4 for s in signals)
 
 
+# Below this estimate, the environment is a weak second factor: an adversary who
+# also obtained the token could plausibly reproduce it. (The token's 256-bit master
+# secret is the root of security; this only rates the *environment* binding.)
+WEAK_ENTROPY_BITS = 48
+
+
+def assess_selection(signals: list) -> tuple[str, str]:
+    """
+    Rate an environment selection for strength and lock-out risk, for UI guidance.
+
+    Returns (level, advice): level is 'ok' | 'caution' | 'weak'; advice is a short
+    message ('' when ok). 'weak' = too little binding to reproduce safely; 'caution'
+    = dominated by volatile signals that drift in normal use (risk of being locked
+    out and needing to re-bind).
+    """
+    if not signals:
+        return "weak", "No signals selected — the key would bind to nothing."
+    bits = estimate_entropy_bits(signals)
+    volatile = [s for s in signals if getattr(s, "stability", 5) < 5]
+    if len(signals) < 2 or bits < WEAK_ENTROPY_BITS:
+        return "weak", ("Weak environment binding. Add more signals, favouring steady "
+                        "hardware/OS identifiers, so the key is harder to reproduce.")
+    if len(volatile) * 2 >= len(signals):
+        names = ", ".join(s.name for s in volatile[:3]) if hasattr(volatile[0], "name") else ""
+        tail = f" ({names}…)" if names else ""
+        return "caution", ("Several chosen signals drift in normal use" + tail +
+                           ". You may get locked out and need to re-bind; mix in steadier signals.")
+    return "ok", ""
+
+
+RECOMMEND_MIN_STABILITY = 7
+RECOMMEND_MAX = 5
+
+
+def recommended_ids(signals: list, max_n: int = RECOMMEND_MAX,
+                    min_stability: int = RECOMMEND_MIN_STABILITY) -> list[str]:
+    """
+    A sensible default selection for a user who does not want to reason about every
+    signal: the most stable *available* signals — enough for a strong binding, but
+    without the volatile ones that cause lock-outs. Returns a list of signal ids.
+    """
+    avail = [s for s in signals
+             if getattr(s, "available", True) and getattr(s, "value", None)]
+    avail.sort(key=lambda s: (getattr(s, "stability", 5), getattr(s, "id", "")), reverse=True)
+    strong = [s for s in avail if getattr(s, "stability", 5) >= min_stability]
+    pick = strong[:max_n] if len(strong) >= 2 else avail[:min(3, len(avail))]
+    return [s.id for s in pick]
+
+
 def environment_hash(signals: list) -> bytes:
     """Canonical, order-independent hash of the selected signals."""
     pairs = sorted([s.id, s.value] for s in signals)
@@ -188,8 +237,13 @@ def unpack_payload(blob: bytes) -> tuple[str, bytes]:
     if len(blob) < 2 or blob[0] not in (KIND_FILE, KIND_FOLDER) or len(blob) < 2 + blob[1]:
         raise ValueError("Decrypted payload has an unknown format.")
     name = blob[2:2 + blob[1]].decode("utf-8", errors="replace")
-    # Never trust a path from the file: keep only a plain name
-    name = os.path.basename(name.replace("\\", "/")).strip() or "recovered_payload.bin"
+    # Never trust a path from the file: keep only a plain name, and drop NUL /
+    # control characters (a NUL can truncate the path in OS calls, and control
+    # chars can spoof the displayed name).
+    name = os.path.basename(name.replace("\\", "/"))
+    name = "".join(ch for ch in name if ch >= " " and ch != "\x7f").strip()
+    if name in ("", ".", ".."):
+        name = "recovered_payload.bin"
     return name, blob[2 + blob[1]:]
 
 

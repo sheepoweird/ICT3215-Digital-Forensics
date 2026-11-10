@@ -24,8 +24,17 @@ import numpy as np
 _DTYPE = {1: np.uint8, 2: np.int16, 4: np.int32}
 
 
+def _open_wav(path: str):
+    """wave.open, but a malformed file raises ValueError (like the image engine) instead
+    of leaking the wave module's own wave.Error."""
+    try:
+        return wave.open(path, "rb")
+    except (wave.Error, EOFError) as e:
+        raise ValueError(f"Not a valid WAV file: {e}")
+
+
 def _read_wav(path: str):
-    with wave.open(path, "rb") as w:
+    with _open_wav(path) as w:
         params = w.getparams()
         frames = w.readframes(params.nframes)
     if params.sampwidth not in _DTYPE:
@@ -41,7 +50,7 @@ def _read_wav(path: str):
 
 def wav_capacity_bytes(path: str) -> int:
     """Total bytes carriable in a WAV's sample LSBs (1 bit per sample, no header subtracted)."""
-    with wave.open(path, "rb") as w:
+    with _open_wav(path) as w:
         p = w.getparams()
     if p.sampwidth not in _DTYPE:
         return 0
@@ -103,7 +112,7 @@ def read_lsb_all_wav(stego_path: str) -> bytes:
 
 def get_audio_info(path: str) -> dict:
     """Metadata for the UI capacity display (mirrors stego_engine.get_image_info)."""
-    with wave.open(path, "rb") as w:
+    with _open_wav(path) as w:
         p = w.getparams()
     cap = wav_capacity_bytes(path)
     seconds = p.nframes / p.framerate if p.framerate else 0

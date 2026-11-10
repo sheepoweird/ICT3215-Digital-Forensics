@@ -41,10 +41,12 @@ import crypto_engine
 import stego_engine
 import token_comms as tc
 from crypto_engine import (
+    assess_selection,
     decrypt_payload,
     encrypt_payload,
     environment_hash,
     pack_payload,
+    recommended_ids,
     unpack_payload,
 )
 from stego_engine import LEGACY_MAGIC, MAGIC, embed, extract
@@ -391,12 +393,20 @@ def test_separator_only_filename_falls_back():
     assert name == "recovered_payload.bin"
 
 
-def test_dotdot_filename_stays_literal_and_cannot_traverse():
-    # "." / ".." survive as literal names, but with no separator they address no
-    # other directory — open() treats them as a (failing) file entry, not a path.
-    name, _ = unpack_payload(pack_payload("..", b"x"))
-    assert name == ".."
-    assert "/" not in name and "\\" not in name
+def test_dotdot_filename_falls_back_to_safe_default():
+    # "." and ".." address a directory, not a file, so they are never used as the
+    # restored name — they fall back to the safe default.
+    for nm in ("..", "."):
+        name, _ = unpack_payload(pack_payload(nm, b"x"))
+        assert name == "recovered_payload.bin"
+
+
+def test_payload_name_strips_nul_and_control_chars():
+    # A NUL can truncate a path in OS calls; control chars can spoof the display.
+    name, data = unpack_payload(pack_payload("with\x00null.txt", b"x"))
+    assert "\x00" not in name and name == "withnull.txt" and data == b"x"
+    name2, _ = unpack_payload(pack_payload("tab\tbell\x07.bin", b"y"))
+    assert all(ch >= " " and ch != "\x7f" for ch in name2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -423,3 +433,59 @@ def test_no_payload_image_rejected(tmp_path):
     plain = make_carrier(tmp_path / "plain.png", 64, 64)
     with pytest.raises(ValueError):
         extract(str(plain))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# assess_selection — environment-strength / lock-out-risk guidance
+# ─────────────────────────────────────────────────────────────────────────────
+class _StabSig:
+    def __init__(self, name, stability, available=True):
+        self.id = name
+        self.name = name
+        self.value = "x" if available else None
+        self.available = available
+        self.stability = stability
+
+
+def test_assess_selection_empty_is_weak():
+    level, advice = assess_selection([])
+    assert level == "weak" and advice
+
+
+def test_assess_selection_single_signal_is_weak():
+    # One signal, even a very steady one, is too little binding.
+    level, _ = assess_selection([_StabSig("os_machineguid", 10)])
+    assert level == "weak"
+
+
+def test_assess_selection_steady_pair_is_ok():
+    level, advice = assess_selection([_StabSig("os_machineguid", 10), _StabSig("hw_disk", 9)])
+    assert level == "ok" and advice == ""
+
+
+def test_assess_selection_volatile_majority_is_caution():
+    sigs = [_StabSig("os_usbhistory", 3), _StabSig("os_prefetchseed", 4), _StabSig("hw_disk", 9)]
+    level, advice = assess_selection(sigs)
+    assert level == "caution" and advice
+
+
+def test_recommended_picks_steady_available_and_is_rated_ok():
+    sigs = [_StabSig("os_machineguid", 10), _StabSig("hw_disk", 9), _StabSig("hw_cpu", 8),
+            _StabSig("os_usbhistory", 3), _StabSig("net_dns", 6),
+            _StabSig("hw_gone", 9, available=False)]
+    ids = recommended_ids(sigs)
+    assert "os_usbhistory" not in ids          # volatile excluded
+    assert "hw_gone" not in ids                # unavailable excluded
+    assert len(ids) >= 2
+    chosen = [s for s in sigs if s.id in ids]
+    assert assess_selection(chosen)[0] == "ok"  # the recommendation is a solid binding
+
+
+def test_recommended_caps_count_and_prefers_most_stable():
+    sigs = [_StabSig(f"s{i}", 10 - (i % 3)) for i in range(12)]
+    ids = recommended_ids(sigs, max_n=5)
+    assert len(ids) == 5
+
+
+def test_recommended_empty_when_nothing_readable():
+    assert recommended_ids([_StabSig("x", 9, available=False)]) == []
