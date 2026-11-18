@@ -77,7 +77,7 @@ def split_embed(index_key: bytes, blob: bytes, carriers: list[str],
     for index, (carrier, outp, chunk) in enumerate(plan):
         tag = ce.pack_shard_tag(index_key, manifest, index, total, len(chunk))
         written.append(media.embed_blob(carrier, tag + chunk, outp,
-                                     match_timestamps=match_timestamps))
+                                        match_timestamps=match_timestamps, order_key=index_key))
     return written
 
 
@@ -86,7 +86,7 @@ def inspect_shard(index_key: bytes, stego_path: str) -> tuple[bytes, int, int, i
     cap = media.lsb_capacity_bytes(stego_path)
     if cap < ce.SHARD_OUTER_SIZE:
         raise InvalidTag()
-    head = media.extract_lsb_bytes(stego_path, ce.SHARD_OUTER_SIZE)
+    head = media.extract_lsb_bytes(stego_path, ce.SHARD_OUTER_SIZE, order_key=index_key)
     return ce.unpack_shard_tag(index_key, head)
 
 
@@ -132,7 +132,8 @@ def join_extract(index_key: bytes, stego_paths: list[str]) -> bytes:
     blob = bytearray()
     for i in range(total):
         path, _t, slen = parts[i]
-        data = media.extract_lsb_bytes(path, ce.SHARD_OUTER_SIZE + slen)[ce.SHARD_OUTER_SIZE:]
+        data = media.extract_lsb_bytes(path, ce.SHARD_OUTER_SIZE + slen,
+                                       order_key=index_key)[ce.SHARD_OUTER_SIZE:]
         blob += data
     return bytes(blob)
 

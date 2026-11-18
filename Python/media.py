@@ -40,23 +40,25 @@ def lsb_capacity_bytes(path: str) -> int:
 
 
 def embed_blob(carrier_path: str, blob: bytes, output_path: str,
-               match_timestamps: bool = False) -> str:
+               match_timestamps: bool = False, order_key: bytes | None = None) -> str:
     if is_audio(carrier_path):
-        return ae.embed_blob_wav(carrier_path, blob, output_path, match_timestamps=match_timestamps)
-    return se.embed_blob(carrier_path, blob, output_path, match_timestamps=match_timestamps)
+        return ae.embed_blob_wav(carrier_path, blob, output_path,
+                                 match_timestamps=match_timestamps, order_key=order_key)
+    return se.embed_blob(carrier_path, blob, output_path,
+                         match_timestamps=match_timestamps, order_key=order_key)
 
 
-def extract_lsb_bytes(stego_path: str, nbytes: int) -> bytes:
+def extract_lsb_bytes(stego_path: str, nbytes: int, order_key: bytes | None = None) -> bytes:
     if is_audio(stego_path):
-        return ae.extract_lsb_bytes_wav(stego_path, nbytes)
-    return se.extract_lsb_bytes(stego_path, nbytes)
+        return ae.extract_lsb_bytes_wav(stego_path, nbytes, order_key=order_key)
+    return se.extract_lsb_bytes(stego_path, nbytes, order_key=order_key)
 
 
-def read_lsb_all(stego_path: str) -> bytes:
+def read_lsb_all(stego_path: str, order_key: bytes | None = None) -> bytes:
     """Whole LSB byte stream in one decode, so extraction need not re-decode the carrier."""
     if is_audio(stego_path):
-        return ae.read_lsb_all_wav(stego_path)
-    return se.read_lsb_all(stego_path)
+        return ae.read_lsb_all_wav(stego_path, order_key=order_key)
+    return se.read_lsb_all(stego_path, order_key=order_key)
 
 
 def carrier_info(path: str) -> dict:

@@ -439,12 +439,13 @@ def test_no_payload_image_rejected(tmp_path):
 # assess_selection — environment-strength / lock-out-risk guidance
 # ─────────────────────────────────────────────────────────────────────────────
 class _StabSig:
-    def __init__(self, name, stability, available=True):
+    def __init__(self, name, stability, available=True, category=""):
         self.id = name
         self.name = name
         self.value = "x" if available else None
         self.available = available
         self.stability = stability
+        self.category = category
 
 
 def test_assess_selection_empty_is_weak():
@@ -485,6 +486,28 @@ def test_recommended_caps_count_and_prefers_most_stable():
     sigs = [_StabSig(f"s{i}", 10 - (i % 3)) for i in range(12)]
     ids = recommended_ids(sigs, max_n=5)
     assert len(ids) == 5
+
+
+def test_recommended_prefers_signals_not_on_the_drive():
+    # Machine GUID (registry) and volume serial (boot sector) are on a seized drive, so
+    # steady motherboard/CPU/BIOS signals are chosen first even though those score higher.
+    sigs = [_StabSig("os_machineguid", 10, category="OS"),
+            _StabSig("hw_volume", 10, category="Hardware"),
+            _StabSig("hw_mobo", 9, category="Hardware"),
+            _StabSig("hw_cpu", 8, category="Hardware"),
+            _StabSig("hw_bios", 8, category="Hardware")]
+    ids = recommended_ids(sigs, max_n=3)
+    assert ids == ["hw_mobo", "hw_cpu", "hw_bios"] or set(ids) == {"hw_mobo", "hw_cpu", "hw_bios"}
+    assert "os_machineguid" not in ids and "hw_volume" not in ids
+
+
+def test_recommended_falls_back_when_few_hardware_signals():
+    # With only one off-drive signal, the rest are filled from the steadiest others.
+    sigs = [_StabSig("hw_cpu", 8, category="Hardware"),
+            _StabSig("os_machineguid", 10, category="OS"),
+            _StabSig("os_machinesid", 9, category="OS")]
+    ids = recommended_ids(sigs)
+    assert ids[0] == "hw_cpu" and len(ids) == 3
 
 
 def test_recommended_empty_when_nothing_readable():

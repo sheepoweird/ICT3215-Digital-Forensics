@@ -134,6 +134,16 @@ def test_bad_archive_raises_value_error(tmp_path):
         safe_extract_zip(b"not a zip at all", str(tmp_path / "out"))
 
 
+def test_zip_bomb_is_rejected(tmp_path, monkeypatch):
+    import archive
+    monkeypatch.setattr(archive, "MAX_EXTRACTED_BYTES", 100)   # tiny cap for the test
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("big.bin", b"A" * 5000)                    # 5000 > 100 cap
+    with pytest.raises(ValueError, match="unreasonable size"):
+        archive.safe_extract_zip(buf.getvalue(), str(tmp_path / "out"))
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Multi-image split (token-encrypted shards)
 # ════════════════════════════════════════════════════════════════════════════
@@ -293,6 +303,36 @@ def test_dispatcher_embed_extract_wav(tmp_path):
     blob = bytes((i * 7) % 256 for i in range(4000))
     out = media.embed_blob(wav, blob, str(tmp_path / "o.wav"))
     assert media.extract_lsb_bytes(out, len(blob)) == blob
+
+
+def test_scatter_order_round_trips_and_hides_location(tmp_path):
+    carrier = _png(tmp_path / "c.png", 200, 200)
+    blob = bytes((i * 13) % 256 for i in range(600))
+    out = media.embed_blob(str(carrier), blob, str(tmp_path / "o.png"), order_key=INDEX_KEY)
+
+    # Recovers only with the right key; sequential or wrong-key reads do not.
+    assert media.read_lsb_all(out, order_key=INDEX_KEY)[:len(blob)] == blob
+    assert media.extract_lsb_bytes(out, len(blob), order_key=INDEX_KEY) == blob
+    assert media.read_lsb_all(out)[:len(blob)] != blob
+    assert media.read_lsb_all(out, order_key=bytes(32))[:len(blob)] != blob
+
+    # The modified pixels are spread across the whole image, not a block from pixel 0.
+    import numpy as np
+    from PIL import Image
+    a = np.array(Image.open(carrier).convert("RGB"), np.uint8).flatten()
+    b = np.array(Image.open(out).convert("RGB"), np.uint8).flatten()
+    changed = np.where(a != b)[0]
+    assert changed.max() - changed.min() > b.size * 0.5
+
+
+def test_multi_image_split_is_scattered_but_rejoins(tmp_path):
+    carriers = _carriers(tmp_path, [(160, 160), (160, 160), (160, 160)])
+    outs = _outs(tmp_path, carriers)
+    blob = bytes((i * 11) % 256 for i in range(9000))
+    written = mi.split_embed(INDEX_KEY, blob, carriers, outs)
+    assert mi.join_extract(INDEX_KEY, written) == blob      # token rejoins the scattered shards
+    with pytest.raises(InvalidTag):
+        mi.join_extract(bytes(32), written)                 # wrong token cannot
 
 
 def test_read_lsb_all_matches_piecewise_png(tmp_path):

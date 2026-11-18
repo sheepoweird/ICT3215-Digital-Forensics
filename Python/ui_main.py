@@ -416,7 +416,8 @@ def _stability_display(stability: int) -> tuple[str, str, str]:
 
 BUILTIN_PRESETS = [
     ("Recommended",
-     "A strong, steady default. The best choice if you are unsure.",
+     "Steady signals from this machine's hardware, which a copied disk does not reveal. "
+     "The best choice if you are unsure.",
      None),            # special: selected via recommended_ids(), not a predicate
     ("Device-bound",
      "Stable hardware and OS identifiers. Opens on this PC on any network.",
@@ -545,7 +546,7 @@ class EncryptWorker(QThread):
                 first_out = written[0]
             else:
                 first_out = embed_blob(self._carriers[0], blob, self._outputs[0],
-                                       match_timestamps=self._match_timestamps)
+                                       match_timestamps=self._match_timestamps, order_key=index_key)
                 written = [first_out]
                 carrier_desc = Path(self._carriers[0]).name
                 out_desc = first_out
@@ -591,8 +592,8 @@ ENV_MISMATCH_MSG = (
     "  • Different network   →  BSSID/gateway signals changed\n"
     "  • Different machine   →  hardware serials changed\n"
     "  • Different token     →  token reset or another token paired\n"
-    "  • Forensic lab/clone  →  no live environment signals\n\n"
-    "The payload is mathematically unrecoverable in this environment."
+    "  • Forensic lab/clone  →  no physical token, and the real hardware serials differ\n\n"
+    "The payload is mathematically unrecoverable without the token and matching environment."
 )
 
 
@@ -614,12 +615,9 @@ class DecryptWorker(QThread):
                 self._decrypt_multi()        # a payload split across several images
                 return
 
-            stream = read_lsb_all(self._stego)   # decode the carrier once, then slice
-            if len(stream) < 4:
-                self.error.emit("This image is too small to contain an EnvStego payload.")
-                return
-            marker = stream[:4]
-
+            # A plain (unscattered) read just to tell a legacy v2 "ENV2" image apart from
+            # a current v3 one. v3 has no marker and is scattered, so this looks random.
+            marker = read_lsb_all(self._stego)[:4]
             if marker == LEGACY_MAGIC:
                 self.error.emit(
                     "This image was made by an older EnvStego build that used a hardcoded "
@@ -628,19 +626,21 @@ class DecryptWorker(QThread):
             if marker == MAGIC:
                 self._decrypt_v2()           # legacy ENV2 image, uses the page's selection
             else:
-                self._decrypt_v3(stream)     # current format, signals read from the header
+                self._decrypt_v3()           # current format, signals read from the header
         except InvalidTag:
             self.error.emit(ENV_MISMATCH_MSG)
         except Exception as e:
             self.error.emit(str(e))
 
     # -- current format: token-encrypted header, signals auto-detected -------------
-    def _decrypt_v3(self, stream: bytes):
+    def _decrypt_v3(self):
+        index_key = request_index_key()          # token round-trip 1
+        # v3 scatters the bits in a token-secret order; read them back in logical order.
+        stream = read_lsb_all(self._stego, order_key=index_key)
         cap = len(stream)
         if cap < OUTER_SIZE:
             self.error.emit("No EnvStego payload detected in this image.")
             return
-        index_key = request_index_key()          # token round-trip 1
         try:
             salt, nonce, ct_len, ids = unpack_header(index_key, stream[:OUTER_SIZE])
         except InvalidTag:
@@ -2909,8 +2909,8 @@ class MainWindow(QMainWindow):
             "that is using its port.",
             "Wait for its light: a few blinks, then 2 short flashes means it is ready. "
             "The port below is detected automatically.",
-            "Click Pair Token. No buttons on the token need pressing; it takes up to 15 seconds "
-            "and the Bluetooth link is checked straight after.",
+            "Click Pair Token. When the token's light stays on, press its IO0 button (not RST) "
+            "within 60 seconds to confirm. The Bluetooth link is checked straight after.",
         ]):
             num = QLabel(str(r + 1))
             num.setObjectName("step_num")
@@ -3123,7 +3123,8 @@ class MainWindow(QMainWindow):
             return
         self._set_busy(True)
         self._pair_btn.setText("Pairing…")
-        self._ping_result.show_info(f"Pairing over {port}…\nThis takes up to 15 seconds.")
+        self._ping_result.show_info(f"Pairing over {port}…\n"
+                                    "When the token's light stays on, press its IO0 button.")
         self._status.showMessage(f"Pairing with hardware token via USB ({port})…")
         w = PairWorker(port)
         w.progress.connect(lambda step: self._ping_result.show_info(f"Pairing over {port}…\n{step}"))

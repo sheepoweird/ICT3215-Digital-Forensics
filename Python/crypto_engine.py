@@ -85,17 +85,38 @@ def assess_selection(signals: list) -> tuple[str, str]:
 RECOMMEND_MIN_STABILITY = 7
 RECOMMEND_MAX = 5
 
+# Hardware signals that an examiner who has seized the drive already holds: the volume
+# serial is written in the drive's boot sector, and the drive's own serial is on the
+# drive (and imaging tools record it). OS and Network signals live in the registry.
+DRIVE_RESIDENT_HARDWARE = {"hw_volume", "hw_disk"}
+
+
+def not_on_seized_drive(s) -> bool:
+    """
+    True for signals read from the rest of the machine (motherboard, CPU, BIOS, RAM,
+    GPU, monitor) rather than stored on its drive. A disk image alone does not reveal
+    them, so they are the part of the environment that still helps when the drive has
+    been imaged. (If the whole machine is seized, every signal can be re-read; the
+    token is what protects the data then.)
+    """
+    return (getattr(s, "category", "") == "Hardware"
+            and getattr(s, "id", "") not in DRIVE_RESIDENT_HARDWARE)
+
 
 def recommended_ids(signals: list, max_n: int = RECOMMEND_MAX,
                     min_stability: int = RECOMMEND_MIN_STABILITY) -> list[str]:
     """
     A sensible default selection for a user who does not want to reason about every
-    signal: the most stable *available* signals — enough for a strong binding, but
-    without the volatile ones that cause lock-outs. Returns a list of signal ids.
+    signal: steady, *available* signals, preferring ones that are not on the drive
+    (see not_on_seized_drive) and leaving out the volatile ones that cause lock-outs.
+    Returns a list of signal ids.
     """
+    def rank(s):
+        return (not_on_seized_drive(s), getattr(s, "stability", 5), getattr(s, "id", ""))
+
     avail = [s for s in signals
              if getattr(s, "available", True) and getattr(s, "value", None)]
-    avail.sort(key=lambda s: (getattr(s, "stability", 5), getattr(s, "id", "")), reverse=True)
+    avail.sort(key=rank, reverse=True)
     strong = [s for s in avail if getattr(s, "stability", 5) >= min_stability]
     pick = strong[:max_n] if len(strong) >= 2 else avail[:min(3, len(avail))]
     return [s.id for s in pick]

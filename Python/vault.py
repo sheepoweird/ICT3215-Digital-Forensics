@@ -60,6 +60,21 @@ _BLOB_AAD = b"EnvVault-blob-v1"
 _CREATED_AAD = b"EnvVault-created-v1"
 
 
+def _atomic_write_text(path: Path, text: str, encoding: str):
+    """
+    Write text durably: a crash mid-write must never leave a half-written file.
+    vault.json holds BOTH wrapped copies of the key, so a torn write there would
+    destroy the vault, recovery code included. Write to a temp file, fsync, then
+    os.replace (atomic on the same filesystem).
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding=encoding) as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def _b64(b: bytes) -> str:
     return base64.b64encode(b).decode("ascii")
 
@@ -150,7 +165,7 @@ class Vault:
 
     def _save_index(self):
         blob = _seal(self._key, json.dumps(self._index).encode("utf-8"), _INDEX_AAD)
-        (self._path / INDEX_NAME).write_text(blob, encoding="ascii")
+        _atomic_write_text(self._path / INDEX_NAME, blob, "ascii")
 
     # -- files ----------------------------------------------------------------
     def add_bytes(self, name: str, data: bytes) -> dict:
@@ -242,7 +257,7 @@ def _read_meta(path) -> dict:
 
 
 def _write_meta(path, meta: dict):
-    (Path(path) / META_NAME).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    _atomic_write_text(Path(path) / META_NAME, json.dumps(meta, indent=2), "utf-8")
 
 
 def create_vault(path: str, index_key: bytes, env_key: bytes,

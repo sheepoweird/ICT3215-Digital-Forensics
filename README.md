@@ -97,5 +97,5 @@ Infocomm Technology Cluster, Singapore Institute of Technology.
 
 ## Security note
 
-A factory reset of the token (hold IO0 while booting) destroys the master secret, making
+A factory reset of the token (hold IO0 for 2 seconds while it boots) destroys the master secret, making
 every file it protected permanently unrecoverable. This is intended behaviour, not a bug.

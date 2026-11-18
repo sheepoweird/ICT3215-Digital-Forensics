@@ -12,7 +12,14 @@
 
 #define SERVICE_UUID        "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define CHARACTERISTIC_UUID "beb5483f-36e1-4688-b7f5-ea07361b26a8"
-#define FIRMWARE_VERSION    3   // v3 adds ECDH-encrypted USB pairing
+#define FIRMWARE_VERSION    4   // v4: button-confirmed ECDH pairing; plaintext pairing removed
+
+// Pairing must be confirmed by pressing IO0 within this long, so nothing can re-pair
+// the token silently while it is plugged in.
+#define PAIR_CONFIRM_MS     60000
+// Factory reset needs IO0 held this long during the boot window (a quick tap is ignored,
+// so pressing IO0 to confirm pairing can never wipe the token by accident).
+#define FACTORY_HOLD_MS     2000
 
 // --- ESP32-CAM FLASH LED CONFIGURATION ---
 // Pin 4 is the bright white LED on the front. Uses standard logic (HIGH = ON).
@@ -70,9 +77,17 @@ unsigned long lockoutUntil = 0;
 String lastPairRequest = "";
 String lastPairReply = "";
 
+// A pairing request waiting for the user to press IO0
+bool pairPending = false;
+String pendingHost = "";
+String pendingReq = "";
+uint8_t pendingPcPub[X25519_LEN];
+unsigned long pairDeadline = 0;
+
 // --- LED STATUS PATTERNS ---
 // Count tells you what happened, length tells you good (short) or bad (long):
-//   Boot window (hold IO0 now)  short blink every 0.5 s for 3 s
+//   Boot window (hold IO0 2 s)  short blink every 0.5 s for 3 s
+//   Confirm pairing             solid ON until IO0 is pressed (up to 60 s)
 //   Ready, paired               1 short
 //   Ready, unpaired             2 short
 //   Pairing success             3 short
@@ -110,6 +125,10 @@ void playPattern(uint8_t count, uint16_t onMs, uint16_t offMs) {
 }
 
 void updateLED() {
+    if (pairPending) {                 // steady light = "press IO0 to confirm pairing"
+        digitalWrite(LED_PIN, HIGH);
+        return;
+    }
     if (!ledToggles || (long)(millis() - ledNextMs) < 0) return;
     ledIsOn = !ledIsOn;
     digitalWrite(LED_PIN, ledIsOn ? HIGH : LOW);
@@ -286,7 +305,7 @@ bool isValidField(const String &s, unsigned int maxLen) {
 // Ensure the token has a master secret + token ID and rotate a fresh auth key
 // bound to hostID. Returns false (with a REFUSED reply queued in lastPairReply)
 // if the token is already bound to a different host. On success, authKey/tokenId
-// hold the new material. Shared by the legacy and ECDH pairing handlers.
+// hold the new material.
 bool rotatePairing(const String &hostID, const String &reqID) {
     // A token bound to another host must be factory reset (destroying its
     // master secret) before it can be bound again.
@@ -320,42 +339,12 @@ bool rotatePairing(const String &hostID, const String &reqID) {
     return true;
 }
 
-// PAIR_DEVICE:<host_id>:<request_id>  (legacy: auth key crosses the wire in plaintext)
-// The host repeats the command until the token answers, so a repeated
-// request_id gets the same reply instead of rotating the auth key again.
-void handlePairCommand(const String &args) {
-    int sep = args.indexOf(':');
-    String hostID = sep >= 0 ? args.substring(0, sep) : args;
-    String reqID  = sep >= 0 ? args.substring(sep + 1) : "";
-
-    if (!isValidField(hostID, 32) || !isValidField(reqID, 32)) {
-        Serial.println("PAIRING_REFUSED;REASON=BAD_FORMAT");
-        return;
-    }
-    if (reqID == lastPairRequest && lastPairReply.length() > 0) {
-        Serial.println(lastPairReply);
-        return;
-    }
-    if (!rotatePairing(hostID, reqID)) {
-        Serial.println(lastPairReply);
-        return;
-    }
-
-    std::string mac = BLEDevice::getAddress().toString();
-    lastPairRequest = reqID;
-    lastPairReply = "PAIRING_SUCCESS;REQ=" + reqID +
-                    ";TOKEN_ID=" + toHex(tokenId, TOKEN_ID_LEN) +
-                    ";AUTH_KEY=" + toHex(authKey, AUTH_KEY_LEN) +
-                    ";BLE_MAC=" + String(mac.c_str()) +
-                    ";CHAR_UUID=" + String(CHARACTERISTIC_UUID) +
-                    ";FW=" + String(FIRMWARE_VERSION);
-    Serial.println(lastPairReply);
-    playPattern(3, PAT_SHORT_MS, PAT_SHORT_MS);
-}
-
 // PAIR_ECDH:<host_id>:<request_id>:<pc_pub hex(32)>  (encrypted: auth key is wrapped)
-// The auth key is sealed under an X25519 shared secret, so it never appears in
-// plaintext on the wire. Must match Python/pair_crypto.py.
+// The host repeats the command until the token answers, so a repeated request_id
+// gets the same reply instead of rotating the auth key again. Nothing is bound until
+// the user presses IO0: until then the token answers PAIRING_PENDING.
+// (The old plaintext PAIR_DEVICE command has been removed: the auth key now only ever
+// crosses the wire encrypted.)
 void handlePairEcdh(const String &args) {
     int s1 = args.indexOf(':');
     int s2 = (s1 >= 0) ? args.indexOf(':', s1 + 1) : -1;
@@ -377,6 +366,49 @@ void handlePairEcdh(const String &args) {
         Serial.println(lastPairReply);
         return;
     }
+    if (pairPending) {
+        if (reqID == pendingReq) {
+            Serial.println("PAIRING_PENDING;REQ=" + reqID + ";REASON=PRESS_BUTTON");
+        } else {
+            Serial.println("PAIRING_REFUSED;REQ=" + reqID + ";REASON=BUSY");
+        }
+        return;
+    }
+    // No point asking for the button if the binding would be refused anyway
+    if (devicePaired && preferences.getString("host_id", "") != hostID) {
+        lastPairRequest = reqID;
+        lastPairReply = "PAIRING_REFUSED;REQ=" + reqID + ";REASON=BOUND_TO_OTHER_HOST";
+        Serial.println(lastPairReply);
+        playPattern(2, PAT_LONG_MS, 300);
+        return;
+    }
+
+    pairPending = true;
+    pendingHost = hostID;
+    pendingReq = reqID;
+    memcpy(pendingPcPub, pcPub, X25519_LEN);
+    pairDeadline = millis() + PAIR_CONFIRM_MS;
+    Serial.println("PAIRING_PENDING;REQ=" + reqID + ";REASON=PRESS_BUTTON");
+}
+
+// IO0 pressed (debounced). Only called after start-up, so it never overlaps the
+// factory-reset window.
+bool confirmButtonPressed() {
+    if (digitalRead(0) != LOW) return false;
+    delay(50);
+    return digitalRead(0) == LOW;
+}
+
+// Called once the user has confirmed: bind the host and send the wrapped auth key.
+void completePairing() {
+    pairPending = false;
+    digitalWrite(LED_PIN, LOW);
+    String hostID = pendingHost;
+    String reqID = pendingReq;
+    uint8_t pcPub[X25519_LEN];
+    memcpy(pcPub, pendingPcPub, X25519_LEN);
+    secureWipe(pendingPcPub, X25519_LEN);
+
     if (!rotatePairing(hostID, reqID)) {
         Serial.println(lastPairReply);
         return;
@@ -431,11 +463,12 @@ void handlePairEcdh(const String &args) {
 void setup() {
     // --- Brownout mitigation for the ESP32-CAM on weak USB power ---
     // The current spike when BLE starts can dip the supply below the brownout
-    // threshold and reset the board in a loop. We lower the baseline draw and stop
-    // the detector from resetting mid-start-up. A lower CPU clock and BLE TX power
-    // keep the actual voltage up, so running with the detector off is far safer than
-    // it would be at full power. A good USB port / powered hub is still preferable.
-    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);   // stop the detector resetting us
+    // threshold and reset the board in a loop. The detector is paused only for
+    // start-up and switched back on at the end of setup(), once the lower CPU clock
+    // and BLE TX power are in place. It must be on afterwards: pairing writes the
+    // secrets to flash, and a dip mid-write with no detector could corrupt them.
+    uint32_t brownoutReg = READ_PERI_REG(RTC_CNTL_BROWN_OUT_REG);
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);   // pause the detector for start-up
     setCpuFrequencyMhz(80);                       // ~half the current of 240 MHz
 
     Serial.begin(115200);
@@ -449,11 +482,14 @@ void setup() {
 
     bool factoryResetTriggered = false;
 
-    // Grace period: 3 seconds scanning for the IO0 button, with a short blink
-    // every 0.5 s to show the factory-reset window is open
+    // Grace period: 3 seconds watching the IO0 button, with a short blink every 0.5 s
+    // to show the factory-reset window is open. IO0 must be HELD for FACTORY_HOLD_MS:
+    // a quick tap (e.g. someone pressing it early to confirm pairing) does nothing.
+    int heldMs = 0;
     for (int i = 0; i < 30; i++) {
         digitalWrite(LED_PIN, (i % 5 == 0) ? HIGH : LOW);
-        if (digitalRead(0) == LOW) {
+        heldMs = (digitalRead(0) == LOW) ? heldMs + 100 : 0;
+        if (heldMs >= FACTORY_HOLD_MS) {
             factoryResetTriggered = true;
             break;
         }
@@ -511,6 +547,9 @@ void setup() {
 
     Serial.println("BLE Server is running. Waiting for connections...");
 
+    // Start-up is over: switch the brownout detector back on (see the top of setup()).
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, brownoutReg);
+
     // Ready: 1 short flash if paired, 2 if waiting for USB pairing
     playPattern(devicePaired ? 1 : 2, PAT_SHORT_MS, PAT_SHORT_MS);
 }
@@ -518,14 +557,29 @@ void setup() {
 void loop() {
     updateLED();
 
+    // A pairing request is waiting for the user: IO0 confirms, otherwise it expires.
+    if (pairPending) {
+        if (confirmButtonPressed()) {
+            completePairing();
+        } else if ((long)(millis() - pairDeadline) >= 0) {
+            pairPending = false;
+            digitalWrite(LED_PIN, LOW);
+            secureWipe(pendingPcPub, X25519_LEN);
+            lastPairRequest = pendingReq;
+            lastPairReply = "PAIRING_REFUSED;REQ=" + pendingReq + ";REASON=NOT_CONFIRMED";
+            Serial.println(lastPairReply);
+            playPattern(2, PAT_LONG_MS, 300);
+        }
+    }
+
     if (Serial.available() > 0) {
         String command = Serial.readStringUntil('\n');
         command.trim();
 
+        // Only encrypted pairing is accepted. Anything else (including the removed
+        // plaintext PAIR_DEVICE) is ignored.
         if (command.startsWith("PAIR_ECDH:")) {
             handlePairEcdh(command.substring(10));
-        } else if (command.startsWith("PAIR_DEVICE:")) {
-            handlePairCommand(command.substring(12));
         }
     }
 }

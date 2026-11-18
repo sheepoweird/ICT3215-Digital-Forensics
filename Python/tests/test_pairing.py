@@ -2,12 +2,14 @@
 EnvStego — USB pairing tests (no hardware required)
 
 Runs the real token_comms.pair_token_usb against scripted serial ports that model
-the two firmwares:
-  * new firmware — answers PAIR_ECDH with an encrypted (ECDH-wrapped) auth key
-  * old firmware — ignores PAIR_ECDH, answers the legacy PAIR_DEVICE in plaintext
+the firmware:
+  * current firmware — answers PAIR_ECDH with PAIRING_PENDING until its IO0 button is
+    pressed, then with an encrypted (ECDH-wrapped) auth key
+  * firmware older than v3 — ignores PAIR_ECDH (only knew plaintext pairing, now removed)
 
-and the situations users hit: low-power restart loop, a busy port, a missing port,
-a mid-pairing drop that recovers, a silent token, and a token bound to another PC.
+and the situations users hit: button never pressed, low-power restart loop, a busy port,
+a missing port, a mid-pairing drop that recovers, a silent token, and a token bound to
+another PC. The removed plaintext pairing must never be used or accepted.
 
 Run from the Python/ directory:
     python -m pytest tests/test_pairing.py -v
@@ -38,17 +40,24 @@ def _common(req):
 
 
 class Firmware:
-    """Scripted serial port that answers like real firmware, keyed on the command verb."""
+    """Scripted serial port that answers like real firmware, keyed on the command verb.
 
-    def __init__(self, kind="ecdh"):
-        self.kind = kind                 # "ecdh" (new) or "legacy" (old)
+    kind="ecdh": answers PAIRING_PENDING for `pending_reads` replies (the user has not
+    pressed IO0 yet), then PAIRING_SUCCESS. kind="old": pre-v3, alive but ignores PAIR_ECDH.
+    """
+
+    def __init__(self, kind="ecdh", pending_reads=2):
+        self.kind = kind
+        self.pending_reads = pending_reads
         self.verb = None
         self.req = None
         self.pc_pub = None
+        self.sent = []
         self.closed = False
         self._tok_priv, self._tok_pub = new_keypair()
 
     def write(self, data: bytes):
+        self.sent.append(data)
         parts = data.decode().strip().split(":")
         self.verb = parts[0]
         self.req = parts[2] if len(parts) > 2 else None
@@ -62,11 +71,12 @@ class Firmware:
         if self.verb == "PAIR_ECDH":
             if self.kind != "ecdh":
                 return b"[HW] Token is UNPAIRED. Waiting for USB handshake...\n"   # old fw: alive, silent
+            if self.pending_reads > 0:
+                self.pending_reads -= 1
+                return f"PAIRING_PENDING;REQ={self.req};REASON=PRESS_BUTTON\n".encode()
             enc = seal_auth_key(self._tok_priv, self._tok_pub, self.pc_pub, TOKEN_ID, AUTH_KEY)
             return (f"PAIRING_SUCCESS{_common(self.req)};MODE=ECDH;"
                     f"TOK_PUB={self._tok_pub.hex()};ENC={enc.hex()}\n").encode()
-        if self.verb == "PAIR_DEVICE":
-            return (f"PAIRING_SUCCESS{_common(self.req)};AUTH_KEY={AUTH_KEY.hex()}\n").encode()
         return b"\n"
 
     def close(self):
@@ -79,7 +89,7 @@ def isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(tc, "_protect_secret", lambda secret: (secret.hex(), "none"))
     monkeypatch.setattr(tc.time, "sleep", lambda _s: None)
     monkeypatch.setattr(tc, "PAIR_WINDOW_S", 2.0)
-    monkeypatch.setattr(tc, "ECDH_PROBE_S", 0.0)       # fall back quickly in the old-firmware test
+    monkeypatch.setattr(tc, "ECDH_PROBE_S", 0.0)       # detect old firmware quickly
 
 
 def use_ports(monkeypatch, *results):
@@ -111,6 +121,7 @@ def test_ecdh_pairing_succeeds_and_recovers_auth_key(monkeypatch):
     # The recovered (sealed-then-opened) auth key matches what the token sent
     assert bytes.fromhex(cfg["auth_key"]) == AUTH_KEY
     assert any("securely" in s.lower() or "encrypted" in s.lower() for s in steps)
+    assert tc.PRESS_BUTTON_MESSAGE in steps            # the user was told to press IO0
 
 
 def test_ecdh_auth_key_never_appears_in_plaintext_on_the_wire(monkeypatch):
@@ -125,13 +136,43 @@ def test_ecdh_auth_key_never_appears_in_plaintext_on_the_wire(monkeypatch):
     assert b"MODE=ECDH" in wire
 
 
-def test_falls_back_to_legacy_for_old_firmware(monkeypatch):
-    use_ports(monkeypatch, Firmware("legacy"))
+def test_old_firmware_is_refused_with_reflash_advice(monkeypatch):
+    # No plaintext fallback any more: old firmware gets a clear "reflash" message.
+    fw = Firmware("old")
+    use_ports(monkeypatch, fw)
+    ok, msg = tc.pair_token_usb("COM3")
+    assert not ok and msg == tc.OUTDATED_FIRMWARE_MESSAGE
+    assert not tc.CONFIG_FILE.exists()
+    assert not any(b"PAIR_DEVICE" in s for s in fw.sent)   # plaintext pairing never attempted
+
+
+def test_plaintext_auth_key_reply_is_rejected(monkeypatch):
+    # A token (or impostor) answering in the old plaintext format must not be trusted.
+    class Plaintext(Firmware):
+        def readline(self):
+            return (f"PAIRING_SUCCESS{_common(self.req)};AUTH_KEY={AUTH_KEY.hex()}\n").encode()
+    use_ports(monkeypatch, Plaintext())
+    ok, msg = tc.pair_token_usb("COM3")
+    assert not ok and "encrypted pairing" in msg
+    assert not tc.CONFIG_FILE.exists()
+
+
+def test_button_not_pressed_in_time_is_refused(monkeypatch):
+    class Unconfirmed(Firmware):
+        def readline(self):
+            return f"PAIRING_REFUSED;REQ={self.req};REASON=NOT_CONFIRMED\n".encode()
+    use_ports(monkeypatch, Unconfirmed())
+    ok, msg = tc.pair_token_usb("COM3")
+    assert not ok and msg == tc.NOT_CONFIRMED_MESSAGE
+    assert not tc.CONFIG_FILE.exists()
+
+
+def test_still_waiting_for_button_at_deadline_says_not_confirmed(monkeypatch):
+    use_ports(monkeypatch, Firmware("ecdh", pending_reads=10**9))   # never pressed
     steps = []
     ok, msg = tc.pair_token_usb("COM3", progress=steps.append)
-    assert ok, msg
-    assert saved_config()["pairing"] == "legacy"
-    assert any("older firmware" in s.lower() or "legacy" in s.lower() for s in steps)
+    assert not ok and msg == tc.NOT_CONFIRMED_MESSAGE
+    assert tc.PRESS_BUTTON_MESSAGE in steps
 
 
 def test_brownout_loop_is_reported_as_a_power_problem(monkeypatch):

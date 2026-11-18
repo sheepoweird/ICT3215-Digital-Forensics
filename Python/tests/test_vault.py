@@ -92,6 +92,18 @@ def test_blob_size_is_blurred_to_buckets(tmp_path):
     assert a["size"] == 100 and b["size"] == 3000     # true sizes live (sealed) in the index
 
 
+def test_metadata_writes_are_atomic_and_survive(tmp_path):
+    # vault.json / index.bin are written via temp-file + os.replace, so a crash can't
+    # tear them. After writes there should be no leftover .tmp, and the vault reopens.
+    v, _ = _new(tmp_path)
+    v.add_bytes("a.txt", b"payload")
+    v.rewrap_env(INDEX_KEY, OTHER_ENV, ["hw_cpu"])      # rewrites vault.json
+    assert [p.name for p in Path(v.path).iterdir() if p.name.endswith(".tmp")] == []
+    v.lock()
+    v2 = V.unlock_env(v.path, OTHER_ENV)
+    assert v2.read_bytes(v2.list_entries()[0]["blob"])[1] == b"payload"
+
+
 def test_remove_shreds_blob_and_drops_entry(tmp_path):
     v, _ = _new(tmp_path)
     e = v.add_bytes("a.bin", b"aaaa")

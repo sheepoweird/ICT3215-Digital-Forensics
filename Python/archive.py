@@ -47,12 +47,17 @@ def _is_within(base: str, target: str) -> bool:
         return False
 
 
+# Cap on total decompressed size, so a malicious "zip bomb" payload cannot fill the
+# disk. 4 GiB is far above any realistic folder a user would hide.
+MAX_EXTRACTED_BYTES = 4 * 1024 ** 3
+
+
 def safe_extract_zip(data: bytes, dest_dir: str) -> list[str]:
     """
     Extract ZIP bytes into dest_dir, refusing any entry that would escape it.
 
-    Returns the list of files written. Raises ValueError on a path-traversal attempt
-    or a malformed archive.
+    Returns the list of files written. Raises ValueError on a path-traversal attempt,
+    a malformed archive, or an archive that decompresses past MAX_EXTRACTED_BYTES.
     """
     os.makedirs(dest_dir, exist_ok=True)
     written = []
@@ -60,6 +65,12 @@ def safe_extract_zip(data: bytes, dest_dir: str) -> list[str]:
         zf = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile as e:
         raise ValueError(f"The recovered data is not a valid archive: {e}")
+
+    # Fast reject on the declared sizes, then enforce the real total while writing
+    # (in case the headers lie).
+    if sum(i.file_size for i in zf.infolist()) > MAX_EXTRACTED_BYTES:
+        raise ValueError("Archive decompresses to an unreasonable size (possible zip bomb).")
+    extracted = 0
 
     for info in zf.infolist():
         name = info.filename.replace("\\", "/")
@@ -82,7 +93,16 @@ def safe_extract_zip(data: bytes, dest_dir: str) -> list[str]:
             os.makedirs(target, exist_ok=True)
             continue
         os.makedirs(os.path.dirname(target), exist_ok=True)
+        # Stream in chunks so a lying header cannot force one huge read, and enforce
+        # the running total against the cap.
         with zf.open(info) as src, open(target, "wb") as dst:
-            dst.write(src.read())
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                extracted += len(chunk)
+                if extracted > MAX_EXTRACTED_BYTES:
+                    raise ValueError("Archive decompresses to an unreasonable size (possible zip bomb).")
+                dst.write(chunk)
         written.append(target)
     return written

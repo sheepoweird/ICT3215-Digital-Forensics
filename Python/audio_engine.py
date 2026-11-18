@@ -59,11 +59,13 @@ def wav_capacity_bytes(path: str) -> int:
 
 
 def embed_blob_wav(carrier_path: str, blob: bytes, output_path: str,
-                   match_timestamps: bool = False) -> str:
+                   match_timestamps: bool = False, order_key: bytes | None = None) -> str:
     """
     Write raw bytes into a WAV's sample LSBs, with no magic header or length field.
+    With order_key the bits are scattered across the samples in a token-secret order.
     Output is forced to .wav. Returns the output path.
     """
+    from stego_engine import _permutation
     params, samples = _read_wav(carrier_path)
     if len(blob) > samples.size // 8:
         raise ValueError(
@@ -75,9 +77,13 @@ def embed_blob_wav(carrier_path: str, blob: bytes, output_path: str,
 
     bits = np.unpackbits(np.frombuffer(blob, dtype=np.uint8)).astype(samples.dtype)
     n = len(bits)
-    # Clear then set the LSB of the first n samples (works for signed ints too:
+    # Clear then set the LSB of the chosen samples (works for signed ints too:
     # ~1 masks off bit 0 while preserving the sign and all higher bits).
-    samples[:n] = (samples[:n] & ~samples.dtype.type(1)) | bits
+    if order_key is None:
+        samples[:n] = (samples[:n] & ~samples.dtype.type(1)) | bits
+    else:
+        pos = _permutation(order_key, samples.size)[:n]
+        samples[pos] = (samples[pos] & ~samples.dtype.type(1)) | bits
 
     out_path = Path(output_path)
     if out_path.suffix.lower() != ".wav":
@@ -92,22 +98,27 @@ def embed_blob_wav(carrier_path: str, blob: bytes, output_path: str,
     return str(out_path)
 
 
-def extract_lsb_bytes_wav(stego_path: str, nbytes: int) -> bytes:
-    """Read the first nbytes bytes carried in a WAV's sample LSBs."""
+def extract_lsb_bytes_wav(stego_path: str, nbytes: int, order_key: bytes | None = None) -> bytes:
+    """Read the first nbytes logical bytes carried in a WAV's sample LSBs."""
+    from stego_engine import _permutation
     _params, samples = _read_wav(stego_path)
     nbits = nbytes * 8
     if nbits > samples.size:
         raise ValueError("Audio is too small for the requested data — it may be corrupted.")
-    lsbs = (samples[:nbits] & samples.dtype.type(1)).astype(np.uint8)
-    return np.packbits(lsbs).tobytes()
+    lsb = (samples & samples.dtype.type(1)).astype(np.uint8)
+    sel = lsb[:nbits] if order_key is None else lsb[_permutation(order_key, samples.size)[:nbits]]
+    return np.packbits(sel).tobytes()
 
 
-def read_lsb_all_wav(stego_path: str) -> bytes:
+def read_lsb_all_wav(stego_path: str, order_key: bytes | None = None) -> bytes:
     """Read the whole LSB byte stream from a WAV in one pass (see stego_engine.read_lsb_all)."""
+    from stego_engine import _permutation
     _params, samples = _read_wav(stego_path)
+    lsbs = (samples & samples.dtype.type(1)).astype(np.uint8)
+    if order_key is not None:
+        lsbs = lsbs[_permutation(order_key, samples.size)]
     usable = (samples.size // 8) * 8
-    lsbs = (samples[:usable] & samples.dtype.type(1)).astype(np.uint8)
-    return np.packbits(lsbs).tobytes()
+    return np.packbits(lsbs[:usable]).tobytes()
 
 
 def get_audio_info(path: str) -> dict:

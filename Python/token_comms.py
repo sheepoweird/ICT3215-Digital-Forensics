@@ -182,8 +182,21 @@ def _parse_fields(line: str) -> dict:
     return fields
 
 
-# Long enough for a full token start-up (3 s reset window + BLE start) plus one restart
-PAIR_WINDOW_S = 15.0
+# Long enough for the token to finish starting up (3 s reset window + BLE start) and for
+# the user to pick it up and press its IO0 button to confirm (the token waits 60 s).
+PAIR_WINDOW_S = 75.0
+
+PRESS_BUTTON_MESSAGE = (
+    "Confirm on the token: its light is now on steadily. Press the IO0 button "
+    "(not RST) within 60 seconds.")
+
+NOT_CONFIRMED_MESSAGE = (
+    "Pairing was not confirmed on the token in time.\n"
+    "Click Pair Token again, and when the token's light stays on, press its IO0 button.")
+
+OUTDATED_FIRMWARE_MESSAGE = (
+    "This token's firmware is too old: it does not support encrypted, button-confirmed "
+    "pairing. Reflash it with the current firmware (SETUP.md, step 6), then pair again.")
 
 POWER_MESSAGE = (
     "The token keeps restarting because this USB port is not giving it enough power.\n"
@@ -215,7 +228,8 @@ def _open_port(com_port: str) -> serial.Serial:
     return ser
 
 
-# After this long of a responsive-but-silent token, assume old firmware and fall back
+# A token that is clearly alive but never answers PAIR_ECDH within this long is running
+# firmware from before v3, which only knew the (now removed) plaintext pairing.
 ECDH_PROBE_S = 8.0
 
 
@@ -228,7 +242,7 @@ def _save_pairing(host_id, token_id, auth_key, mac, fields) -> tuple[bool, str]:
         "ble_mac": mac,
         "char_uuid": fields.get("CHAR_UUID", CHARACTERISTIC_UUID),
         "firmware": fields.get("FW", "?"),
-        "pairing": "ecdh" if fields.get("MODE") == "ECDH" else "legacy",
+        "pairing": "ecdh",
         "auth_key": key_blob,
         "auth_key_protection": scheme,
         "paired_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -239,41 +253,42 @@ def _save_pairing(host_id, token_id, auth_key, mac, fields) -> tuple[bool, str]:
 
 
 def _extract_auth_key(fields, pc_priv, pc_pub):
-    """Return (token_id, auth_key) from a reply, decrypting the ECDH form. Raises ValueError."""
+    """Return (token_id, auth_key) from an ECDH pairing reply. Raises ValueError.
+
+    Only the encrypted form is accepted: a reply carrying the auth key in plaintext
+    (the old PAIR_DEVICE format) is refused, so a downgraded or spoofed token cannot
+    make the key cross the wire in the clear."""
+    if fields.get("MODE") != "ECDH":
+        raise ValueError("the token did not use encrypted pairing")
     token_id = bytes.fromhex(fields["TOKEN_ID"])
     if len(token_id) != TOKEN_ID_LEN:
         raise ValueError("bad token id")
-    if fields.get("MODE") == "ECDH":
-        from pair_crypto import open_auth_key
-        from cryptography.exceptions import InvalidTag
-        tok_pub = bytes.fromhex(fields["TOK_PUB"])
-        enc = bytes.fromhex(fields["ENC"])
-        try:
-            auth_key = open_auth_key(pc_priv, pc_pub, tok_pub, token_id, enc)
-        except InvalidTag:
-            raise ValueError("encrypted pairing failed authentication")
-    else:
-        auth_key = bytes.fromhex(fields["AUTH_KEY"])
+    from pair_crypto import open_auth_key
+    tok_pub = bytes.fromhex(fields["TOK_PUB"])
+    enc = bytes.fromhex(fields["ENC"])
+    try:
+        auth_key = open_auth_key(pc_priv, pc_pub, tok_pub, token_id, enc)
+    except InvalidTag:
+        raise ValueError("encrypted pairing failed authentication")
     if len(auth_key) != 32:
         raise ValueError("bad auth key length")
     return token_id, auth_key
 
 
-def _pair_once(com_port, mode, host_id, request_id, pc_priv, pc_pub, report, deadline):
+def _pair(com_port, host_id, request_id, pc_priv, pc_pub, report, deadline):
     """
-    Run one pairing attempt in 'ecdh' or 'legacy' mode until the deadline.
+    Run the encrypted, button-confirmed pairing exchange until the deadline.
 
-    Returns (result, message): result True = paired, False = definitive failure,
-    None = no usable reply (the token is old firmware / silent — try the other mode).
+    The command is repeated (same request ID, so the token never rotates the key twice).
+    The token first answers PAIRING_PENDING and waits for its IO0 button; once pressed it
+    answers PAIRING_SUCCESS. Returns (ok, message).
     """
-    if mode == "ecdh":
-        command = f"PAIR_ECDH:{host_id}:{request_id}:{pc_pub.hex()}\n".encode()
-    else:
-        command = f"PAIR_DEVICE:{host_id}:{request_id}\n".encode()
+    command = f"PAIR_ECDH:{host_id}:{request_id}:{pc_pub.hex()}\n".encode()
 
     ser, opened, open_error = None, False, None
     drops = restarts = 0
     alive_since = None
+    prompted = False
     try:
         while time.time() < deadline:
             if ser is None:
@@ -304,29 +319,38 @@ def _pair_once(com_port, mode, host_id, request_id, pc_priv, pc_pub, report, dea
             if line:
                 alive_since = alive_since or time.time()
             if not line.startswith("PAIRING_"):
-                # Old firmware ignores PAIR_ECDH entirely: if it is clearly alive but
-                # never answers our ECDH command, stop probing and fall back to legacy.
-                if (mode == "ecdh" and alive_since
+                # Firmware older than v3 ignores PAIR_ECDH entirely. If the token is
+                # clearly alive but never answers, tell the user to reflash it.
+                if (not prompted and alive_since
                         and time.time() - alive_since > ECDH_PROBE_S):
-                    return None, "fallback"
+                    return False, OUTDATED_FIRMWARE_MESSAGE
                 continue
             fields = _parse_fields(line)
             if fields.get("REQ") != request_id:
                 continue
+            if line.startswith("PAIRING_PENDING"):
+                # The token is waiting for its IO0 button; keep repeating the request.
+                if not prompted:
+                    report(PRESS_BUTTON_MESSAGE)
+                    prompted = True
+                continue
             if line.startswith("PAIRING_REFUSED"):
-                if fields.get("REASON") == "BOUND_TO_OTHER_HOST":
+                reason = fields.get("REASON")
+                if reason == "BOUND_TO_OTHER_HOST":
                     return False, (
                         "This token is already bound to a different PC.\n"
-                        "Hold the IO0 button while it boots to factory reset it. "
+                        "Hold the IO0 button for 3 seconds while it boots to factory reset it. "
                         "Note: a reset destroys its master secret, so files encrypted "
                         "with it can never be decrypted again.")
-                return False, f"Token refused pairing ({fields.get('REASON', 'unknown')})."
+                if reason == "NOT_CONFIRMED":
+                    return False, NOT_CONFIRMED_MESSAGE
+                return False, f"Token refused pairing ({reason or 'unknown'})."
             try:
                 token_id, auth_key = _extract_auth_key(fields, pc_priv, pc_pub)
                 mac = fields["BLE_MAC"]
             except (KeyError, ValueError) as e:
                 return False, f"Token sent an unreadable pairing reply ({e}). Is the firmware up to date?"
-            report("Token answered. Saving the pairing…")
+            report("Confirmed on the token. Saving the pairing…")
             return _save_pairing(host_id, token_id, auth_key, mac, fields)
     finally:
         if ser is not None:
@@ -339,14 +363,18 @@ def _pair_once(com_port, mode, host_id, request_id, pc_priv, pc_pub, report, dea
     if drops:
         return False, (f"The connection to the token kept dropping. Check the cable and close any "
                        f"other program using {com_port}, then try again.")
-    return None, "timeout"       # no reply at all — let the caller fall back / report
+    if prompted:
+        return False, NOT_CONFIRMED_MESSAGE
+    return False, ("The token did not answer. Check its firmware is flashed and no serial monitor is "
+                   "open. After start-up its light should give 2 short flashes; if it doesn't, see "
+                   "Troubleshooting on this page.")
 
 
 def pair_token_usb(com_port: str, progress=None) -> tuple[bool, str]:
     """
-    Bind the token over USB. Encrypted (ECDH) pairing is tried first so the auth key
-    never crosses the wire in plaintext; if the token runs older firmware that does
-    not understand it, pairing falls back to the legacy plaintext handshake.
+    Bind the token over USB with an encrypted (ECDH) exchange, so the auth key never
+    crosses the wire in plaintext. The token asks for a press of its IO0 button before
+    it binds, so nothing can re-pair it silently while it is plugged in.
 
     progress, if given, is called with short status lines for the UI.
     """
@@ -357,22 +385,10 @@ def pair_token_usb(com_port: str, progress=None) -> tuple[bool, str]:
     pc_priv, pc_pub = new_keypair()
 
     report(f"Connecting to {com_port}…")
-    report("Pairing securely (encrypted key exchange). No buttons need pressing…")
-    result, msg = _pair_once(com_port, "ecdh", host_id, request_id, pc_priv, pc_pub,
-                             report, time.time() + PAIR_WINDOW_S)
-    if result is not None:
-        return result, msg
-
-    # Old firmware: fall back to the legacy plaintext handshake.
-    report("This token uses older firmware without encrypted pairing — using legacy pairing…")
-    result, msg = _pair_once(com_port, "legacy", host_id, request_id, pc_priv, pc_pub,
-                             report, time.time() + PAIR_WINDOW_S)
-    if result is not None:
-        return result, msg
-
-    return False, ("The token did not answer. Check its firmware is flashed and no serial monitor is "
-                   "open. After start-up its light should give 2 short flashes; if it doesn't, see "
-                   "Troubleshooting on this page.")
+    report("Pairing securely (encrypted key exchange). You will be asked to press the "
+           "token's IO0 button…")
+    return _pair(com_port, host_id, request_id, pc_priv, pc_pub, report,
+                 time.time() + PAIR_WINDOW_S)
 
 
 # ── Phase 2: BLE protocol (pure functions, testable without hardware) ──

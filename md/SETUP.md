@@ -86,14 +86,15 @@ The count tells you what happened; short flashes are good news, long ones are pr
 
 | Pattern | Meaning |
 |---------|---------|
-| Short blink every 0.5 s for 3 s | Booting. Hold IO0 now to factory reset |
+| Short blink every 0.5 s for 3 s | Booting. Hold IO0 for 2 s now to factory reset (a quick tap is ignored) |
+| Solid on | Pairing requested — press IO0 within 60 s to confirm |
 | 10 rapid flashes | Factory reset done, all secrets wiped |
 | 1 short | Ready, paired |
 | 2 short | Ready, waiting for USB pairing |
 | 3 short | Pairing succeeded |
 | 2 very fast | Key request served |
 | 1 long | Rejected a bad request |
-| 2 long | Pairing refused (bound to another PC) |
+| 2 long | Pairing refused (bound to another PC, or not confirmed in time) |
 | 3 long | Locked out for 30 s after 5 bad requests |
 
 If the boot blink keeps repeating, the token is resetting itself, usually because the
@@ -110,12 +111,15 @@ refreshes and restarts.
 
 ### Setup › Token (do this first)
 1. Plug the token in over USB, pick its **serial port** (CH340/CP210x ports are listed first)
-2. Click **Pair Token**. The token generates its master secret with its hardware RNG and
-   gives this PC an auth key, which is stored encrypted with Windows DPAPI
+2. Click **Pair Token**. When the token's light **stays on**, press its **IO0** button (not RST)
+   within 60 seconds to confirm. Nothing can pair the token without this press. The token
+   generates its master secret with its hardware RNG and gives this PC an auth key over an
+   encrypted (ECDH) exchange; the PC stores it encrypted with Windows DPAPI
 3. Click **Test connection** to run the authenticated BLE handshake. The USB cable is no longer needed
 - **Forget pairing** deletes only this PC's credentials. Re-pairing later keeps your files decryptable
-- **Factory reset** (hold IO0 while booting) destroys the master secret. Files encrypted with
-  that token become permanently unrecoverable
+- **Factory reset** (hold IO0 for 2 seconds while it boots) destroys the master secret. Files
+  encrypted with that token become permanently unrecoverable
+- Firmware **v4 or later** is required (older firmware used a plaintext pairing that has been removed)
 
 ### Setup › Signals
 - The app scans your machine on launch. **Refresh** re-scans and keeps your selection
