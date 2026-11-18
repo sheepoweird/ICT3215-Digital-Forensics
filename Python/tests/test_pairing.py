@@ -244,6 +244,14 @@ def test_firmware_hkdf_formula_matches_reference():
     assert firmware == reference
 
 
+def test_pairing_can_be_cancelled(monkeypatch):
+    # Wrong port chosen: cancelling returns promptly without binding anything.
+    use_ports(monkeypatch, Firmware("ecdh", pending_reads=10**9))   # would wait forever
+    ok, msg = tc.pair_token_usb("COM3", should_cancel=lambda: True)
+    assert not ok and msg == tc.CANCELLED_MESSAGE
+    assert not tc.CONFIG_FILE.exists()
+
+
 def test_token_bound_to_other_pc_is_refused(monkeypatch):
     class Refusing(Firmware):
         def readline(self):

@@ -68,9 +68,9 @@ def fake_collect():
 PAIR_SHOULD_FAIL = {"value": False}
 
 
-def fake_pair(_port, progress=None):
+def fake_pair(_port, progress=None, should_cancel=None):
     if progress:
-        progress("Waiting for the token to answer. No buttons need pressing…")
+        progress("When the token's light stays on, press its IO0 button.")
     if PAIR_SHOULD_FAIL["value"]:
         return False, tc.POWER_MESSAGE
     STATE["cfg"] = dict(FAKE_CFG)
@@ -134,6 +134,14 @@ def idle(w):
 
 # ── Startup ──────────────────────────────────────────────────────────────────
 
+def test_rescan_after_first_collection_does_not_crash(win):
+    # Regression: the loading label is deleted by the first populate, so a second
+    # collection (Refresh) must not raise "wrapped C/C++ object ... has been deleted".
+    win._on_signals_collected(fake_collect())
+    win._on_signals_collected(fake_collect())
+    assert len(win._signal_rows) > 0
+
+
 def test_startup_shows_paired_token_and_all_pages(win):
     assert win._tabs.count() == 6
     assert win._token_cfg is not None
@@ -161,6 +169,17 @@ def test_preset_selects_expected_signals(win):
     assert win._selected_ids == DEVICE_BOUND
     assert win._active_preset == "builtin:Device-bound"
     assert win._test_btn.isEnabled()
+
+
+def test_choosing_preset_does_not_rebuild_the_combo(win):
+    # Regression: picking a preset must not clear()+rebuild the combo from inside its
+    # own activated handler — that corrupted the popup so it would not reopen.
+    before = win._preset_combo.count()
+    idx = win._preset_combo.findData("builtin:Device-bound")
+    win._on_preset_chosen(idx)                        # simulate the activated signal
+    assert win._preset_combo.count() == before        # items untouched
+    assert win._preset_combo.currentData() == "builtin:Device-bound"
+    assert win._preset_combo.isEnabled()
 
 
 def test_recommended_preset_selects_a_strong_readable_set(win):

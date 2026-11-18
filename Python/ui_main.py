@@ -57,6 +57,7 @@ from cryptography.exceptions import InvalidTag
 from token_comms import (
     pair_token_usb, ping_token, load_config, forget_pairing, list_serial_ports,
     token_fingerprint, TokenError, UNREACHABLE_MSG as TOKEN_UNREACHABLE_HINT,
+    CANCELLED_MESSAGE as PAIR_CANCELLED_MSG,
 )
 
 
@@ -460,9 +461,14 @@ class PairWorker(QThread):
     def __init__(self, port: str):
         super().__init__()
         self._port = port
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
 
     def run(self):
-        self.done.emit(*pair_token_usb(self._port, progress=self.progress.emit))
+        self.done.emit(*pair_token_usb(self._port, progress=self.progress.emit,
+                                       should_cancel=lambda: self._cancelled))
 
 
 class PingWorker(QThread):
@@ -1562,6 +1568,8 @@ class MainWindow(QMainWindow):
         self._workers: set[QThread] = set()
         self._busy = False
         self._collecting = False
+        self._pairing = False
+        self._pair_worker = None
         # First launch with nothing chosen falls back to the Recommended preset once.
         self._did_default_preset = bool(self._selected_ids) or bool(self._active_preset)
         # Which signal categories are collapsed on the Signals page (remembered).
@@ -2027,6 +2035,17 @@ class MainWindow(QMainWindow):
         c.blockSignals(False)
         self._update_preset_controls()
 
+    def _sync_preset_combo_selection(self):
+        """Point the combo at the active preset (or 'Custom') WITHOUT rebuilding its
+        items. Safe to call from inside the combo's own 'activated' handler — a full
+        clear()+rebuild there corrupts the popup so later clicks won't open it."""
+        c = self._preset_combo
+        idx = c.findData(self._active_preset) if self._active_preset else 0
+        c.blockSignals(True)
+        c.setCurrentIndex(max(idx, 0))
+        c.blockSignals(False)
+        self._update_preset_controls()
+
     def _current_preset(self) -> tuple[str, str] | None:
         data = self._preset_combo.currentData()
         if not data:
@@ -2112,7 +2131,9 @@ class MainWindow(QMainWindow):
         for row in self._signal_rows:
             row.set_checked(row.signal.id in self._selected_ids)
         self._set_active_preset(preset_key)
-        self._rebuild_preset_combo()
+        # Only move the current item; the item list is unchanged (rebuilding it from
+        # inside the combo's activated handler is what broke the dropdown).
+        self._sync_preset_combo_selection()
         self._on_selection_changed()
 
     def _on_portable_toggled(self, on: bool):
@@ -2939,7 +2960,7 @@ class MainWindow(QMainWindow):
         self._pair_btn.setObjectName("btn_primary")
         self._pair_btn.setMinimumWidth(170)
         self._pair_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._pair_btn.clicked.connect(self._start_pairing)
+        self._pair_btn.clicked.connect(self._on_pair_button)
         port_row.addWidget(self._pair_btn)
         pl.addLayout(port_row)
 
@@ -3111,6 +3132,13 @@ class MainWindow(QMainWindow):
             self._settings.setValue("token/port", port)
         self._refresh_actions()
 
+    def _on_pair_button(self):
+        """The pair button doubles as Cancel while a pairing is running."""
+        if self._pairing:
+            self._cancel_pairing()
+        else:
+            self._start_pairing()
+
     def _start_pairing(self):
         port = self._port_combo.currentData()
         if not port:
@@ -3121,17 +3149,30 @@ class MainWindow(QMainWindow):
                 "stay decryptable, but the old pairing stops working.\n\nContinue?"
         ) != QMessageBox.StandardButton.Yes:
             return
+        self._pairing = True
         self._set_busy(True)
-        self._pair_btn.setText("Pairing…")
+        self._pair_btn.setText("Cancel")
+        self._pair_btn.setEnabled(True)              # stays clickable to cancel
         self._ping_result.show_info(f"Pairing over {port}…\n"
-                                    "When the token's light stays on, press its IO0 button.")
+                                    "When the token's light stays on, press its IO0 button. "
+                                    "Wrong port? Click Cancel.")
         self._status.showMessage(f"Pairing with hardware token via USB ({port})…")
         w = PairWorker(port)
+        self._pair_worker = w
         w.progress.connect(lambda step: self._ping_result.show_info(f"Pairing over {port}…\n{step}"))
         w.done.connect(self._on_pairing_done)
         self._start_worker(w)
 
+    def _cancel_pairing(self):
+        if self._pair_worker is not None:
+            self._pair_worker.cancel()
+        self._pair_btn.setText("Cancelling…")
+        self._pair_btn.setEnabled(False)
+        self._ping_result.show_info("Cancelling…")
+
     def _on_pairing_done(self, success: bool, msg: str):
+        self._pairing = False
+        self._pair_worker = None
         self._set_busy(False)
         self._token_cfg = load_config()
         self._refresh_token_ui()
@@ -3140,6 +3181,9 @@ class MainWindow(QMainWindow):
             # Confirm the Bluetooth link straight away, so problems show up now and not mid-encrypt
             self._pending_pair_msg = msg
             self._start_ping()
+        elif msg == PAIR_CANCELLED_MSG:
+            self._ping_result.show_info("Pairing cancelled. Pick the right port and try again.")
+            self._status.showMessage("Pairing cancelled")
         else:
             self._ping_result.show_error(msg)
             self._status.showMessage("Token pairing failed")
@@ -3741,7 +3785,12 @@ class MainWindow(QMainWindow):
     def _on_signals_collected(self, signals: list[EnvSignal]):
         self._collecting = False
         self._all_signals = signals
-        self._loading_lbl.hide()
+        # The loading label lives in the scroll area that _populate_signal_rows clears,
+        # so after the first collection it is gone; a re-scan must not touch a dead widget.
+        try:
+            self._loading_lbl.hide()
+        except RuntimeError:
+            pass
         self._populate_signal_rows(signals)
         self._populate_inspector()
         self._refresh_btn.setText("↻  Refresh signals")
@@ -3799,7 +3848,9 @@ class MainWindow(QMainWindow):
         self._preset_save_btn.setEnabled(bool(self._selected_ids))
         self._refresh_btn.setEnabled(idle)
         # Token management does not depend on the signal scan
-        self._pair_btn.setEnabled(not self._busy and self._port_combo.currentData() is not None)
+        # While pairing, the button stays enabled as a Cancel control.
+        self._pair_btn.setEnabled(self._pairing or
+                                  (not self._busy and self._port_combo.currentData() is not None))
         self._ping_btn.setEnabled(not self._busy and paired)
         self._forget_btn.setEnabled(not self._busy and paired)
         self._populate_inspector_marks()

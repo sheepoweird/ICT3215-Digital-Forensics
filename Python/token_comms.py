@@ -198,6 +198,8 @@ OUTDATED_FIRMWARE_MESSAGE = (
     "This token's firmware is too old: it does not support encrypted, button-confirmed "
     "pairing. Reflash it with the current firmware (SETUP.md, step 6), then pair again.")
 
+CANCELLED_MESSAGE = "Pairing cancelled."
+
 POWER_MESSAGE = (
     "The token keeps restarting because this USB port is not giving it enough power.\n"
     "Its light repeats the start-up blinks but never gives the 2 short 'ready' flashes.\n"
@@ -275,13 +277,14 @@ def _extract_auth_key(fields, pc_priv, pc_pub):
     return token_id, auth_key
 
 
-def _pair(com_port, host_id, request_id, pc_priv, pc_pub, report, deadline):
+def _pair(com_port, host_id, request_id, pc_priv, pc_pub, report, deadline, should_cancel=None):
     """
     Run the encrypted, button-confirmed pairing exchange until the deadline.
 
     The command is repeated (same request ID, so the token never rotates the key twice).
     The token first answers PAIRING_PENDING and waits for its IO0 button; once pressed it
-    answers PAIRING_SUCCESS. Returns (ok, message).
+    answers PAIRING_SUCCESS. Returns (ok, message). should_cancel, if given, is polled
+    each loop so the UI can abort (e.g. the wrong COM port was chosen).
     """
     command = f"PAIR_ECDH:{host_id}:{request_id}:{pc_pub.hex()}\n".encode()
 
@@ -291,6 +294,8 @@ def _pair(com_port, host_id, request_id, pc_priv, pc_pub, report, deadline):
     prompted = False
     try:
         while time.time() < deadline:
+            if should_cancel is not None and should_cancel():
+                return False, CANCELLED_MESSAGE
             if ser is None:
                 try:
                     ser = _open_port(com_port)
@@ -370,13 +375,14 @@ def _pair(com_port, host_id, request_id, pc_priv, pc_pub, report, deadline):
                    "Troubleshooting on this page.")
 
 
-def pair_token_usb(com_port: str, progress=None) -> tuple[bool, str]:
+def pair_token_usb(com_port: str, progress=None, should_cancel=None) -> tuple[bool, str]:
     """
     Bind the token over USB with an encrypted (ECDH) exchange, so the auth key never
     crosses the wire in plaintext. The token asks for a press of its IO0 button before
     it binds, so nothing can re-pair it silently while it is plugged in.
 
-    progress, if given, is called with short status lines for the UI.
+    progress, if given, is called with short status lines for the UI. should_cancel, if
+    given, is polled so the UI can abort a pairing started on the wrong port.
     """
     from pair_crypto import new_keypair
     report = progress or (lambda _msg: None)
@@ -388,7 +394,7 @@ def pair_token_usb(com_port: str, progress=None) -> tuple[bool, str]:
     report("Pairing securely (encrypted key exchange). You will be asked to press the "
            "token's IO0 button…")
     return _pair(com_port, host_id, request_id, pc_priv, pc_pub, report,
-                 time.time() + PAIR_WINDOW_S)
+                 time.time() + PAIR_WINDOW_S, should_cancel=should_cancel)
 
 
 # ── Phase 2: BLE protocol (pure functions, testable without hardware) ──
