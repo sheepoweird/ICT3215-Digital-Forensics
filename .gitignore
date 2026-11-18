@@ -66,3 +66,6 @@ Python/envstego_settings.ini
 # Logs + screenshots documenting test/verification runs. Kept locally
 # for the report; not pushed. The app and tests do not depend on them.
 /evidence/
+
+# ─── PlatformIO build output (ESP32 firmware) ───
+.pio/
