@@ -3,9 +3,9 @@ EnvStego — USB pairing tests (no hardware required)
 
 Runs the real token_comms.pair_token_usb against scripted serial ports that model
 the firmware:
-  * current firmware — answers PAIR_ECDH with PAIRING_PENDING until its IO0 button is
+  * current firmware — answers PAIR_V5 with PAIRING_PENDING until its IO0 button is
     pressed, then with an encrypted (ECDH-wrapped) auth key
-  * firmware older than v3 — ignores PAIR_ECDH (only knew plaintext pairing, now removed)
+  * older firmware — ignores PAIR_V5
 
 and the situations users hit: button never pressed, low-power restart loop, a busy port,
 a missing port, a mid-pairing drop that recovers, a silent token, and a token bound to
@@ -15,6 +15,7 @@ Run from the Python/ directory:
     python -m pytest tests/test_pairing.py -v
 """
 
+import hmac
 import json
 import sys
 from pathlib import Path
@@ -31,19 +32,20 @@ from pair_crypto import new_keypair, seal_auth_key
 
 TOKEN_ID = bytes.fromhex("f10553cd5fb8f6e0199acc61fb2f9543")
 AUTH_KEY = bytes(range(32))
+PAIR_NONCE = bytes(range(16))
 MAC = "84:1f:e8:67:b6:c2"
 
 
 def _common(req):
     return (f";REQ={req};TOKEN_ID={TOKEN_ID.hex()};BLE_MAC={MAC};"
-            f"CHAR_UUID={tc.CHARACTERISTIC_UUID};FW=3")
+            f"CHAR_UUID={tc.CHARACTERISTIC_UUID};FW=5")
 
 
 class Firmware:
     """Scripted serial port that answers like real firmware, keyed on the command verb.
 
     kind="ecdh": answers PAIRING_PENDING for `pending_reads` replies (the user has not
-    pressed IO0 yet), then PAIRING_SUCCESS. kind="old": pre-v3, alive but ignores PAIR_ECDH.
+    pressed IO0 yet), then PAIRING_SUCCESS. kind="paired" requires credential proof first.
     """
 
     def __init__(self, kind="ecdh", pending_reads=2):
@@ -52,6 +54,8 @@ class Firmware:
         self.verb = None
         self.req = None
         self.pc_pub = None
+        self.mode = None
+        self.proven = False
         self.sent = []
         self.closed = False
         self._tok_priv, self._tok_pub = new_keypair()
@@ -60,17 +64,31 @@ class Firmware:
         self.sent.append(data)
         parts = data.decode().strip().split(":")
         self.verb = parts[0]
-        self.req = parts[2] if len(parts) > 2 else None
-        if self.verb == "PAIR_ECDH" and len(parts) > 3:
-            self.pc_pub = bytes.fromhex(parts[3])
+        self.req = parts[1] if len(parts) > 1 else None
+        if self.verb == "PAIR_V5":
+            self.pc_pub = bytes.fromhex(parts[2])
+            self.mode = parts[3]
+        elif self.verb == "PAIR_PROVE":
+            transcript = b"3T-PAIR-PROOF-v1" + TOKEN_ID + PAIR_NONCE + self.req.encode() + self.pc_pub
+            self.proven = hmac.compare_digest(bytes.fromhex(parts[2]), hmac.digest(AUTH_KEY, transcript, "sha256"))
 
     def flush(self):
         pass
 
     def readline(self) -> bytes:
-        if self.verb == "PAIR_ECDH":
-            if self.kind != "ecdh":
+        if self.verb == "PAIR_PROVE":
+            reason = "AUTH_FAILED" if not self.proven else "PRESS_BUTTON"
+            status = "REFUSED" if not self.proven else "PENDING"
+            return f"PAIRING_{status};REQ={self.req};REASON={reason}\n".encode()
+        if self.verb == "PAIR_V5":
+            if self.kind == "old":
                 return b"[HW] Token is UNPAIRED. Waiting for USB handshake...\n"   # old fw: alive, silent
+            if self.kind == "paired":
+                if self.mode != "REPAIR":
+                    return f"PAIRING_REFUSED;REQ={self.req};REASON=PROOF_REQUIRED\n".encode()
+                if not self.proven:
+                    return (f"PAIRING_PROOF;REQ={self.req};NONCE={PAIR_NONCE.hex()};"
+                            f"TOKEN_ID={TOKEN_ID.hex()}\n").encode()
             if self.pending_reads > 0:
                 self.pending_reads -= 1
                 return f"PAIRING_PENDING;REQ={self.req};REASON=PRESS_BUTTON\n".encode()
@@ -87,6 +105,7 @@ class Firmware:
 def isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(tc, "CONFIG_FILE", tmp_path / "token_config.json")
     monkeypatch.setattr(tc, "_protect_secret", lambda secret: (secret.hex(), "none"))
+    monkeypatch.setattr(tc, "_unprotect_secret", lambda blob, _scheme: bytes.fromhex(blob))
     monkeypatch.setattr(tc.time, "sleep", lambda _s: None)
     monkeypatch.setattr(tc, "PAIR_WINDOW_S", 2.0)
     monkeypatch.setattr(tc, "ECDH_PROBE_S", 0.0)       # detect old firmware quickly
@@ -143,7 +162,7 @@ def test_old_firmware_is_refused_with_reflash_advice(monkeypatch):
     ok, msg = tc.pair_token_usb("COM3")
     assert not ok and msg == tc.OUTDATED_FIRMWARE_MESSAGE
     assert not tc.CONFIG_FILE.exists()
-    assert not any(b"PAIR_DEVICE" in s for s in fw.sent)   # plaintext pairing never attempted
+    assert all(s.startswith(b"PAIR_V5:") for s in fw.sent)
 
 
 def test_plaintext_auth_key_reply_is_rejected(monkeypatch):
@@ -252,10 +271,28 @@ def test_pairing_can_be_cancelled(monkeypatch):
     assert not tc.CONFIG_FILE.exists()
 
 
-def test_token_bound_to_other_pc_is_refused(monkeypatch):
-    class Refusing(Firmware):
-        def readline(self):
-            return f"PAIRING_REFUSED;REQ={self.req};REASON=BOUND_TO_OTHER_HOST\n".encode()
-    use_ports(monkeypatch, Refusing())
+def test_already_paired_token_requires_a_saved_credential(monkeypatch):
+    use_ports(monkeypatch, Firmware("paired"))
     ok, msg = tc.pair_token_usb("COM3")
-    assert not ok and "different PC" in msg
+    assert not ok and msg == tc.EXISTING_CREDENTIAL_MESSAGE
+    assert not tc.CONFIG_FILE.exists()
+
+
+def test_repair_proves_possession_of_an_existing_v4_key(monkeypatch):
+    tc._save_pairing(TOKEN_ID, AUTH_KEY, MAC, {"FW": "4"})
+    fw = Firmware("paired")
+    use_ports(monkeypatch, fw)
+    ok, msg = tc.pair_token_usb("COM3")
+    assert ok, msg
+    assert fw.proven
+    assert saved_config()["auth_key"] == AUTH_KEY.hex()
+    assert saved_config()["firmware"] == "5"
+
+
+def test_repair_failure_keeps_saved_credential(monkeypatch):
+    tc._save_pairing(TOKEN_ID, b"z" * 32, MAC, {"FW": "4"})
+    original = tc.CONFIG_FILE.read_bytes()
+    use_ports(monkeypatch, Firmware("paired"))
+    ok, msg = tc.pair_token_usb("COM3")
+    assert not ok and msg == tc.EXISTING_CREDENTIAL_MESSAGE
+    assert tc.CONFIG_FILE.read_bytes() == original

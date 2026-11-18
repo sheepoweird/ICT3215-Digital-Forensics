@@ -1,7 +1,7 @@
 """
 EnvStego — offline test suite (no hardware required)
 
-A faithful software model of the 3T token firmware (ESP32 Files/main.cpp) drives
+A software model of the original generic-key protocol drives
 the REAL production protocol code in token_comms.py, so these tests exercise the
 actual challenge/response, key-derivation, crypto and steganography paths.
 
@@ -57,10 +57,10 @@ ENV_LABEL = b"3T-ENV-v1"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Simulated token — mirrors ESP32 Files/main.cpp state machine exactly
+# Simulated generic-key token; v6 approval transport is tested in test_vault_protocol.py.
 # ─────────────────────────────────────────────────────────────────────────────
 class SimToken:
-    """Software twin of the firmware. Consumes/produces the same wire bytes."""
+    """Generic-key protocol fixture. Consumes/produces production wire bytes."""
 
     def __init__(self, master_secret=None, auth_key=None, token_id=None):
         self.master_secret = master_secret or os.urandom(tc.HASH_LEN)

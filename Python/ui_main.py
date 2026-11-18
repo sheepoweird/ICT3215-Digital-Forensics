@@ -25,6 +25,7 @@ import os
 import sys
 import tempfile
 import time
+import threading
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -32,10 +33,10 @@ from PyQt6.QtWidgets import (
     QPushButton, QCheckBox, QProgressBar, QFileDialog, QTextEdit, QButtonGroup,
     QScrollArea, QFrame, QTableWidget, QTableWidgetItem, QLineEdit, QStatusBar,
     QGridLayout, QHeaderView, QMessageBox, QComboBox, QInputDialog, QToolButton,
-    QApplication, QListWidget, QListWidgetItem, QSizePolicy, QDialog,
+    QApplication, QListWidget, QListWidgetItem, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QUrl, QPointF, QTimer
-from PyQt6.QtGui import (QColor, QDesktopServices, QPainter, QPainterPath, QPen, QPixmap, QImage,
+from PyQt6.QtGui import (QColor, QDesktopServices, QPainter, QPainterPath, QPen, QPixmap,
                          QShortcut, QKeySequence)
 
 from signals import EnvSignal, collect_all_signals
@@ -47,16 +48,18 @@ from crypto_engine import (
 )
 import multi_image as mi
 import media
-import vault as V
+import vault_v2 as V
+from crypto_engine import environment_hash
 from archive import zip_folder, safe_extract_zip
 from stego_engine import extract, MAGIC, LEGACY_MAGIC
-from media import embed_blob, lsb_capacity_bytes, read_lsb_all
+from media import embed_blob, read_lsb_all
 from winutils import pictures_dir, downloads_dir
 from winutils import protect_str, unprotect_str
 from cryptography.exceptions import InvalidTag
 from token_comms import (
     pair_token_usb, ping_token, load_config, forget_pairing, list_serial_ports,
-    token_fingerprint, TokenError, UNREACHABLE_MSG as TOKEN_UNREACHABLE_HINT,
+    token_fingerprint, TokenError, TokenTransientError, PING_TIMEOUT_S,
+    UNREACHABLE_MSG as TOKEN_UNREACHABLE_HINT,
     CANCELLED_MESSAGE as PAIR_CANCELLED_MSG,
 )
 
@@ -504,7 +507,7 @@ class TestKeyWorker(QThread):
 
 
 class EncryptWorker(QThread):
-    done  = pyqtSignal(str, str, str)
+    done  = pyqtSignal(str, str, list)
     error = pyqtSignal(str)
 
     def __init__(self, selected_ids, carriers, payload_path, outputs, match_timestamps=False):
@@ -547,7 +550,7 @@ class EncryptWorker(QThread):
             if len(self._carriers) > 1:
                 written = mi.split_embed(index_key, blob, self._carriers, self._outputs,
                                          match_timestamps=self._match_timestamps)
-                carrier_desc = f"{len(written)} images (split)"
+                carrier_desc = f"{len(written)} carriers (split)"
                 out_desc = "\n                 ".join(written)
                 first_out = written[0]
             else:
@@ -565,7 +568,7 @@ class EncryptWorker(QThread):
                 f"  Carrier:       {carrier_desc}\n"
                 f"  Output:        {out_desc}",
                 fp,
-                first_out
+                written
             )
         except Exception as e:
             self.error.emit(str(e))
@@ -611,14 +614,18 @@ class DecryptWorker(QThread):
     def __init__(self, selected_ids, stego_paths, output_dir):
         super().__init__()
         self._selected_ids = set(selected_ids)
+        self._split = not isinstance(stego_paths, str)
         self._stego_paths  = [stego_paths] if isinstance(stego_paths, str) else list(stego_paths)
         self._stego        = self._stego_paths[0] if self._stego_paths else ""
         self._output_dir   = output_dir
 
     def run(self):
         try:
-            if len(self._stego_paths) > 1:
+            if self._split:
                 self._decrypt_multi()        # a payload split across several images
+                return
+            if media.is_jpeg(self._stego):
+                self._decrypt_v3()           # native JPEG was introduced with the v3 payload
                 return
 
             # A plain (unscattered) read just to tell a legacy v2 "ENV2" image apart from
@@ -659,10 +666,15 @@ class DecryptWorker(QThread):
                     _mid, _idx, total, _slen = unpack_shard_tag(index_key, stream[:SHARD_OUTER_SIZE])
                 except InvalidTag:
                     total = None
+            if total == 1:
+                # Older greedy split builds sometimes produced a one-piece set.
+                # It contains the entire encrypted payload and is recoverable alone.
+                self._decrypt_multi(index_key=index_key)
+                return
             if total:
                 self.error.emit(
                     f"This carrier is one piece of a set split across {total} carriers.\n\n"
-                    "Tick “This file was split across several images” and add the whole "
+                    "Tick “This file was split across several carriers” and add the whole "
                     "set (all its stego files) to recover the payload.")
                 return
             self.error.emit(
@@ -677,8 +689,9 @@ class DecryptWorker(QThread):
         self._finish_v3(salt, nonce, ids, ct, "read from the image header")
 
     # -- current format, split across several images -------------------------------
-    def _decrypt_multi(self):
-        index_key = request_index_key()          # token round-trip 1
+    def _decrypt_multi(self, index_key=None):
+        if index_key is None:
+            index_key = request_index_key()      # token round-trip 1
         try:
             blob = mi.join_extract(index_key, self._stego_paths)   # regroup + order the shards
         except InvalidTag:
@@ -768,9 +781,10 @@ class VaultCreateWorker(QThread):
     done  = pyqtSignal(object, str)   # (Vault, recovery_code)
     error = pyqtSignal(str)
 
-    def __init__(self, path, selected_ids):
+    def __init__(self, path, selected_ids, cancel):
         super().__init__()
         self._path = path
+        self._cancel = cancel
         self._ids = set(selected_ids)
 
     def run(self):
@@ -784,8 +798,7 @@ class VaultCreateWorker(QThread):
                                 + ", ".join(s.name for s in missing))
                 return
             index_key = request_index_key()
-            env_key, _fp = derive_env_key(selected)
-            v, code = V.create_vault(self._path, index_key, env_key, [s.id for s in selected])
+            v, code = V.create_vault(self._path, index_key, environment_hash(selected), [s.id for s in selected], cancel=self._cancel)
             self.done.emit(v, code)
         except Exception as e:
             self.error.emit(str(e))
@@ -795,13 +808,15 @@ class VaultUnlockWorker(QThread):
     done  = pyqtSignal(object, list, str)   # (Vault, signal_ids, fingerprint)
     error = pyqtSignal(str)
 
-    def __init__(self, path):
+    def __init__(self, path, cancel):
         super().__init__()
         self._path = path
+        self._cancel = cancel
 
     def run(self):
         try:
             index_key = request_index_key()
+            V._meta(self._path)
             try:
                 sig_ids = V.read_signal_ids(self._path, index_key)
             except InvalidTag:
@@ -814,14 +829,15 @@ class VaultUnlockWorker(QThread):
                     + "\n  ".join(s.name for s in missing)
                     + "\n\nMove back to the original environment, or unlock with the recovery code.")
                 return
-            env_key, fp = derive_env_key(selected)
+            env_hash = environment_hash(selected)
+            fp = "metadata session"
             try:
-                v = V.unlock_env(self._path, env_key)
+                v = V.unlock_env(self._path, env_hash, cancel=self._cancel, signal_ids=sig_ids)
             except InvalidTag:
                 self.error.emit(
                     "The environment does not match — the vault key could not be rebuilt.\n\n"
                     "A signal changed (network/location?), or this is a different machine. "
-                    "Use the recovery code, then re-bind the vault to this environment.")
+                    "Use the recovery code to open the list and export your files.")
                 return
             self.done.emit(v, sig_ids, fp)
         except Exception as e:
@@ -834,10 +850,16 @@ class VaultHeartbeatWorker(QThread):
 
     def run(self):
         try:
-            ping_token()
+            try:
+                ping_token()
+            except TokenTransientError:
+                if self.isInterruptionRequested():
+                    return
+                time.sleep(1)
+                if self.isInterruptionRequested():
+                    return
+                ping_token()
             self.result.emit(True, "")
-        except TokenError as e:
-            self.result.emit(False, str(e))
         except Exception as e:
             self.result.emit(False, str(e))
 
@@ -1056,13 +1078,14 @@ class _VaultDropTable(QTableWidget):
 
 
 class MultiFilePicker(QWidget):
-    """A labelled list of image paths with Add / Remove / Clear, for multi-image split."""
+    """A labelled list of carrier files with Add, Remove and Clear."""
     changed = pyqtSignal()
 
     def __init__(self, label: str, filter_: str = "PNG Images (*.png)", step: int | None = None,
-                 parent=None):
+                 parent=None, *, stego_only: bool = False):
         super().__init__(parent)
         self._filter = filter_
+        self._accept_path = media.is_stego_carrier if stego_only else media.is_carrier
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(6)
@@ -1088,13 +1111,13 @@ class MultiFilePicker(QWidget):
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self._list.setMinimumHeight(96)
         self._list.setMaximumHeight(150)
-        self._list.setToolTip("Drop PNG/WAV files here, or use Add images…")
+        self._list.setToolTip("Drop carrier files here or use Add files…")
         self._list.dropped.connect(self._on_dropped)
         outer.addWidget(self._list)
 
         row = QHBoxLayout()
         row.setSpacing(6)
-        add = QPushButton("Add images…")
+        add = QPushButton("Add files…")
         add.setMinimumHeight(32)
         add.setCursor(Qt.CursorShape.PointingHandCursor)
         add.clicked.connect(self._add)
@@ -1114,16 +1137,13 @@ class MultiFilePicker(QWidget):
 
     def _add(self):
         start = FilePicker.last_dir
-        paths, _ = QFileDialog.getOpenFileNames(self, "Add carrier images", start, self._filter)
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add carrier files", start, self._filter)
         if paths:
             FilePicker.last_dir = os.path.dirname(paths[-1])
             self._add_paths(*paths)
 
     def _on_dropped(self, paths):
-        # Only accept carrier files (PNG/WAV); ignore folders and other junk drops.
-        good = [p for p in paths if os.path.isfile(p) and media.is_carrier(p)]
-        if good:
-            self._add_paths(*good)
+        self._add_paths(*paths)
 
     def _add_paths(self, *paths):
         """Add paths to the list, skipping duplicates. Also used by tests (no dialog)."""
@@ -1131,7 +1151,7 @@ class MultiFilePicker(QWidget):
         added = False
         for p in paths:
             p = os.path.normpath(p)
-            if p not in existing:
+            if p not in existing and os.path.isfile(p) and self._accept_path(p):
                 item = QListWidgetItem(os.path.basename(p))
                 item.setToolTip(p)
                 item.setData(Qt.ItemDataRole.UserRole, p)
@@ -1152,7 +1172,7 @@ class MultiFilePicker(QWidget):
 
     def _update(self):
         n = self._list.count()
-        self._count_lbl.setText("none" if n == 0 else f"{n} image{'s' if n != 1 else ''}")
+        self._count_lbl.setText("none" if n == 0 else f"{n} file{'s' if n != 1 else ''}")
         self.changed.emit()
 
     def paths(self) -> list[str]:
@@ -1162,90 +1182,6 @@ class MultiFilePicker(QWidget):
         return self._list.count()
 
 
-def _looks_textual(data: bytes) -> bool:
-    if b"\x00" in data[:8192]:
-        return False
-    try:
-        data[:8192].decode("utf-8")
-        return True
-    except UnicodeDecodeError:
-        return False
-
-
-class VaultViewer(QDialog):
-    """Shows a decrypted file from RAM only — nothing is written to disk."""
-    _IMG = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
-
-    MAX_DIM = 4096      # cap the displayed image so a huge photo can't exhaust memory
-
-    @staticmethod
-    def _pixmap_from(data: bytes):
-        """
-        Decode an image with Pillow (handles JPEG/PNG/etc. without Qt's image plugins)
-        and downscale very large images. A small JPEG can decode to hundreds of MB of
-        pixels, which Qt refuses to allocate and which there is no point rendering at
-        full size, so cap it to screen size here.
-        """
-        try:
-            import io
-            from PIL import Image
-            im = Image.open(io.BytesIO(data))
-            # JPEG can decode directly at a reduced scale — much faster and lighter.
-            im.draft("RGB", (VaultViewer.MAX_DIM, VaultViewer.MAX_DIM))
-            im.load()
-            if max(im.size) > VaultViewer.MAX_DIM:
-                im.thumbnail((VaultViewer.MAX_DIM, VaultViewer.MAX_DIM), Image.LANCZOS)
-            im = im.convert("RGBA")
-            qimg = QImage(im.tobytes("raw", "RGBA"), im.width, im.height,
-                          QImage.Format.Format_RGBA8888)
-            return QPixmap.fromImage(qimg.copy())      # copy so the pixmap owns the pixels
-        except Exception:
-            pm = QPixmap()                             # last resort: Qt's own loader
-            return pm if pm.loadFromData(data) else None
-
-    def __init__(self, name: str, data: bytes, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Vault · {name}")
-        self.resize(780, 640)
-        lay = QVBoxLayout(self)
-        head = QLabel(f"{name}  ·  {len(data):,} bytes  ·  shown from memory (no copy on disk)")
-        head.setObjectName("subtle")
-        lay.addWidget(head)
-
-        shown = False
-        if Path(name).suffix.lower() in self._IMG:
-            pm = self._pixmap_from(data)
-            if pm is not None:
-                lbl = QLabel()
-                lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                lbl.setPixmap(pm)
-                area = QScrollArea()
-                area.setWidgetResizable(True)
-                area.setWidget(lbl)
-                lay.addWidget(area, stretch=1)
-                shown = True
-        if not shown and _looks_textual(data):
-            te = QTextEdit()
-            te.setReadOnly(True)
-            te.setStyleSheet("font-family:Consolas,monospace;")
-            text = data.decode("utf-8", errors="replace")
-            te.setPlainText(text[:200_000] + ("\n…(truncated)…" if len(text) > 200_000 else ""))
-            lay.addWidget(te, stretch=1)
-            shown = True
-        if not shown:
-            info = QLabel("This file type can't be previewed in memory.\n\nUse <b>Export</b> to open it "
-                          "in its own program — that writes a decrypted copy to disk, which you should "
-                          "delete when done.")
-            info.setWordWrap(True)
-            info.setObjectName("muted")
-            lay.addWidget(info, stretch=1)
-
-        close = QPushButton("Close")
-        close.clicked.connect(self.accept)
-        row = QHBoxLayout()
-        row.addStretch()
-        row.addWidget(close)
-        lay.addLayout(row)
 
 
 class StatusPanel(QLabel):
@@ -1577,6 +1513,8 @@ class MainWindow(QMainWindow):
         self._last_test: tuple[frozenset, str, dict] | None = None
         self._token_reachable: bool | None = None   # None = not contacted this session
         self._vault: V.Vault | None = None           # unlocked vault instance, else None
+        self._vault_open_cancel = threading.Event()
+        self._vault_heartbeat_worker: VaultHeartbeatWorker | None = None
         self._vault_sig_ids: list[str] = []          # signals the open vault is bound to
         self._enc_output_auto = False
         self._enc_capacity_ok = False
@@ -1662,11 +1600,10 @@ class MainWindow(QMainWindow):
         self._settings.sync()
 
     def closeEvent(self, event):
+        self._vault_open_cancel.set()
         # Lock the vault on exit so its key never outlives the window.
         if self._vault is not None:
-            self._vault_timer.stop()
-            self._vault.lock()
-            self._vault = None
+            self._vault_do_lock("Vault locked on exit.")
         self._settings.setValue("window/geometry", self.saveGeometry())
         self._settings.setValue("window/tab", self._tabs.currentIndex())
         self._settings.setValue("enc/output_auto", self._enc_output_auto)
@@ -1678,7 +1615,11 @@ class MainWindow(QMainWindow):
                 self._settings.setValue(key, picker.path())
             self._settings.setValue("files/last_dir", FilePicker.last_dir)
         for w in list(self._workers):
-            w.wait(5000)
+            if w is self._vault_heartbeat_worker:
+                w.requestInterruption()
+                w.wait(int((PING_TIMEOUT_S + 2) * 1000))
+            else:
+                w.wait(5000)
         # Remove the throwaway UI glyphs from %TEMP% so the app leaves nothing behind
         # there. They are only tick/arrow images, but a clean exit leaves no trace.
         try:
@@ -2363,20 +2304,21 @@ class MainWindow(QMainWindow):
         self._enc_payload = FilePicker("File or folder to hide", filter_="All Files (*.*)", step=1,
                                        allow_dir=True,
                                        placeholder="Any file, or a whole folder — browse, or drop it here")
+        images = " ".join(f"*{ext}" for ext in media.IMAGE_EXTS)
+        audio = " ".join(f"*{ext}" for ext in media.AUDIO_EXTS)
+        carrier_filter = f"Images and audio ({images} {audio});;Images ({images});;Audio ({audio})"
         self._enc_carrier = FilePicker(
-            "Carrier — PNG image or WAV audio", step=2,
-            filter_="Carriers (*.png *.wav);;PNG Images (*.png);;WAV Audio (*.wav);;All (*.*)",
-            placeholder="The PNG or WAV to hide it in — browse, or drop it here")
+            "Carrier image or audio", step=2, filter_=carrier_filter,
+            placeholder="Choose or drop an image or audio file")
         self._enc_output  = FilePicker("Save stego carrier as", mode="save", step=3,
-                                       filter_="Carrier (*.png *.wav)",
+                                       filter_="Stego images (*.jpg *.jpeg *.jfif *.png *.webp *.bmp *.tif *.tiff);;WAV audio (*.wav)",
                                        placeholder="Suggested automatically next to the carrier")
 
         # Multi-image split: the same payload spread across several carriers.
         self._enc_carriers = MultiFilePicker(
-            "Carrier images/audio (PNG or WAV) — filled in order", step=2,
-            filter_="Carriers (*.png *.wav);;PNG Images (*.png);;WAV Audio (*.wav)")
-        self._enc_out_dir  = FilePicker("Save stego images to folder", mode="dir", step=3,
-                                        placeholder="The split images are written here")
+            "Carrier images or audio in order", step=2, filter_=carrier_filter)
+        self._enc_out_dir = FilePicker("Save stego files to folder", mode="dir", step=3,
+                                       placeholder="Folder for the split stego files")
 
         self._enc_carrier.changed.connect(self._on_carrier_changed)
         self._enc_payload.changed.connect(self._update_capacity)
@@ -2384,7 +2326,7 @@ class MainWindow(QMainWindow):
         self._enc_carriers.changed.connect(self._update_capacity)
         self._enc_out_dir.changed.connect(self._refresh_actions)
 
-        self._enc_split = QCheckBox("Split across several carrier images (for payloads too big for one)")
+        self._enc_split = QCheckBox("Split across several carriers")
         self._enc_split.setObjectName("mode_check")
         self._enc_split.toggled.connect(self._on_split_toggled)
 
@@ -2394,12 +2336,15 @@ class MainWindow(QMainWindow):
         il.addWidget(self._enc_output)
         il.addWidget(self._enc_carriers)
         il.addWidget(self._enc_out_dir)
+        il.addWidget(_label("JPEG photos stay JPEG. PNG, WebP, BMP and TIFF keep their format. "
+                            "WebP is saved losslessly; GIF becomes PNG and audio becomes WAV. "
+                            "Converting lossy WebP or compressed audio can increase file size.", "subtle"))
         self._enc_carriers.setVisible(False)
         self._enc_out_dir.setVisible(False)
         il.addWidget(_divider())
 
         cap_top = QHBoxLayout()
-        self._cap_label = QLabel("Select a carrier (PNG image or WAV audio) to see capacity")
+        self._cap_label = QLabel("Select a carrier to see its capacity")
         self._cap_label.setObjectName("muted")
         cap_top.addWidget(self._cap_label)
         cap_top.addStretch()
@@ -2464,7 +2409,11 @@ class MainWindow(QMainWindow):
     def _on_carrier_changed(self, carrier: str):
         # Suggest an output path unless the user chose one themselves. Privacy mode
         # puts it in Pictures; otherwise next to the carrier.
-        if carrier and (self._enc_output_auto or not self._enc_output.path()):
+        supported = media.is_carrier(carrier)
+        if supported:
+            suffix = media.output_suffix(carrier)
+            self._enc_output._filter = f"{suffix[1:].upper()} (*{suffix})"
+        if supported and (self._enc_output_auto or not self._enc_output.path()):
             p = Path(carrier)
             folder = pictures_dir() if self._privacy else str(p.parent)
             suggestion = str(Path(folder) / f"{p.stem}_stego{media.output_suffix(carrier)}")
@@ -2477,7 +2426,7 @@ class MainWindow(QMainWindow):
 
     def _on_output_edited(self, _text: str):
         carrier = self._enc_carrier.path()
-        if carrier:
+        if media.is_carrier(carrier):
             p = Path(carrier)
             auto = str(p.with_name(f"{p.stem}_stego{media.output_suffix(carrier)}"))
             self._enc_output_auto = self._enc_output.path() == auto
@@ -2495,14 +2444,14 @@ class MainWindow(QMainWindow):
         self._cap_bar.setObjectName("capacity_bar")
 
         if not carrier or not os.path.isfile(carrier):
-            self._cap_label.setText("Select a carrier (PNG image or WAV audio) to see capacity")
+            self._cap_label.setText("Select a carrier to see its capacity")
             self._img_info_lbl.setText("")
             self._cap_bar.setValue(0)
         else:
             try:
                 info = media.carrier_info(carrier)
                 # Usable payload capacity = total LSB bytes minus the v3 header overhead
-                cap = max(0, lsb_capacity_bytes(carrier) - OUTER_SIZE)
+                cap = max(0, info["capacity_bytes"] - OUTER_SIZE)
                 self._img_info_lbl.setText(
                     f"{info['summary']}  |  capacity {cap:,} B  ({cap/1024:.1f} KB)"
                 )
@@ -2513,7 +2462,7 @@ class MainWindow(QMainWindow):
                     total = _folder_size(payload)
                     self._enc_capacity_ok = cap > 0
                     if cap <= 0:
-                        self._cap_label.setText("Folder too large for this carrier — use a bigger image")
+                        self._cap_label.setText("Folder too large for this carrier. Choose a larger carrier.")
                         self._cap_bar.setObjectName("capacity_over")
                     elif total <= cap:
                         self._cap_label.setText(f"Folder — up to {total:,} / {cap:,} bytes before zip (fits)")
@@ -2537,7 +2486,7 @@ class MainWindow(QMainWindow):
                     self._cap_label.setText(f"Capacity: {cap:,} bytes  ({cap/1024:.1f} KB)")
                     self._cap_bar.setValue(0)
             except Exception as e:
-                self._cap_label.setText(f"Cannot read image: {e}")
+                self._cap_label.setText(f"Cannot read carrier: {e}")
                 self._img_info_lbl.setText("")
                 self._cap_bar.setValue(0)
 
@@ -2552,13 +2501,13 @@ class MainWindow(QMainWindow):
         self._cap_bar.setObjectName("capacity_bar")
         try:
             if len(carriers) < 2:
-                self._cap_label.setText("Add at least two carrier images to split across")
+                self._cap_label.setText("Add at least two carrier files")
                 self._img_info_lbl.setText("")
                 self._cap_bar.setValue(0)
             else:
                 cap = mi.total_capacity(carriers)       # combined usable bytes (tags deducted)
                 self._img_info_lbl.setText(
-                    f"{len(carriers)} images  |  combined capacity {cap:,} B  ({cap/1024:.1f} KB)")
+                    f"{len(carriers)} carriers  |  combined capacity {cap:,} B  ({cap/1024:.1f} KB)")
                 if payload and os.path.isdir(payload):
                     total = _folder_size(payload)
                     self._enc_capacity_ok = cap > OUTER_SIZE
@@ -2570,7 +2519,7 @@ class MainWindow(QMainWindow):
                     pct = min(100, int(needed / cap * 100)) if cap > 0 else 100
                     if needed > cap:
                         self._cap_label.setText(
-                            f"⚠  Payload too large: needs {needed:,} B, images hold {cap:,} B")
+                            f"⚠  Payload too large: needs {needed:,} B, carriers hold {cap:,} B")
                         self._cap_bar.setObjectName("capacity_over")
                     else:
                         self._cap_label.setText(f"Using {needed:,} / {cap:,} bytes  ({pct}%)")
@@ -2580,7 +2529,7 @@ class MainWindow(QMainWindow):
                     self._cap_label.setText(f"Combined capacity: {cap:,} bytes  ({cap/1024:.1f} KB)")
                     self._cap_bar.setValue(0)
         except Exception as e:
-            self._cap_label.setText(f"Cannot read an image: {e}")
+            self._cap_label.setText(f"Cannot read a carrier: {e}")
             self._img_info_lbl.setText("")
             self._cap_bar.setValue(0)
         self._cap_bar.style().unpolish(self._cap_bar)
@@ -2602,21 +2551,23 @@ class MainWindow(QMainWindow):
 
         if self._enc_split.isChecked():
             if self._enc_carriers.count() < 2:
-                out.append("add at least two carrier images")
+                out.append("add at least two carrier files")
             elif payload and os.path.exists(payload) and not self._enc_capacity_ok:
                 out.append("add more or larger carriers")
             if not self._enc_out_dir.path():
                 out.append("choose an output folder")
         else:
             carrier, output = self._enc_carrier.path(), self._enc_output.path()
-            if not carrier or not os.path.isfile(carrier):
-                out.append("choose a carrier (PNG or WAV)")
+            if not os.path.isfile(carrier) or not media.is_carrier(carrier):
+                out.append("choose a supported image or audio carrier")
             elif payload and os.path.exists(payload) and not self._enc_capacity_ok:
-                out.append("use a bigger carrier image")
-            if not output:
+                out.append("check the carrier or use a bigger carrier")
+            if not output or not Path(output).name:
                 out.append("choose an output path")
-            elif carrier and os.path.normcase(os.path.abspath(output)) == os.path.normcase(os.path.abspath(carrier)):
-                out.append("pick an output different from the carrier")
+            elif carrier:
+                target = media.stego_output_path(carrier, output)
+                if os.path.normcase(os.path.abspath(target)) == os.path.normcase(os.path.abspath(carrier)):
+                    out.append("pick an output different from the carrier")
         return out
 
     def _do_encrypt(self):
@@ -2630,13 +2581,13 @@ class MainWindow(QMainWindow):
             if existing:
                 if QMessageBox.question(
                         self, "Overwrite files",
-                        f"{len(existing)} output image(s) already exist in that folder. Overwrite them?") \
+                        f"{len(existing)} output file(s) already exist in that folder. Overwrite them?") \
                         != QMessageBox.StandardButton.Yes:
                     return
         else:
             carriers = [self._enc_carrier.path()]
             outputs = [self._enc_output.path()]
-            out_final = str(Path(outputs[0]).with_suffix(media.output_suffix(carriers[0])))
+            out_final = str(media.stego_output_path(carriers[0], outputs[0]))
             if os.path.exists(out_final):
                 if QMessageBox.question(self, "Overwrite file",
                                         f"{Path(out_final).name} already exists. Overwrite it?") \
@@ -2655,7 +2606,8 @@ class MainWindow(QMainWindow):
         w.error.connect(self._on_encrypt_error)
         self._start_worker(w)
 
-    def _on_encrypt_done(self, msg: str, fp: str, out_path: str):
+    def _on_encrypt_done(self, msg: str, fp: str, output_paths: list[str]):
+        out_path = output_paths[0]
         self._set_busy(False)
         self._note_token_result(True)
         self._enc_btn.setText(self.ENC_LABEL)
@@ -2669,9 +2621,13 @@ class MainWindow(QMainWindow):
         self._enc_last_payload = self._enc_payload.path()
         self._enc_shred_btn.setVisible(bool(self._enc_last_payload)
                                        and os.path.isfile(self._enc_last_payload))
-        # Convenience: the image just made is the one most likely to be decrypted next
-        if not self._dec_stego.path():
-            self._dec_stego.set_path(out_path)
+        # Hand off the complete current result, replacing stale selections.
+        split = len(output_paths) > 1
+        self._dec_stegos.clear()
+        self._dec_stego.set_path("" if split else out_path)
+        if split:
+            self._dec_stegos._add_paths(*output_paths)
+        self._dec_split.setChecked(split)
         self._status.showMessage(f"Encrypt complete — key fingerprint: {fp}")
 
     def _shred_original(self):
@@ -2726,16 +2682,16 @@ class MainWindow(QMainWindow):
 
         files, il = _card(spacing=14)
         il.addWidget(_section("Files"))
+        stego_filter = "Stego images and WAV (" + " ".join(f"*{ext}" for ext in media.STEGO_EXTS) + ")"
         self._dec_stego  = FilePicker(
-            "Stego carrier (PNG or WAV)", step=1,
-            filter_="Carriers (*.png *.wav);;PNG Images (*.png);;WAV Audio (*.wav)",
-            placeholder="A PNG or WAV made by Encrypt — browse, or drop it here")
+            "Stego image or WAV", step=1, filter_=stego_filter,
+            placeholder="A file made by Encrypt — browse, or drop it here")
         self._dec_stegos = MultiFilePicker(
             "Stego carriers (the full split set)", step=1,
-            filter_="Carriers (*.png *.wav);;PNG Images (*.png);;WAV Audio (*.wav)")
+            filter_=stego_filter, stego_only=True)
         self._dec_output = FilePicker("Save recovered file to", mode="dir", step=2,
-                                      placeholder="Same folder as the stego image")
-        self._dec_split = QCheckBox("This file was split across several images")
+                                      placeholder="Same folder as the stego file")
+        self._dec_split = QCheckBox("This file was split across several carriers")
         self._dec_split.setObjectName("mode_check")
         self._dec_split.toggled.connect(self._on_dec_split_toggled)
         self._dec_stego.changed.connect(self._refresh_actions)
@@ -2798,12 +2754,12 @@ class MainWindow(QMainWindow):
         if not self._token_cfg:
             out.append("pair a hardware token")
         if self._dec_split.isChecked():
-            if self._dec_stegos.count() < 2:
-                out.append("add the split images")
+            if self._dec_stegos.count() < 1:
+                out.append("add the split stego files")
         else:
             stego = self._dec_stego.path()
-            if not stego or not os.path.isfile(stego):
-                out.append("choose a stego carrier (PNG or WAV)")
+            if not os.path.isfile(stego) or not media.is_stego_carrier(stego):
+                out.append("choose a stego image or WAV")
         return out
 
     def _do_decrypt(self):
@@ -2931,7 +2887,8 @@ class MainWindow(QMainWindow):
             "Wait for its light: a few blinks, then 2 short flashes means it is ready. "
             "The port below is detected automatically.",
             "Click Pair Token. When the token's light stays on, press its IO0 button (not RST) "
-            "within 60 seconds to confirm. The Bluetooth link is checked straight after.",
+            "within 60 seconds to confirm. Re-pairing also requires the saved credential. "
+            "The Bluetooth link is checked straight after.",
         ]):
             num = QLabel(str(r + 1))
             num.setObjectName("step_num")
@@ -3000,7 +2957,7 @@ class MainWindow(QMainWindow):
             ("The blinks repeat over and over", "Restarting — not enough power (see below)"),
             ("3 short flashes", "Pairing succeeded"),
             ("2 very fast flashes", "Key request served"),
-            ("1 long flash  /  3 long flashes", "Request rejected  /  locked for 30 s"),
+            ("1 long flash  /  3 long flashes", "Request rejected  /  Bluetooth connection closed"),
             ("10 rapid flashes", "Factory reset — all secrets erased"),
         ]):
             legend.addWidget(_label(pattern, "muted", wrap=False), r, 0)
@@ -3016,10 +2973,9 @@ class MainWindow(QMainWindow):
             "• Port missing from the list: re-plug the cable; the list updates by itself.", "muted"))
 
         reset = QLabel(
-            "<b>Factory reset:</b> only if the token is bound to another PC or you want to destroy it. Hold "
-            "the IO0 button while the token starts up; 10 fast flashes confirm the reset. This destroys the "
-            "master secret — <b>every file encrypted with that token becomes permanently unrecoverable.</b> "
-            "Do not press IO0 to pair."
+            "<b>Factory reset:</b> This destroys the master secret. <b>Existing stego files protected "
+            "by this token become permanently unreadable.</b> Holding IO0 during the startup blinks "
+            "triggers reset. For pairing, wait for the steady light and then tap IO0."
         )
         reset.setObjectName("callout_danger")
         reset.setWordWrap(True)
@@ -3226,8 +3182,9 @@ class MainWindow(QMainWindow):
     def _forget_token(self):
         if QMessageBox.question(
                 self, "Forget pairing",
-                "Delete this PC's token credentials?\n\nThe token keeps its master secret, so you can pair "
-                "again later from this PC and your files stay decryptable."
+                "Delete this PC's token credentials?\n\nRe-pairing requires an existing credential. "
+                "If you delete your only copy, regaining access to the token requires a factory reset, "
+                "which makes its existing stego files unreadable."
         ) != QMessageBox.StandardButton.Yes:
             return
         forget_pairing()
@@ -3362,11 +3319,10 @@ class MainWindow(QMainWindow):
         self._vault_howto, hl = _card(spacing=8)
         hl.addWidget(_section("How the vault works"))
         for icon, text in [
-            ("📥", "Add any file — it is encrypted into the vault and the original is securely shredded."),
-            ("🔑", "The key is bound to this token + this PC. A copied disk, or the wrong "
-                   "environment, cannot open it."),
-            ("👁", "Open files right here while unlocked — the plaintext stays in memory only. "
-                   "The vault auto-locks when the token goes out of range."),
+            ("📥", "Add any file. It is encrypted into the vault; deleting the original is optional."),
+            ("🔑", "File keys require this token and matching environment signals, or your offline recovery code."),
+            ("🔐", "Tap IO0 once to open the list and once per export selection. Add files without another tap. "
+                   "The file list closes when the token goes out of range."),
         ]:
             row = QHBoxLayout()
             row.setSpacing(10)
@@ -3378,7 +3334,7 @@ class MainWindow(QMainWindow):
             row.addWidget(_label(text, "muted"), stretch=1)
             hl.addLayout(row)
         hl.addWidget(_label("Use the vault for files you keep and reopen on this PC. Use Encrypt & "
-                            "hide instead to tuck a single file inside a PNG or WAV to share.", "subtle"))
+                            "hide instead to tuck a single file inside an image or audio carrier.", "subtle"))
         layout.addWidget(self._vault_howto)
 
         # — action bar (changes with state) —
@@ -3387,7 +3343,7 @@ class MainWindow(QMainWindow):
         self._vault_create_btn = QPushButton("Create Env Vault")
         self._vault_create_btn.setObjectName("btn_primary")
         self._vault_create_btn.clicked.connect(self._vault_create)
-        self._vault_unlock_btn = QPushButton("Unlock")
+        self._vault_unlock_btn = QPushButton("Browse files")
         self._vault_unlock_btn.setObjectName("btn_primary")
         self._vault_unlock_btn.clicked.connect(self._vault_unlock)
         self._vault_recovery_btn = QPushButton("Unlock with recovery code")
@@ -3403,14 +3359,12 @@ class MainWindow(QMainWindow):
         actions.addStretch()
         self._vault_add_btn = QPushButton("Add files…")
         self._vault_add_btn.clicked.connect(self._vault_add_files)
-        self._vault_open_btn = QPushButton("Open")
-        self._vault_open_btn.clicked.connect(self._vault_open_selected)
         self._vault_export_btn = QPushButton("Export…")
         self._vault_export_btn.clicked.connect(self._vault_export_selected)
         self._vault_remove_btn = QPushButton("Remove")
         self._vault_remove_btn.setObjectName("btn_danger")
         self._vault_remove_btn.clicked.connect(self._vault_remove_selected)
-        for b in (self._vault_add_btn, self._vault_open_btn,
+        for b in (self._vault_add_btn,
                   self._vault_export_btn, self._vault_remove_btn):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             actions.addWidget(b)
@@ -3430,7 +3384,6 @@ class MainWindow(QMainWindow):
         self._vault_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._vault_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._vault_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
-        self._vault_table.doubleClicked.connect(lambda *_: self._vault_open_selected())
         hdr = self._vault_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -3458,20 +3411,23 @@ class MainWindow(QMainWindow):
         self._vault_unlock_btn.setVisible(exists and not unlocked)
         self._vault_unlock_btn.setEnabled(idle and bool(self._token_cfg))
         self._vault_recovery_btn.setVisible(exists and not unlocked)
+        self._vault_recovery_btn.setEnabled(idle)
         self._vault_lock_btn.setVisible(unlocked)
         self._vault_howto.setVisible(not exists and not unlocked)
         self._vault_change_loc.setEnabled(not unlocked and idle)
-        for b in (self._vault_add_btn, self._vault_open_btn,
+        for b in (self._vault_add_btn,
                   self._vault_export_btn, self._vault_remove_btn):
             b.setVisible(unlocked)
             b.setEnabled(unlocked and idle)
+        if unlocked:
+            self._vault_add_btn.setEnabled(idle and not getattr(self._vault, "recovery", False))
         self._vault_table.setVisible(unlocked)
 
         if unlocked:
             reach = {True: "token in range", False: "⚠ token not answering",
                      None: "token not checked yet"}[self._token_reachable]
             self._vault_status.setText(
-                f"🔓 Unlocked · {self._vault.count()} item(s) · "
+                f"🔓 File list open · {self._vault.count()} item(s) · "
                 f"{self._vault.total_bytes():,} bytes · auto-lock on ({reach})")
             self._vault_status.setStyleSheet("font-size:16px; font-weight:600; color:#3fb950;")
         elif exists:
@@ -3523,12 +3479,13 @@ class MainWindow(QMainWindow):
     # -- create ---------------------------------------------------------------
     def _vault_create(self):
         path = self._vault_loc.text()
-        if os.path.isdir(path) and os.listdir(path):
+        if os.path.isdir(path) and any(name != V.LOCK_NAME for name in os.listdir(path)):
             self._vault_result.show_error("Pick an empty folder (or a new one) for the vault.")
             return
         self._set_busy(True)
-        self._vault_result.show_info("Creating vault and sealing its key with the token…")
-        w = VaultCreateWorker(path, self._selected_ids)
+        self._vault_result.show_info("Creating a vault with separate file keys. Tap IO0 when the token light stays on to open the list…")
+        self._vault_open_cancel.clear()
+        w = VaultCreateWorker(path, self._selected_ids, self._vault_open_cancel)
         w.done.connect(self._on_vault_created)
         w.error.connect(self._on_vault_error)
         self._start_worker(w)
@@ -3541,13 +3498,19 @@ class MainWindow(QMainWindow):
 
     def _on_vault_created(self, v, code: str):
         self._set_busy(False)
+        if self._vault_open_cancel.is_set():
+            v.lock()
+            self._show_recovery_code(code)
+            self._vault_result.show_info("Vault created and locked. Save the recovery code offline.")
+            self._refresh_vault_ui()
+            return
         self._vault = v
         self._note_token_result(True)
         self._settings.setValue("vault/path", self._vault_loc.text())
         self._show_recovery_code(code)
         self._populate_vault_table()
         self._start_vault_heartbeat()
-        self._vault_result.show_success("Vault created and unlocked. Keep the recovery code safe.")
+        self._vault_result.show_success("Vault created. File list open. Save the recovery code offline.")
         self._refresh_vault_ui()
 
     def _show_recovery_code(self, code: str):
@@ -3569,21 +3532,27 @@ class MainWindow(QMainWindow):
     # -- unlock ---------------------------------------------------------------
     def _vault_unlock(self):
         self._set_busy(True)
-        self._vault_result.show_info("Reading the vault's signal list, collecting them and asking the token…")
-        w = VaultUnlockWorker(self._vault_loc.text())
+        self._vault_result.show_info("Checking the vault signals. Tap IO0 when the token light stays on to open the file list…")
+        self._vault_open_cancel.clear()
+        w = VaultUnlockWorker(self._vault_loc.text(), self._vault_open_cancel)
         w.done.connect(self._on_vault_unlocked)
         w.error.connect(self._on_vault_unlock_error)
         self._start_worker(w)
 
     def _on_vault_unlocked(self, v, sig_ids: list, fp: str):
         self._set_busy(False)
+        if self._vault_open_cancel.is_set():
+            v.lock()
+            self._vault_result.show_info("Vault opening cancelled.")
+            self._refresh_vault_ui()
+            return
         self._vault = v
         self._vault_sig_ids = sig_ids
         self._note_token_result(True)
         self._populate_vault_table()
         self._start_vault_heartbeat()
         self._vault_result.show_success(
-            f"Vault unlocked · key fingerprint {fp} · {v.count()} item(s).")
+            f"File list open · {v.count()} item(s). File keys are requested only for import or export.")
         self._refresh_vault_ui()
 
     def _on_vault_unlock_error(self, msg: str):
@@ -3594,11 +3563,15 @@ class MainWindow(QMainWindow):
 
     def _vault_unlock_recovery(self):
         code, ok = QInputDialog.getText(self, "Unlock with recovery code",
-                                        "Enter the recovery code shown when the vault was created:")
+                                        "Enter the recovery code shown when the vault was created:",
+                                        QLineEdit.EchoMode.Password)
         if not ok or not code.strip():
             return
         try:
             self._vault = V.unlock_recovery(self._vault_loc.text(), code)
+        except V.UnsupportedVault as exc:
+            self._vault_result.show_error(str(exc))
+            return
         except Exception:
             self._vault_result.show_error("That recovery code did not open the vault.")
             return
@@ -3606,13 +3579,13 @@ class MainWindow(QMainWindow):
         self._populate_vault_table()
         self._start_vault_heartbeat()
         self._vault_result.show_success(
-            "Vault unlocked with the recovery code. Tip: re-bind it to this environment "
-            "below so the token can open it normally again.")
+            "File list recovered. Enter the recovery code again for each export.")
         self._refresh_vault_ui()
 
     # -- lock / auto-lock -----------------------------------------------------
     def _panic_lock(self):
         """Lock the vault immediately (Ctrl+Shift+L), from any page."""
+        self._vault_open_cancel.set()
         if self._vault is not None:
             self._vault_do_lock("Locked (panic).")
             self._status.showMessage("Vault locked.")
@@ -3631,21 +3604,30 @@ class MainWindow(QMainWindow):
         self._vault_timer.start()
 
     def _vault_heartbeat_tick(self):
-        if self._vault is None or self._busy:
+        if self._vault is None or self._busy or self._vault_heartbeat_worker is not None:
             return
+        vault = self._vault
         w = VaultHeartbeatWorker()
-        w.result.connect(self._on_vault_heartbeat)
+        self._vault_heartbeat_worker = w
+        w.result.connect(lambda ok, msg: self._on_vault_heartbeat(vault, ok, msg))
         self._start_worker(w)
 
-    def _on_vault_heartbeat(self, ok: bool, msg: str):
+    def _on_vault_heartbeat(self, vault, ok: bool, msg: str):
+        self._vault_heartbeat_worker = None
+        if self._vault is not vault:
+            return
+        if self._busy:
+            return  # A heartbeat started before this file action must not cancel its IO0 wait.
         self._note_token_result(ok, msg)
-        if not ok and self._vault is not None:
-            self._vault_do_lock("Auto-locked — the token went out of range. "
-                                "Unlock again when it is back.")
+        if not ok:
+            self._vault_do_lock(f"Auto-locked — could not verify the token.\n{msg}")
 
     # -- file operations ------------------------------------------------------
     def _vault_add_files(self, paths=None):
-        if self._vault is None:
+        if self._vault is None or self._busy:
+            return
+        if self._vault.recovery:
+            self._vault_result.show_error("Use the token and matching environment to import files.")
             return
         # A list comes from a drag-and-drop onto the table; the button passes a bool.
         if not isinstance(paths, list):
@@ -3662,26 +3644,41 @@ class MainWindow(QMainWindow):
         big = sum(os.path.getsize(p) for p in paths if os.path.isfile(p)) > 256 * 2**20
         self._set_busy(True)
         self._vault_result.show_info(
-            "Encrypting into the vault…" + ("  (large file — this can take a moment)" if big else ""))
-        vault, keep = self._vault, not shred
+            "Requesting one import key, then encrypting and verifying the selected files locally." +
+            (" Large files may take a moment." if big else ""))
+        vault = self._vault
 
-        def work():
-            n = 0
-            for p in paths:
-                vault.add_file(p, shred_original=not keep)
-                n += 1
-            return n
-
-        w = VaultTaskWorker(work)
-        w.done.connect(lambda n: self._on_vault_added(n, shred))
+        w = VaultTaskWorker(lambda: vault.add_files(paths, shred_original=shred))
+        w.done.connect(lambda results: self._on_vault_added(vault, paths, results))
         w.error.connect(self._on_vault_task_error)
         self._start_worker(w)
 
-    def _on_vault_added(self, n, shred):
+    def _on_vault_added(self, vault, paths, results):
         self._set_busy(False)
+        if self._vault is not vault:
+            return
+        added = 0
+        details = []
+        failed = False
+        for path, result in zip(paths, results, strict=True):
+            if "error" in result:
+                failed = True
+                details.append(f"{path} — import failed: {result['error']}")
+                continue
+            added += 1
+            status = result["shred_status"]
+            if status == "unconfirmed":
+                failed = True
+                details.append(f"{path} — shredding unconfirmed. Plaintext may remain.")
+            else:
+                details.append(f"{path} — original {status}.")
+        if any(result.get("unreachable") for result in results):
+            self._note_token_result(False, TOKEN_UNREACHABLE_HINT)
+        elif added:
+            self._note_token_result(True)
         self._populate_vault_table()
-        self._vault_result.show_success(
-            f"Added {n} file(s)." + (" Originals shredded." if shred else ""))
+        show = self._vault_result.show_error if failed else self._vault_result.show_success
+        show(f"Added {added} file(s).\n" + "\n".join(details))
         self._refresh_vault_ui()
 
     def _on_vault_task_error(self, msg):
@@ -3690,26 +3687,6 @@ class MainWindow(QMainWindow):
         self._vault_result.show_error(msg)
         self._refresh_vault_ui()
 
-    def _vault_open_selected(self):
-        if self._vault is None:
-            return
-        blobs = self._selected_vault_blobs()
-        if not blobs:
-            self._vault_result.show_info("Select an item to open.")
-            return
-        vault, blob = self._vault, blobs[0]
-        self._set_busy(True)
-        self._vault_result.show_info("Decrypting in memory…")
-        w = VaultTaskWorker(lambda: vault.read_bytes(blob))
-        w.done.connect(self._on_vault_opened)
-        w.error.connect(self._on_vault_task_error)
-        self._start_worker(w)
-
-    def _on_vault_opened(self, result):
-        self._set_busy(False)
-        self._vault_result.clear()
-        name, data = result
-        VaultViewer(name, data, self).exec()
 
     def _vault_export_selected(self):
         if self._vault is None:
@@ -3717,6 +3694,9 @@ class MainWindow(QMainWindow):
         blobs = self._selected_vault_blobs()
         if not blobs:
             self._vault_result.show_info("Select item(s) to export.")
+            return
+        if self._vault.recovery and len(blobs) != 1:
+            self._vault_result.show_info("Select one file at a time for recovery export. Each export needs the code again.")
             return
         if QMessageBox.warning(
                 self, "Export decrypted copy",
@@ -3730,11 +3710,19 @@ class MainWindow(QMainWindow):
             return
         vault = self._vault
         self._set_busy(True)
-        self._vault_result.show_info("Exporting decrypted copies…")
+        code = None
+        if vault.recovery:
+            name = vault._entry(blobs[0])["name"]
+            code, ok = QInputDialog.getText(self, "Recover selected file", f"Enter the recovery code to export {name}:",
+                                            QLineEdit.EchoMode.Password)
+            if not ok or not code.strip():
+                self._set_busy(False)
+                return
+        self._vault_result.show_info("Recovering the selected file…" if vault.recovery else
+                                     "Tap IO0 once when the token light stays on to export the selected files.")
 
         def work():
-            for b in blobs:
-                vault.export(b, dest)
+            vault.export_many(blobs, dest, recovery_code=code)
             return len(blobs), dest
 
         w = VaultTaskWorker(work)
@@ -3754,7 +3742,7 @@ class MainWindow(QMainWindow):
             return
         if QMessageBox.warning(
                 self, "Remove from vault",
-                f"Permanently shred and remove {len(blobs)} item(s) from the vault?",
+                f"Remove {len(blobs)} item(s) from the vault? Their encrypted files will be deleted.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Yes:
             return

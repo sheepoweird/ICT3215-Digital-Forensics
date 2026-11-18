@@ -14,10 +14,13 @@ A sniffer sees only two public keys and ciphertext. The byte layout and KDF here
 must match the firmware (ESP32 Files/main.cpp / encryption.cpp).
 
 Wire (USB serial, newline-terminated):
-  PC   -> Token : PAIR_ECDH:<host_id>:<request_id>:<pc_pub hex(32)>
+  PC   -> Token : PAIR_V5:<request_id>:<pc_pub hex(32)>:<ENROLL|REPAIR>
+  Re-pairing   : token issues a fresh challenge; PC proves possession of the current auth key.
   Token -> PC   : PAIRING_SUCCESS;REQ=..;MODE=ECDH;TOKEN_ID=<hex(16)>;
                   TOK_PUB=<hex(32)>;ENC=<hex(iv12|ct32|tag16)>;BLE_MAC=..;CHAR_UUID=..;FW=..
 """
+
+import hmac
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -28,6 +31,12 @@ PAIR_INFO = b"EnvStego-pair-v1"
 PUB_LEN = 32
 IV_LEN = 12
 TAG_LEN = 16
+
+
+def pairing_proof(auth_key: bytes, token_id: bytes, nonce: bytes,
+                  request_id: str, pc_pub: bytes) -> bytes:
+    transcript = b"3T-PAIR-PROOF-v1" + token_id + nonce + request_id.encode("ascii") + pc_pub
+    return hmac.digest(auth_key, transcript, "sha256")
 
 
 def new_keypair() -> tuple[X25519PrivateKey, bytes]:

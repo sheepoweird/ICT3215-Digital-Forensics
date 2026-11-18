@@ -8,6 +8,7 @@ Run from the Python/ directory:
 
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -66,9 +67,24 @@ def test_add_file_shreds_original_and_round_trips(tmp_path):
     src = tmp_path / "report.docx"
     src.write_bytes(b"CONFIDENTIAL BODY" * 100)
     entry = v.add_file(str(src))
+    assert entry["shred_status"] == "shredded"
     assert not src.exists()                            # original shredded
     name, data = v.read_bytes(entry["blob"])
     assert name == "report.docx" and data == b"CONFIDENTIAL BODY" * 100
+
+
+def test_vault_writers_preserve_each_others_index_entries(tmp_path):
+    first, code = _new(tmp_path)
+    second = V.unlock_env(first.path, ENV_KEY)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a = pool.submit(first.add_bytes, "a.txt", b"first")
+        b = pool.submit(second.add_bytes, "b.txt", b"second")
+        a_entry, b_entry = a.result(), b.result()
+    assert {e["name"] for e in first.list_entries()} == {"a.txt", "b.txt"}
+    first.remove(b_entry["blob"])
+    reopened = V.unlock_recovery(first.path, code)
+    assert [e["name"] for e in reopened.list_entries()] == ["a.txt"]
+    assert second.read_bytes(a_entry["blob"]) == ("a.txt", b"first")
 
 
 def test_add_bytes_does_not_need_an_original(tmp_path):

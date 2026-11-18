@@ -3,11 +3,12 @@
 **Hardware-anchored anti-forensics against disk acquisition.**
 ICT3215 Digital Forensics · Singapore Institute of Technology
 
-EnvStego protects a user's data so that, if their device is seized and the disk is
-imaged, the data **cannot be recovered without the physical ESP32 token *and* the
-original environment**. The root secret never touches the disk — it lives only on a
-low-cost ESP32 hardware token the user carries separately. Lose or destroy the token
-and the data is permanently unrecoverable, by design.
+EnvStego encrypts data using a master secret held by a separate ESP32 token and
+user-selected environment signals. A PC disk image alone lacks the token secret.
+Many environment signals can be reconstructed from disk; they are not a second
+high-entropy secret. Vaults also have an offline recovery code, which bypasses the
+token and environment. See [the vault security design](md/VAULT_SECURITY.md) for
+the memory-exposure boundary and recovery limitations.
 
 > Threat model: the *resettable adversary* — an investigator who images the drive and
 > studies unlimited offline copies at leisure. Anything reconstructable from the copied
@@ -18,7 +19,7 @@ and the data is permanently unrecoverable, by design.
 
 ## How it works
 
-Decryption always requires **two factors together**, never either alone:
+Normal decryption uses the token and selected environment signals:
 
 1. **The ESP32 token** holds a 256-bit master secret generated on-device by its hardware
    RNG. It never leaves the token. First pairing is over USB (ECDH-encrypted); afterwards
@@ -28,12 +29,21 @@ Decryption always requires **two factors together**, never either alone:
 
 ```
 env_hash  = SHA-256(selected signal ids + values)
-env_key   = HMAC-SHA256(master_secret, env_hash)      # computed on the token
-file_key  = HKDF-SHA256(env_key, random per-file salt) # computed on the PC
+env_key   = HMAC-SHA256(master_secret, "3T-ENV-v1" | env_hash)
+stego_key = HKDF-SHA256(env_key, random per-file salt)
 ```
 
-Every file gets an independent key; the master secret never reaches the PC in a reusable
-form. Payloads are encrypted with **AES-256-GCM**.
+Stego encryption uses the environment key on the PC. The vault handles keys differently.
+
+| Vault action | IO0 | Key handling |
+| --- | --- | --- |
+| Open the file list | One tap | The app holds the metadata key until the list locks. |
+| Add one or more files | No additional tap | After checking the environment, the worker requests one batch secret, disconnects Bluetooth, and derives a separate AES-256-GCM key for each file locally. It releases the secret when the import ends. |
+| Export selected files | One tap for the selection | The worker keeps the export connection open and requests each selected file's key as it decrypts that file. |
+
+A memory capture during import can expose the whole selection through its batch
+secret. An ordinary export exposes the current file's key. The offline recovery
+code can recover the entire vault. [Vault security and recovery](md/VAULT_SECURITY.md)
 
 ## Features
 
@@ -41,12 +51,20 @@ form. Payloads are encrypted with **AES-256-GCM**.
   protection and lockout. Credentials sealed with Windows DPAPI.
 - **Environment signals** — 21 hardware/network/OS signals, each rated for stability, with
   a one-click **Recommended** selection and **Portable / Place-bound** modes.
-- **Steganography** — hide an encrypted payload in the LSBs of a **PNG** image or **WAV**
-  audio file under a token-encrypted header with **no plaintext marker**. Large payloads
-  **split across several carriers** (sharded), each piece token-tagged.
-- **Env Vault** — an encrypted store bound to the token + environment; files encrypted in
-  (originals shredded), names/sizes/dates sealed, opened in RAM, **auto-locks** when the
-  token leaves range (plus a **Ctrl+Shift+L panic lock**).
+- **Steganography** — hide any file, including DOCX or PDF, inside an image or audio
+  carrier. Inputs include JPEG, PNG, WebP, BMP, TIFF, GIF, WAV, MP3, FLAC, Ogg, Opus,
+  and AIFF. JPEG carriers stay JPEG; PNG, WebP, BMP and TIFF keep their format
+  using the corresponding JPEG or lossless pixel method. GIF saves as PNG and audio
+  saves as WAV. Large payloads can
+  split across all usable selected carriers, with a token-encrypted tag for each
+  piece. Decrypt receives the complete output set automatically.
+  WebP outputs are lossless and may grow from lossy inputs. Native JPEG support is
+  implemented inside `stego_engine.py`; native MP3 embedding is not implemented.
+  See [format behavior and validation](md/STEGO_FORMATS.md).
+- **Env Vault v2** — arbitrary file types, including DOCX and PDF; encrypted metadata,
+  one token request per import selection, locally derived per-file keys, and offline recovery. **No vault preview.** Auto-lock and **Ctrl+Shift+L** clear
+  the list and cancel active file workers. Deleting imported originals is optional;
+  each deletion outcome is reported.
 - **Anti-forensic hygiene** — secure delete (overwrite + timestomp + rename + unlink),
   optional free-space wipe, Privacy mode, and settings kept out of the Windows registry.
 
@@ -70,8 +88,8 @@ Encrypt a file or create a Vault.
 Python/          Host application (PyQt6) + automated tests
   main.py        Entry point
   crypto_engine, stego_engine, audio_engine, media, multi_image, vault, signals,
-  token_comms, pair_crypto, winutils, ui_main
-  tests/         150 automated tests (pytest)
+  vault_v2, vault_worker, token_comms, pair_crypto, winutils, ui_main
+  tests/         Automated tests (pytest)
 ESP32 Files/     3T token firmware
 md/              Setup/usage guide and docs
 ```
@@ -80,15 +98,19 @@ md/              Setup/usage guide and docs
 
 The token is a single **ESP32-CAM** module, flashed with the firmware in `ESP32 Files/`.
 No custom PCB or extra components are required beyond a USB-to-serial programmer and cable.
+Vault v2 needs **firmware v8**. Updating the application alone is insufficient.
+Preserve NVS and the pairing config when updating the firmware.
 
 ## Testing
 
 ```bash
-cd Python && python -m pytest tests/ -q      # 150 tests
+python -m pytest Python/tests/ -q
 ```
 
-The project is also evaluated with a disk-acquisition adversary harness and an
-app-abuse fuzzing harness (kept locally, not in this repo).
+The suite covers stego round trips, host BLE protocol behavior, vault key separation,
+recovery, write failures, concurrency, batch approvals, subprocess cancellation and Qt UI
+flows. Host protocol simulation does not validate the physical IO0 circuit or BLE
+runtime. See [validation results](md/VAULT_SECURITY.md#validation).
 
 ## Team
 
@@ -97,5 +119,7 @@ Infocomm Technology Cluster, Singapore Institute of Technology.
 
 ## Security note
 
-A factory reset of the token (hold IO0 for 2 seconds while it boots) destroys the master secret, making
-every file it protected permanently unrecoverable. This is intended behaviour, not a bug.
+A factory reset destroys the token secret: stego files become unrecoverable and
+vaults need their saved recovery codes. This change does not enable flash/NVS
+encryption or Secure Boot; token theft remains a separate hardware risk. See
+[the hardware security status](md/FLASH_ENCRYPTION.md).

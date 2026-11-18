@@ -4,7 +4,11 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <Preferences.h>
+#include <atomic>
+#include <map>
+#include <mutex>
 #include <esp_system.h>
+#include <mbedtls/sha256.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
@@ -12,7 +16,7 @@
 
 #define SERVICE_UUID        "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define CHARACTERISTIC_UUID "beb5483f-36e1-4688-b7f5-ea07361b26a8"
-#define FIRMWARE_VERSION    4   // v4: button-confirmed ECDH pairing; plaintext pairing removed
+#define FIRMWARE_VERSION    8
 
 // Pairing must be confirmed by pressing IO0 within this long, so nothing can re-pair
 // the token silently while it is plugged in.
@@ -28,13 +32,13 @@
 // --- BLE PROTOCOL (must match Python/token_comms.py) ---
 // Host  -> Token  HELLO     : 0x10
 // Token -> Host   CHALLENGE : 0x11 | token_nonce[16] | token_id[16]
-// Host  -> Token  REQUEST   : 0x20 | host_nonce[16] | iv[12] | ct[33] | tag[16]
-// Token -> Host   RESPONSE  : 0x21 | iv[12] | ct[33] | tag[16]
+// Host  -> Token  REQUEST   : 0x20 | host_nonce[16] | iv[12] | ct | tag[16]
+// Token -> Host   RESPONSE  : 0x21 | iv[12] | ct | tag[16]
 // Token -> Host   ERROR     : 0x7F | code
 //
 // session_key = HMAC(auth_key, "3T-SK-v1" | token_nonce | host_nonce)
-// REQUEST plaintext  = op | env_hash[32]      (AAD = "3T-REQ-v1" | token_id)
-// RESPONSE plaintext = status | data[32]      (AAD = "3T-RSP-v1" | token_id)
+// REQUEST plaintext  = op | context (32, 48, 64 or 96 bytes)      (AAD = "3T-REQ-v1" | token_id)
+// RESPONSE plaintext = status | data (32 bytes, or 48 for mint)      (AAD = "3T-RSP-v1" | token_id)
 // env_key (DERIVE)   = HMAC(master_secret, "3T-ENV-v1" | env_hash)
 #define MSG_HELLO      0x10
 #define MSG_CHALLENGE  0x11
@@ -44,57 +48,98 @@
 
 #define OP_DERIVE      0x01
 #define OP_PING        0x02
+// New opcodes make older firmware fail closed on vault requests.
+#define OP_VAULT_OPEN   0x13
+#define OP_VAULT_MINT   0x14
+#define OP_EXPORT_BEGIN 0x15
+#define OP_EXPORT_NEXT  0x16
+
+#define OP_IMPORT_BATCH 0x17
+#define OP_EXPORT_CHILD 0x18
+
+// These domains are independent of v7's single-file derivation.
+void deriveBatchSecret(const uint8_t *master, const uint8_t *vaultContext,
+                       const uint8_t *batchId, uint8_t *out) {
+    hmacSha256(master, MASTER_SECRET_LEN, "3T-VAULT-BATCH-v1",
+               vaultContext, SHA256_LEN, batchId, 16, out);
+}
 
 #define ERR_NOT_PAIRED   0x01
 #define ERR_NO_CHALLENGE 0x02
 #define ERR_AUTH_FAILED  0x03
 #define ERR_BAD_FORMAT   0x04
-#define ERR_LOCKED_OUT   0x05
+#define ERR_INTERNAL     0x06
+#define ERR_FILE_TIMEOUT 0x07
 
 #define REQ_PLAIN_LEN  (1 + SHA256_LEN)
 #define REQUEST_LEN    (1 + NONCE_LEN + GCM_IV_LEN + REQ_PLAIN_LEN + GCM_TAG_LEN)
 
-// Brute-force protection: too many bad requests locks the token for a while
+// Close only the connection responsible for repeated authentication failures.
 #define MAX_AUTH_FAILURES 5
-#define LOCKOUT_MS        30000
 
 Preferences preferences;
 BLECharacteristic *pCharacteristic;
+BLEServer *bleServer;
+esp_gatt_if_t gattInterface = ESP_GATT_IF_NONE;
 
-bool devicePaired = false;
+std::atomic<bool> devicePaired{false};
+bool storageHealthy = false;
 uint8_t masterSecret[MASTER_SECRET_LEN];
 uint8_t authKey[AUTH_KEY_LEN];
 uint8_t tokenId[TOKEN_ID_LEN];
 
-// Single-use challenge for the current BLE session (prevents replay)
-uint8_t tokenNonce[NONCE_LEN];
-bool challengeActive = false;
+struct BleSession {
+    uint8_t nonce[NONCE_LEN] = {};
+    bool challengeActive = false;
+    unsigned int failures = 0;
+    uint8_t exportCursor[SHA256_LEN] = {};  // Zero denotes no remaining selection.
 
-int authFailures = 0;
-unsigned long lockoutUntil = 0;
+};
+std::map<uint16_t, BleSession> bleSessions;
+std::mutex bleMutex;
+
+struct FileApproval {
+    bool active = false;
+    bool released = false;
+    uint16_t connection = 0;
+    uint8_t operation = 0;
+    unsigned long deadline = 0;
+    uint8_t sessionKey[SHA256_LEN] = {};
+    uint8_t context[SHA256_LEN] = {};
+};
+FileApproval fileApproval;
+
+void clearFileApproval() {
+    secureWipe(fileApproval.sessionKey, sizeof(fileApproval.sessionKey));
+    secureWipe(fileApproval.context, sizeof(fileApproval.context));
+    fileApproval.active = false;
+}
 
 // Last USB pairing reply, re-sent if the host repeats the same request
 String lastPairRequest = "";
 String lastPairReply = "";
+uint8_t lastPairPcPub[X25519_LEN];
 
 // A pairing request waiting for the user to press IO0
-bool pairPending = false;
-String pendingHost = "";
+enum class PairState { Idle, Proving, Confirming };
+PairState pairState = PairState::Idle;
 String pendingReq = "";
 uint8_t pendingPcPub[X25519_LEN];
+uint8_t pendingPairNonce[NONCE_LEN];
 unsigned long pairDeadline = 0;
+bool pairButtonReleased = false;
 
 // --- LED STATUS PATTERNS ---
 // Count tells you what happened, length tells you good (short) or bad (long):
 //   Boot window (hold IO0 2 s)  short blink every 0.5 s for 3 s
-//   Confirm pairing             solid ON until IO0 is pressed (up to 60 s)
+//   Confirm pairing/file action solid ON until IO0 is pressed (up to 60 s)
 //   Ready, paired               1 short
 //   Ready, unpaired             2 short
 //   Pairing success             3 short
 //   Key served                  2 very fast
 //   Auth failure                1 long
 //   Pairing refused             2 long
-//   Lockout engaged             3 long
+//   Failing BLE link closed     3 long
 //   Factory reset               10 rapid
 #define PAT_SHORT_MS 150
 #define PAT_LONG_MS  600
@@ -125,7 +170,7 @@ void playPattern(uint8_t count, uint16_t onMs, uint16_t offMs) {
 }
 
 void updateLED() {
-    if (pairPending) {                 // steady light = "press IO0 to confirm pairing"
+    if (pairState == PairState::Confirming) {
         digitalWrite(LED_PIN, HIGH);
         return;
     }
@@ -137,95 +182,195 @@ void updateLED() {
 }
 
 bool loadSecrets() {
-    if (!preferences.getBool("paired", false)) return false;
-    return preferences.getBytes("master", masterSecret, MASTER_SECRET_LEN) == MASTER_SECRET_LEN &&
-           preferences.getBytes("auth_key", authKey, AUTH_KEY_LEN) == AUTH_KEY_LEN &&
-           preferences.getBytes("token_id", tokenId, TOKEN_ID_LEN) == TOKEN_ID_LEN;
+    if (preferences.isKey("credentials_v5")) {
+        uint8_t stored[MASTER_SECRET_LEN + AUTH_KEY_LEN + TOKEN_ID_LEN];
+        storageHealthy = preferences.getBytes("credentials_v5", stored, sizeof(stored)) == sizeof(stored);
+        if (storageHealthy) {
+            memcpy(masterSecret, stored, MASTER_SECRET_LEN);
+            memcpy(authKey, stored + MASTER_SECRET_LEN, AUTH_KEY_LEN);
+            memcpy(tokenId, stored + MASTER_SECRET_LEN + AUTH_KEY_LEN, TOKEN_ID_LEN);
+        }
+        secureWipe(stored, sizeof(stored));
+        return storageHealthy;
+    }
+    // Preserve already enrolled v3/v4 tokens and the files derived from their master key.
+    if (!preferences.getBool("paired", false)) {
+        storageHealthy = !preferences.isKey("master") && !preferences.isKey("auth_key") &&
+                         !preferences.isKey("token_id");
+        return false;
+    }
+    storageHealthy = preferences.getBytes("master", masterSecret, MASTER_SECRET_LEN) == MASTER_SECRET_LEN &&
+                     preferences.getBytes("auth_key", authKey, AUTH_KEY_LEN) == AUTH_KEY_LEN &&
+                     preferences.getBytes("token_id", tokenId, TOKEN_ID_LEN) == TOKEN_ID_LEN;
+    return storageHealthy;
 }
 
-void sendError(uint8_t code) {
+void sendToLink(uint16_t connId, uint8_t *data, size_t len) {
+    esp_ble_gatts_send_indicate(gattInterface, connId, pCharacteristic->getHandle(), len, data, false);
+}
+
+void sendError(uint16_t connId, uint8_t code) {
     uint8_t msg[2] = { MSG_ERROR, code };
-    pCharacteristic->setValue(msg, sizeof(msg));
-    pCharacteristic->notify();
-    pCharacteristic->setValue((uint8_t *)"", 0);
+    sendToLink(connId, msg, sizeof(msg));
 }
 
-void handleHello() {
-    secureRandom(tokenNonce, NONCE_LEN);
-    challengeActive = true;
+void handleHello(uint16_t connId, BleSession &session) {
+    if (fileApproval.active && fileApproval.connection == connId) clearFileApproval();
+    secureRandom(session.nonce, NONCE_LEN);
+    session.challengeActive = true;
 
     uint8_t msg[1 + NONCE_LEN + TOKEN_ID_LEN];
     msg[0] = MSG_CHALLENGE;
-    memcpy(msg + 1, tokenNonce, NONCE_LEN);
+    memcpy(msg + 1, session.nonce, NONCE_LEN);
     memcpy(msg + 1 + NONCE_LEN, tokenId, TOKEN_ID_LEN);
-    pCharacteristic->setValue(msg, sizeof(msg));
-    pCharacteristic->notify();
-    pCharacteristic->setValue((uint8_t *)"", 0);
+    sendToLink(connId, msg, sizeof(msg));
 }
 
-void recordAuthFailure() {
-    authFailures++;
-    Serial.printf("[SEC] Rejected BLE request (%d/%d failures)\n", authFailures, MAX_AUTH_FAILURES);
-    if (authFailures >= MAX_AUTH_FAILURES) {
-        lockoutUntil = millis() + LOCKOUT_MS;
-        authFailures = 0;
-        Serial.println("[SEC] Too many failures. Token locked for 30 s.");
+void recordAuthFailure(uint16_t connId, BleSession &session) {
+    session.failures++;
+    Serial.printf("[SEC] Rejected BLE request (%u/%d failures on this link)\n", session.failures, MAX_AUTH_FAILURES);
+    sendError(connId, ERR_AUTH_FAILED);
+    if (session.failures >= MAX_AUTH_FAILURES) {
+        bleServer->disconnect(connId);
         playPattern(3, PAT_LONG_MS, 300);
     } else {
         playPattern(1, PAT_LONG_MS, 0);
     }
 }
 
-void handleRequest(const uint8_t *data, size_t len) {
-    if (!challengeActive) {
-        sendError(ERR_NO_CHALLENGE);
+void handleRequest(uint16_t connId, BleSession &session, const uint8_t *data, size_t len) {
+    if (!session.challengeActive) {
+        sendError(connId, ERR_NO_CHALLENGE);
         return;
     }
     // The challenge is consumed by this attempt whether it succeeds or not
-    challengeActive = false;
+    session.challengeActive = false;
 
-    if (len != REQUEST_LEN) {
-        sendError(ERR_BAD_FORMAT);
+    if (len != REQUEST_LEN && len != REQUEST_LEN + 16 && len != REQUEST_LEN + SHA256_LEN &&
+            len != REQUEST_LEN + 2 * SHA256_LEN) {
+        sendError(connId, ERR_BAD_FORMAT);
         return;
     }
 
     const uint8_t *hostNonce = data + 1;
     const uint8_t *reqIv     = hostNonce + NONCE_LEN;
     const uint8_t *reqCt     = reqIv + GCM_IV_LEN;
-    const uint8_t *reqTag    = reqCt + REQ_PLAIN_LEN;
+    const size_t plainLen = len - REQUEST_LEN + REQ_PLAIN_LEN;
+    const uint8_t *reqTag = reqCt + plainLen;
 
     uint8_t sessionKey[SHA256_LEN];
     hmacSha256(authKey, AUTH_KEY_LEN, "3T-SK-v1",
-               tokenNonce, NONCE_LEN, hostNonce, NONCE_LEN, sessionKey);
+               session.nonce, NONCE_LEN, hostNonce, NONCE_LEN, sessionKey);
 
     uint8_t aad[9 + TOKEN_ID_LEN];
     memcpy(aad, "3T-REQ-v1", 9);
     memcpy(aad + 9, tokenId, TOKEN_ID_LEN);
 
-    uint8_t plain[REQ_PLAIN_LEN];
-    if (!gcmDecrypt(sessionKey, reqIv, aad, sizeof(aad), reqCt, REQ_PLAIN_LEN, reqTag, plain)) {
+    uint8_t plain[REQ_PLAIN_LEN + 2 * SHA256_LEN];
+    if (!gcmDecrypt(sessionKey, reqIv, aad, sizeof(aad), reqCt, plainLen, reqTag, plain)) {
         // Host does not hold the auth key paired over USB: impostor or stale pairing
         secureWipe(sessionKey, sizeof(sessionKey));
-        recordAuthFailure();
-        sendError(ERR_AUTH_FAILED);
+        recordAuthFailure(connId, session);
         return;
     }
-    authFailures = 0;
+    session.failures = 0;
 
     uint8_t op = plain[0];
     const uint8_t *envHash = plain + 1;
 
-    uint8_t respPlain[1 + SHA256_LEN];
+    size_t expected = REQ_PLAIN_LEN;
+    if (op == OP_VAULT_MINT) expected += 16;
+    if (op == OP_EXPORT_NEXT) expected += SHA256_LEN;
+    if (op == OP_EXPORT_CHILD) expected += 2 * SHA256_LEN;
+    if (plainLen != expected) {
+        secureWipe(sessionKey, sizeof(sessionKey));
+        secureWipe(plain, sizeof(plain));
+        sendError(connId, ERR_BAD_FORMAT);
+        return;
+    }
+
+    uint8_t respPlain[1 + 16 + SHA256_LEN] = {};
+    size_t responseLen = 1 + SHA256_LEN;
     respPlain[0] = 0x00; // status OK
     if (op == OP_DERIVE) {
         hmacSha256(masterSecret, MASTER_SECRET_LEN, "3T-ENV-v1",
                    envHash, SHA256_LEN, NULL, 0, respPlain + 1);
     } else if (op == OP_PING) {
         memset(respPlain + 1, 0, SHA256_LEN);
+    } else if (op == OP_VAULT_MINT) {
+        // A caller may choose the vault, but only the token chooses the new blob ID.
+        constexpr char domain[] = "EnvVault-v2";
+        constexpr size_t prefixLen = sizeof(domain) - 1;
+        constexpr size_t vaultContextLen = 16 + SHA256_LEN;
+        uint8_t material[prefixLen + vaultContextLen + 16];
+        memcpy(material, domain, prefixLen);
+        memcpy(material + prefixLen, envHash, vaultContextLen);
+        secureRandom(respPlain + 1, 16);
+        memcpy(material + prefixLen + vaultContextLen, respPlain + 1, 16);
+        uint8_t context[SHA256_LEN];
+        if (mbedtls_sha256_ret(material, sizeof(material), context, 0) != 0) {
+            secureWipe(sessionKey, sizeof(sessionKey));
+            secureWipe(plain, sizeof(plain));
+            sendError(connId, ERR_INTERNAL);
+            return;
+        }
+        hmacSha256(masterSecret, MASTER_SECRET_LEN, "3T-VAULT-FILE-v2",
+                   context, sizeof(context), nullptr, 0, respPlain + 17);
+        responseLen += 16;
+    } else if (op == OP_IMPORT_BATCH) {
+        // The token chooses the batch ID. The host cannot ask to remint an existing batch.
+        secureRandom(respPlain + 1, 16);
+        deriveBatchSecret(masterSecret, envHash, respPlain + 1, respPlain + 17);
+        responseLen += 16;
+    } else if (op == OP_EXPORT_NEXT || op == OP_EXPORT_CHILD) {
+        // Each approved link commits to this file context and the remaining suffix.
+        const uint8_t empty[SHA256_LEN] = {};
+        uint8_t digest[SHA256_LEN];
+        if (!memcmp(session.exportCursor, empty, SHA256_LEN) ||
+                mbedtls_sha256_ret(envHash, plainLen - 1, digest, 0) != 0 ||
+                memcmp(session.exportCursor, digest, SHA256_LEN)) {
+            secureWipe(session.exportCursor, SHA256_LEN);
+            secureWipe(sessionKey, sizeof(sessionKey));
+            secureWipe(plain, sizeof(plain));
+            sendError(connId, ERR_BAD_FORMAT);
+            return;
+        }
+        memcpy(session.exportCursor, plain + plainLen - SHA256_LEN, SHA256_LEN);
+        if (op == OP_EXPORT_CHILD) {
+            // context = vault context (32) | batch ID (16) | selected file ID (16).
+            uint8_t batch[SHA256_LEN];
+            deriveBatchSecret(masterSecret, envHash, envHash + SHA256_LEN, batch);
+            hmacSha256(batch, sizeof(batch), "3T-VAULT-CHILD-v1",
+                       envHash + SHA256_LEN + 16, 16, nullptr, 0, respPlain + 1);
+            secureWipe(batch, sizeof(batch));
+        } else {
+            hmacSha256(masterSecret, MASTER_SECRET_LEN, "3T-VAULT-FILE-v2",
+                       envHash, SHA256_LEN, nullptr, 0, respPlain + 1);
+        }
+    } else if (op == OP_VAULT_OPEN || op == OP_EXPORT_BEGIN) {
+        secureWipe(session.exportCursor, SHA256_LEN);
+        if (fileApproval.active || pairState != PairState::Idle) {
+            secureWipe(sessionKey, sizeof(sessionKey));
+            secureWipe(plain, sizeof(plain));
+            sendError(connId, ERR_INTERNAL);
+            return;
+        }
+        fileApproval.operation = op;
+        fileApproval.connection = connId;
+        fileApproval.deadline = millis() + 60000;
+        fileApproval.released = digitalRead(0) != LOW;
+        memcpy(fileApproval.sessionKey, sessionKey, SHA256_LEN);
+        memcpy(fileApproval.context, envHash, SHA256_LEN);
+        fileApproval.active = true;
+        // Signal that this connection must now wait for a fresh physical press.
+        respPlain[0] = 0x01;
+        memset(respPlain + 1, 0, SHA256_LEN);
+        Serial.println(op == OP_VAULT_OPEN ? "[VAULT] Confirm opening the list with IO0." :
+                                           "[VAULT] Confirm selected export with IO0.");
     } else {
         secureWipe(sessionKey, sizeof(sessionKey));
         secureWipe(plain, sizeof(plain));
-        sendError(ERR_BAD_FORMAT);
+        sendError(connId, ERR_BAD_FORMAT);
         return;
     }
 
@@ -233,63 +378,68 @@ void handleRequest(const uint8_t *data, size_t len) {
     msg[0] = MSG_RESPONSE;
     uint8_t *respIv  = msg + 1;
     uint8_t *respCt  = respIv + GCM_IV_LEN;
-    uint8_t *respTag = respCt + sizeof(respPlain);
+    uint8_t *respTag = respCt + responseLen;
     secureRandom(respIv, GCM_IV_LEN);
 
     memcpy(aad, "3T-RSP-v1", 9);
-    gcmEncrypt(sessionKey, respIv, aad, sizeof(aad), respPlain, sizeof(respPlain), respCt, respTag);
-
-    pCharacteristic->setValue(msg, sizeof(msg));
-    pCharacteristic->notify();
-    pCharacteristic->setValue((uint8_t *)"", 0);
+    bool encrypted = gcmEncrypt(sessionKey, respIv, aad, sizeof(aad), respPlain, responseLen, respCt, respTag);
 
     secureWipe(sessionKey, sizeof(sessionKey));
     secureWipe(plain, sizeof(plain));
     secureWipe(respPlain, sizeof(respPlain));
+    if (!encrypted) {
+        sendError(connId, ERR_INTERNAL);
+        return;
+    }
+    sendToLink(connId, msg, 1 + GCM_IV_LEN + responseLen + GCM_TAG_LEN);
 
     if (op == OP_DERIVE) {
         Serial.println("[BLE] Authenticated key request served.");
         playPattern(2, 50, 80);
-    } else {
+    } else if (op == OP_PING) {
         Serial.println("[BLE] Authenticated ping served.");
     }
 }
 
 class MyServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
+    void onConnect(BLEServer*, esp_ble_gatts_cb_param_t *param) override {
+        std::lock_guard<std::mutex> guard(bleMutex);
+        bleSessions[param->connect.conn_id] = BleSession{};
         Serial.println("[BLE] Host connected wirelessly.");
     }
-    void onDisconnect(BLEServer* pServer) {
-        challengeActive = false;
-        secureWipe(tokenNonce, NONCE_LEN);
+    void onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) override {
+        std::lock_guard<std::mutex> guard(bleMutex);
+        if (fileApproval.active && fileApproval.connection == param->disconnect.conn_id) clearFileApproval();
+        bleSessions.erase(param->disconnect.conn_id);
         Serial.println("[BLE] Host disconnected. Restarting advertising...");
         pServer->getAdvertising()->start();
     }
 };
 
 class MyCallbacks : public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-        std::string value = pCharacteristic->getValue();
+    void onWrite(BLECharacteristic *characteristic, esp_ble_gatts_cb_param_t *param) override {
+        std::lock_guard<std::mutex> guard(bleMutex);
+        // conn_id is the first field for both normal and committed long writes.
+        uint16_t connId = param->write.conn_id;
+        auto session = bleSessions.find(connId);
+        if (session == bleSessions.end()) return;
+        std::string value = characteristic->getValue();
         if (value.empty()) return;
         const uint8_t *data = (const uint8_t *)value.data();
         size_t len = value.length();
 
         if (!devicePaired) {
-            sendError(ERR_NOT_PAIRED);
+            sendError(connId, ERR_NOT_PAIRED);
             return;
         }
-        if (lockoutUntil && (long)(lockoutUntil - millis()) > 0) {
-            sendError(ERR_LOCKED_OUT);
-            return;
-        }
-        lockoutUntil = 0;
+        if (session->second.failures >= MAX_AUTH_FAILURES) return;
 
         if (data[0] == MSG_HELLO && len == 1) {
-            handleHello();
+            handleHello(connId, session->second);
         } else if (data[0] == MSG_REQUEST) {
-            handleRequest(data, len);
+            handleRequest(connId, session->second, data, len);
         } else {
-            sendError(ERR_BAD_FORMAT);
+            sendError(connId, ERR_BAD_FORMAT);
         }
     }
 };
@@ -302,154 +452,198 @@ bool isValidField(const String &s, unsigned int maxLen) {
     return true;
 }
 
-// Ensure the token has a master secret + token ID and rotate a fresh auth key
-// bound to hostID. Returns false (with a REFUSED reply queued in lastPairReply)
-// if the token is already bound to a different host. On success, authKey/tokenId
-// hold the new material.
-bool rotatePairing(const String &hostID, const String &reqID) {
-    // A token bound to another host must be factory reset (destroying its
-    // master secret) before it can be bound again.
-    if (devicePaired && preferences.getString("host_id", "") != hostID) {
-        lastPairRequest = reqID;
-        lastPairReply = "PAIRING_REFUSED;REQ=" + reqID + ";REASON=BOUND_TO_OTHER_HOST";
-        playPattern(2, PAT_LONG_MS, 300);
-        return false;
-    }
-
-    // The master secret is created once and survives re-pairing with the same
-    // host, so files encrypted earlier stay recoverable.
-    if (preferences.getBytes("master", masterSecret, MASTER_SECRET_LEN) != MASTER_SECRET_LEN) {
-        secureRandom(masterSecret, MASTER_SECRET_LEN);
-        secureRandom(tokenId, TOKEN_ID_LEN);
-        preferences.putBytes("master", masterSecret, MASTER_SECRET_LEN);
-        preferences.putBytes("token_id", tokenId, TOKEN_ID_LEN);
-        Serial.println("[HW] Generated new master secret from hardware RNG.");
-    } else {
-        preferences.getBytes("token_id", tokenId, TOKEN_ID_LEN);
-    }
-
-    // A fresh auth key on every pairing invalidates any older host config
-    secureRandom(authKey, AUTH_KEY_LEN);
-    preferences.putBytes("auth_key", authKey, AUTH_KEY_LEN);
-    preferences.putString("host_id", hostID);
-    preferences.putBool("paired", true);
-    devicePaired = true;
-    challengeActive = false;
-    authFailures = 0;
-    return true;
+void refusePairing(const String &req, const char *reason) {
+    Serial.println("PAIRING_REFUSED;REQ=" + req + ";REASON=" + reason);
 }
 
-// PAIR_ECDH:<host_id>:<request_id>:<pc_pub hex(32)>  (encrypted: auth key is wrapped)
-// The host repeats the command until the token answers, so a repeated request_id
-// gets the same reply instead of rotating the auth key again. Nothing is bound until
-// the user presses IO0: until then the token answers PAIRING_PENDING.
-// (The old plaintext PAIR_DEVICE command has been removed: the auth key now only ever
-// crosses the wire encrypted.)
-void handlePairEcdh(const String &args) {
-    int s1 = args.indexOf(':');
-    int s2 = (s1 >= 0) ? args.indexOf(':', s1 + 1) : -1;
-    if (s1 < 0 || s2 < 0) {
-        Serial.println("PAIRING_REFUSED;REASON=BAD_FORMAT");
-        return;
-    }
-    String hostID = args.substring(0, s1);
-    String reqID  = args.substring(s1 + 1, s2);
-    String pcPubHex = args.substring(s2 + 1);
+void clearPendingPairing() {
+    pairState = PairState::Idle;
+    pendingReq = "";
+    secureWipe(pendingPcPub, sizeof(pendingPcPub));
+    secureWipe(pendingPairNonce, sizeof(pendingPairNonce));
+    digitalWrite(LED_PIN, LOW);
+}
 
-    uint8_t pcPub[X25519_LEN];
-    if (!isValidField(hostID, 32) || !isValidField(reqID, 32) ||
-            !fromHex(pcPubHex, pcPub, X25519_LEN)) {
-        Serial.println("PAIRING_REFUSED;REQ=" + reqID + ";REASON=BAD_FORMAT");
+void sendPairingState() {
+    if (pairState == PairState::Proving) {
+        Serial.println("PAIRING_PROOF;REQ=" + pendingReq +
+                       ";NONCE=" + toHex(pendingPairNonce, NONCE_LEN) +
+                       ";TOKEN_ID=" + toHex(tokenId, TOKEN_ID_LEN));
+    } else {
+        Serial.println("PAIRING_PENDING;REQ=" + pendingReq + ";REASON=PRESS_BUTTON");
+    }
+}
+
+void waitForButton() {
+    pairState = PairState::Confirming;
+    pairButtonReleased = digitalRead(0) != LOW;
+    pairDeadline = millis() + PAIR_CONFIRM_MS;
+    sendPairingState();
+}
+
+// PAIR_V5:<request_id>:<pc_pub>:<ENROLL|REPAIR>
+void handlePairStart(const String &args) {
+    if (fileApproval.active) {
+        Serial.println("PAIRING_REFUSED;REASON=BUSY");
         return;
     }
-    if (reqID == lastPairRequest && lastPairReply.length() > 0) {
+    int separator = args.indexOf(':');
+    int modeSeparator = (separator >= 0) ? args.indexOf(':', separator + 1) : -1;
+    if (modeSeparator < 0) return;
+    String req = args.substring(0, separator);
+    String mode = args.substring(modeSeparator + 1);
+    uint8_t pcPub[X25519_LEN];
+    if (req.length() != 16 || !isValidField(req, 16) ||
+        !fromHex(args.substring(separator + 1, modeSeparator), pcPub, X25519_LEN) ||
+        (mode != "ENROLL" && mode != "REPAIR")) {
+        refusePairing(req, "BAD_FORMAT");
+        return;
+    }
+    if (req == lastPairRequest && memcmp(lastPairPcPub, pcPub, X25519_LEN) == 0) {
         Serial.println(lastPairReply);
         return;
     }
-    if (pairPending) {
-        if (reqID == pendingReq) {
-            Serial.println("PAIRING_PENDING;REQ=" + reqID + ";REASON=PRESS_BUTTON");
+    if (!storageHealthy) {
+        refusePairing(req, "STORAGE_ERROR");
+        return;
+    }
+    const bool paired = devicePaired.load();
+    if (paired != (mode == "REPAIR")) {
+        refusePairing(req, paired ? "PROOF_REQUIRED" : "TOKEN_UNPAIRED");
+        return;
+    }
+    if (pairState != PairState::Idle) {
+        if (req == pendingReq && memcmp(pendingPcPub, pcPub, X25519_LEN) == 0) {
+            sendPairingState();
         } else {
-            Serial.println("PAIRING_REFUSED;REQ=" + reqID + ";REASON=BUSY");
+            refusePairing(req, "BUSY");
         }
         return;
     }
-    // No point asking for the button if the binding would be refused anyway
-    if (devicePaired && preferences.getString("host_id", "") != hostID) {
-        lastPairRequest = reqID;
-        lastPairReply = "PAIRING_REFUSED;REQ=" + reqID + ";REASON=BOUND_TO_OTHER_HOST";
-        Serial.println(lastPairReply);
-        playPattern(2, PAT_LONG_MS, 300);
-        return;
-    }
 
-    pairPending = true;
-    pendingHost = hostID;
-    pendingReq = reqID;
+    pendingReq = req;
     memcpy(pendingPcPub, pcPub, X25519_LEN);
-    pairDeadline = millis() + PAIR_CONFIRM_MS;
-    Serial.println("PAIRING_PENDING;REQ=" + reqID + ";REASON=PRESS_BUTTON");
+    if (paired) {
+        pairState = PairState::Proving;
+        pairDeadline = millis() + 10000;
+        secureRandom(pendingPairNonce, NONCE_LEN);
+        sendPairingState();
+    } else {
+        waitForButton();
+    }
 }
 
-// IO0 pressed (debounced). Only called after start-up, so it never overlaps the
-// factory-reset window.
+// PAIR_PROVE:<request_id>:<HMAC>. The transcript binds proof to this token,
+// its one-time challenge, and the host's exact ephemeral public key.
+void handlePairProof(const String &args) {
+    int separator = args.indexOf(':');
+    if (separator < 0) return;
+    String req = args.substring(0, separator);
+    if (!devicePaired || pairState == PairState::Idle || req != pendingReq) {
+        refusePairing(req, "NO_PENDING");
+        return;
+    }
+    uint8_t proof[SHA256_LEN];
+    if (!fromHex(args.substring(separator + 1), proof, SHA256_LEN)) {
+        refusePairing(req, "BAD_FORMAT");
+        return;
+    }
+    uint8_t transcript[TOKEN_ID_LEN + NONCE_LEN + 16 + X25519_LEN];
+    memcpy(transcript, tokenId, TOKEN_ID_LEN);
+    memcpy(transcript + TOKEN_ID_LEN, pendingPairNonce, NONCE_LEN);
+    memcpy(transcript + TOKEN_ID_LEN + NONCE_LEN, req.c_str(), 16);
+    memcpy(transcript + TOKEN_ID_LEN + NONCE_LEN + 16, pendingPcPub, X25519_LEN);
+    uint8_t expected[SHA256_LEN];
+    hmacSha256(authKey, AUTH_KEY_LEN, "3T-PAIR-PROOF-v1",
+               transcript, sizeof(transcript), nullptr, 0, expected);
+    volatile uint8_t difference = 0;
+    for (size_t i = 0; i < sizeof(proof); ++i) difference |= proof[i] ^ expected[i];
+    secureWipe(expected, sizeof(expected));
+    secureWipe(proof, sizeof(proof));
+    if (difference != 0) {
+        refusePairing(req, "AUTH_FAILED");
+        return;
+    }
+    if (pairState == PairState::Proving) {
+        waitForButton();
+    } else {
+        sendPairingState();
+    }
+}
+
 bool confirmButtonPressed() {
-    if (digitalRead(0) != LOW) return false;
+    if (digitalRead(0) != LOW) {
+        pairButtonReleased = true;
+        return false;
+    }
+    if (!pairButtonReleased) return false;
     delay(50);
     return digitalRead(0) == LOW;
 }
 
-// Called once the user has confirmed: bind the host and send the wrapped auth key.
 void completePairing() {
-    pairPending = false;
-    digitalWrite(LED_PIN, LOW);
-    String hostID = pendingHost;
-    String reqID = pendingReq;
+    String req = pendingReq;
     uint8_t pcPub[X25519_LEN];
     memcpy(pcPub, pendingPcPub, X25519_LEN);
-    secureWipe(pendingPcPub, X25519_LEN);
+    clearPendingPairing();
 
-    if (!rotatePairing(hostID, reqID)) {
-        Serial.println(lastPairReply);
-        return;
-    }
-
-    // X25519: our ephemeral key pair, then the shared secret with the host
     uint8_t tokPriv[X25519_LEN], tokPub[X25519_LEN], shared[X25519_LEN];
-    if (!x25519Keypair(tokPriv, tokPub) || !x25519Shared(tokPriv, pcPub, shared)) {
-        secureWipe(tokPriv, sizeof(tokPriv));
+    bool exchanged = x25519Keypair(tokPriv, tokPub) && x25519Shared(tokPriv, pcPub, shared);
+    secureWipe(tokPriv, sizeof(tokPriv));
+    if (!exchanged) {
         secureWipe(shared, sizeof(shared));
-        Serial.println("PAIRING_REFUSED;REQ=" + reqID + ";REASON=CRYPTO_ERROR");
+        refusePairing(req, "CRYPTO_ERROR");
         return;
     }
 
-    // Wrapping key = HKDF(shared, salt=none, info = "EnvStego-pair-v1" | pc_pub | tok_pub | token_id)
-    uint8_t info[16 + X25519_LEN + X25519_LEN + TOKEN_ID_LEN];
-    memcpy(info, "EnvStego-pair-v1", 16);
-    memcpy(info + 16, pcPub, X25519_LEN);
-    memcpy(info + 16 + X25519_LEN, tokPub, X25519_LEN);
-    memcpy(info + 16 + 2 * X25519_LEN, tokenId, TOKEN_ID_LEN);
-    uint8_t wrapKey[32];
-    hkdfSha256(NULL, 0, shared, X25519_LEN, info, sizeof(info), wrapKey, sizeof(wrapKey));
+    // Re-pairing refreshes the PC's config without rotating working credentials.
+    const bool enrolling = !devicePaired.load();
+    if (enrolling) {
+        secureRandom(masterSecret, MASTER_SECRET_LEN);
+        secureRandom(authKey, AUTH_KEY_LEN);
+        secureRandom(tokenId, TOKEN_ID_LEN);
+    }
 
-    // AES-256-GCM encrypt the auth key, AAD = pc_pub | tok_pub | token_id
     uint8_t aad[X25519_LEN + X25519_LEN + TOKEN_ID_LEN];
     memcpy(aad, pcPub, X25519_LEN);
     memcpy(aad + X25519_LEN, tokPub, X25519_LEN);
     memcpy(aad + 2 * X25519_LEN, tokenId, TOKEN_ID_LEN);
+    uint8_t info[16 + sizeof(aad)];
+    memcpy(info, "EnvStego-pair-v1", 16);
+    memcpy(info + 16, aad, sizeof(aad));
+    uint8_t wrapKey[AUTH_KEY_LEN];
+    hkdfSha256(nullptr, 0, shared, sizeof(shared), info, sizeof(info), wrapKey, sizeof(wrapKey));
+    secureWipe(shared, sizeof(shared));
 
     uint8_t enc[GCM_IV_LEN + AUTH_KEY_LEN + GCM_TAG_LEN];
-    uint8_t *iv = enc, *ct = enc + GCM_IV_LEN, *tag = ct + AUTH_KEY_LEN;
-    secureRandom(iv, GCM_IV_LEN);
-    gcmEncrypt(wrapKey, iv, aad, sizeof(aad), authKey, AUTH_KEY_LEN, ct, tag);
-
-    secureWipe(tokPriv, sizeof(tokPriv));
-    secureWipe(shared, sizeof(shared));
+    secureRandom(enc, GCM_IV_LEN);
+    bool wrapped = gcmEncrypt(wrapKey, enc, aad, sizeof(aad), authKey, AUTH_KEY_LEN,
+                              enc + GCM_IV_LEN, enc + GCM_IV_LEN + AUTH_KEY_LEN);
     secureWipe(wrapKey, sizeof(wrapKey));
+    if (!wrapped) {
+        refusePairing(req, "CRYPTO_ERROR");
+        return;
+    }
+
+    // Commit new credentials as one NVS value only after the exchange and wrap succeed.
+    if (enrolling) {
+        uint8_t stored[MASTER_SECRET_LEN + AUTH_KEY_LEN + TOKEN_ID_LEN];
+        memcpy(stored, masterSecret, MASTER_SECRET_LEN);
+        memcpy(stored + MASTER_SECRET_LEN, authKey, AUTH_KEY_LEN);
+        memcpy(stored + MASTER_SECRET_LEN + AUTH_KEY_LEN, tokenId, TOKEN_ID_LEN);
+        storageHealthy = preferences.putBytes("credentials_v5", stored, sizeof(stored)) == sizeof(stored);
+        secureWipe(stored, sizeof(stored));
+        if (!storageHealthy) {
+            refusePairing(req, "STORAGE_ERROR");
+            return;
+        }
+        devicePaired = true;
+    }
 
     std::string mac = BLEDevice::getAddress().toString();
-    lastPairRequest = reqID;
-    lastPairReply = "PAIRING_SUCCESS;REQ=" + reqID + ";MODE=ECDH" +
+    lastPairRequest = req;
+    memcpy(lastPairPcPub, pcPub, X25519_LEN);
+    lastPairReply = "PAIRING_SUCCESS;REQ=" + req + ";MODE=ECDH" +
                     ";TOKEN_ID=" + toHex(tokenId, TOKEN_ID_LEN) +
                     ";TOK_PUB=" + toHex(tokPub, X25519_LEN) +
                     ";ENC=" + toHex(enc, sizeof(enc)) +
@@ -497,37 +691,39 @@ void setup() {
     }
     digitalWrite(LED_PIN, LOW);
 
-    preferences.begin("3t_storage", false);
+    storageHealthy = preferences.begin("3t_storage", false);
 
     if (factoryResetTriggered) {
         // Destroys the master secret: every file encrypted with this token
         // becomes permanently unrecoverable.
         Serial.println("[HW] Factory Reset triggered! Wiping all secrets...");
-        preferences.clear();
-        devicePaired = false;
-        flashLED(10, 40);
-    } else {
+        storageHealthy = storageHealthy && preferences.clear();
+        if (storageHealthy) flashLED(10, 40);
+    } else if (storageHealthy) {
         devicePaired = loadSecrets();
         if (devicePaired) {
-            Serial.println("[HW] Restored state: Token is ALREADY bound to host from NVS flash.");
-        } else {
+            Serial.println("[HW] Restored pairing credentials from NVS flash.");
+        } else if (storageHealthy) {
             Serial.println("[HW] Token is UNPAIRED. Waiting for USB handshake...");
         }
     }
+    if (!storageHealthy) Serial.println("[HW] Pairing storage could not be read or reset.");
 
-    // Initialize BLE with V4 name to bypass Windows cache
-    BLEDevice::init("3T-Token-v4");
+    BLEDevice::init("3T-Token-v8");
     // Lower the radio TX power to cut the current spike that causes brownouts.
     // The PC pairs over USB first, so a shorter BLE range is an acceptable trade.
     BLEDevice::setPower(ESP_PWR_LVL_N9);
     // Protocol messages are up to 78 bytes, above the 20-byte default payload
     BLEDevice::setMTU(185);
-    BLEServer *pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
+    BLEDevice::setCustomGattsHandler([](esp_gatts_cb_event_t event, esp_gatt_if_t interface,
+                                      esp_ble_gatts_cb_param_t *param) {
+        if (event == ESP_GATTS_REG_EVT && param->reg.status == ESP_GATT_OK) gattInterface = interface;
+    });
+    bleServer = BLEDevice::createServer();
+    bleServer->setCallbacks(new MyServerCallbacks());
 
-    BLEService *pService = pServer->createService(SERVICE_UUID);
-    // No READ property: responses are only delivered by notification and
-    // cleared straight after, so nothing lingers on the characteristic.
+    BLEService *pService = bleServer->createService(SERVICE_UUID);
+    // No READ property. Replies are notifications addressed to the requesting link.
     pCharacteristic = pService->createCharacteristic(
                         CHARACTERISTIC_UUID,
                         BLECharacteristic::PROPERTY_WRITE  |
@@ -555,31 +751,68 @@ void setup() {
 }
 
 void loop() {
+    std::lock_guard<std::mutex> guard(bleMutex);
     updateLED();
 
-    // A pairing request is waiting for the user: IO0 confirms, otherwise it expires.
-    if (pairPending) {
-        if (confirmButtonPressed()) {
-            completePairing();
-        } else if ((long)(millis() - pairDeadline) >= 0) {
-            pairPending = false;
+    if (fileApproval.active) {
+        digitalWrite(LED_PIN, HIGH);
+        if ((long)(millis() - fileApproval.deadline) >= 0) {
+            sendError(fileApproval.connection, ERR_FILE_TIMEOUT);
+            clearFileApproval();
             digitalWrite(LED_PIN, LOW);
-            secureWipe(pendingPcPub, X25519_LEN);
-            lastPairRequest = pendingReq;
-            lastPairReply = "PAIRING_REFUSED;REQ=" + pendingReq + ";REASON=NOT_CONFIRMED";
-            Serial.println(lastPairReply);
-            playPattern(2, PAT_LONG_MS, 300);
+        } else if (digitalRead(0) != LOW) {
+            fileApproval.released = true;
+        } else if (fileApproval.released) {
+            delay(50);
+            if (digitalRead(0) == LOW) {
+                uint8_t response[1 + GCM_IV_LEN + 33 + GCM_TAG_LEN];
+                uint8_t plain[33] = {};
+                uint8_t aad[9 + TOKEN_ID_LEN];
+                response[0] = MSG_RESPONSE;
+                secureRandom(response + 1, GCM_IV_LEN);
+                memcpy(aad, "3T-RSP-v1", 9);
+                memcpy(aad + 9, tokenId, TOKEN_ID_LEN);
+                if (fileApproval.operation == OP_VAULT_OPEN) {
+                    hmacSha256(masterSecret, MASTER_SECRET_LEN, "3T-VAULT-META-v2",
+                               fileApproval.context, SHA256_LEN, nullptr, 0, plain + 1);
+                }
+                bool encrypted = gcmEncrypt(fileApproval.sessionKey, response + 1, aad, sizeof(aad),
+                                            plain, sizeof(plain), response + 1 + GCM_IV_LEN,
+                                            response + 1 + GCM_IV_LEN + sizeof(plain));
+                if (encrypted) {
+                    if (fileApproval.operation == OP_EXPORT_BEGIN) {
+                        memcpy(bleSessions[fileApproval.connection].exportCursor, fileApproval.context, SHA256_LEN);
+                    }
+                    sendToLink(fileApproval.connection, response, sizeof(response));
+                } else {
+                    sendError(fileApproval.connection, ERR_INTERNAL);
+                }
+                secureWipe(plain, sizeof(plain));
+                clearFileApproval();
+                digitalWrite(LED_PIN, LOW);
+                playPattern(2, PAT_SHORT_MS, PAT_SHORT_MS);
+            }
         }
+    }
+
+    if (pairState != PairState::Idle && (long)(millis() - pairDeadline) >= 0) {
+        const char *reason = pairState == PairState::Proving ? "NO_PENDING" : "NOT_CONFIRMED";
+        refusePairing(pendingReq, reason);
+        clearPendingPairing();
+        playPattern(2, PAT_LONG_MS, 300);
     }
 
     if (Serial.available() > 0) {
         String command = Serial.readStringUntil('\n');
         command.trim();
 
-        // Only encrypted pairing is accepted. Anything else (including the removed
-        // plaintext PAIR_DEVICE) is ignored.
-        if (command.startsWith("PAIR_ECDH:")) {
-            handlePairEcdh(command.substring(10));
+        if (command.startsWith("PAIR_V5:")) {
+            handlePairStart(command.substring(8));
+        } else if (command.startsWith("PAIR_PROVE:")) {
+            handlePairProof(command.substring(11));
+        } else if (command.startsWith("PAIR_CANCEL:") && command.substring(12) == pendingReq) {
+            clearPendingPairing();
         }
     }
+    if (pairState == PairState::Confirming && confirmButtonPressed()) completePairing();
 }

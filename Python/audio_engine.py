@@ -1,10 +1,10 @@
 """
 EnvStego - audio_engine.py
-LSB steganography for WAV audio carriers (the audio twin of stego_engine).
+LSB steganography for audio carriers, written as PCM WAV.
 
-A payload is hidden in the least-significant bit of each PCM sample. WAV is
-required for the same reason PNG is for images: it is lossless, so the LSBs
-survive. Lossy formats (MP3, AAC, OGG) re-quantise the audio and destroy them.
+A payload is hidden in the least-significant bit of each PCM sample. Other
+audio formats are decoded to PCM before embedding, and the output is stored
+as WAV so re-encoding does not change the embedded bits.
 
 Supported: uncompressed PCM WAV, 8 / 16 / 32-bit, any channel count. The written
 bits look like dithering noise and are inaudible at 1 bit of a 16-bit sample.
@@ -22,6 +22,7 @@ import numpy as np
 
 # PCM sample width (bytes) -> numpy dtype for in-place LSB edits
 _DTYPE = {1: np.uint8, 2: np.int16, 4: np.int32}
+DECODED_AUDIO_EXTS = (".mp3", ".flac", ".ogg", ".oga", ".opus", ".aif", ".aiff")
 
 
 def _open_wav(path: str):
@@ -48,6 +49,32 @@ def _read_wav(path: str):
     return params, samples
 
 
+def _open_encoded_audio(path: str):
+    try:
+        import soundfile
+    except (ImportError, OSError) as e:
+        raise ValueError("Install the project requirements to open this audio format.") from e
+    try:
+        return soundfile.SoundFile(path)
+    except soundfile.SoundFileError as e:
+        raise ValueError(f"Cannot open audio carrier: {e}") from e
+
+
+def _read_audio_carrier(path: str):
+    if Path(path).suffix.lower() == ".wav":
+        return _read_wav(path)
+    with _open_encoded_audio(path) as audio:
+        # Preserve the original channel count and sample rate. Normalize all
+        # non-WAV sources to 16-bit PCM, including float-based audio files.
+        samples = audio.read(dtype="float32").reshape(-1)
+        np.nan_to_num(samples, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
+        np.clip(samples, -1.0, 32767 / 32768, out=samples)
+        samples *= 32768
+        params = (audio.channels, 2, audio.samplerate, samples.size // audio.channels,
+                  "NONE", "not compressed")
+    return params, np.rint(samples, out=samples).astype(np.int16)
+
+
 def wav_capacity_bytes(path: str) -> int:
     """Total bytes carriable in a WAV's sample LSBs (1 bit per sample, no header subtracted)."""
     with _open_wav(path) as w:
@@ -61,12 +88,12 @@ def wav_capacity_bytes(path: str) -> int:
 def embed_blob_wav(carrier_path: str, blob: bytes, output_path: str,
                    match_timestamps: bool = False, order_key: bytes | None = None) -> str:
     """
-    Write raw bytes into a WAV's sample LSBs, with no magic header or length field.
+    Write raw bytes into audio sample LSBs and save a PCM WAV.
     With order_key the bits are scattered across the samples in a token-secret order.
     Output is forced to .wav. Returns the output path.
     """
     from stego_engine import _permutation
-    params, samples = _read_wav(carrier_path)
+    params, samples = _read_audio_carrier(carrier_path)
     if len(blob) > samples.size // 8:
         raise ValueError(
             f"Carrier audio is too small.\n"
@@ -123,15 +150,18 @@ def read_lsb_all_wav(stego_path: str, order_key: bytes | None = None) -> bytes:
 
 def get_audio_info(path: str) -> dict:
     """Metadata for the UI capacity display (mirrors stego_engine.get_image_info)."""
-    with _open_wav(path) as w:
-        p = w.getparams()
-    cap = wav_capacity_bytes(path)
-    seconds = p.nframes / p.framerate if p.framerate else 0
+    if Path(path).suffix.lower() == ".wav":
+        with _open_wav(path) as w:
+            channels, width, rate, frames, _, _ = w.getparams()
+    else:
+        with _open_encoded_audio(path) as audio:
+            channels, width, rate, frames = audio.channels, 2, audio.samplerate, audio.frames
+    cap = frames * channels // 8 if width in _DTYPE else 0
     return {
-        "channels":       p.nchannels,
-        "sample_rate":    p.framerate,
-        "sample_width":   p.sampwidth * 8,
-        "duration_s":     seconds,
+        "channels":       channels,
+        "sample_rate":    rate,
+        "sample_width":   width * 8,
+        "duration_s":     frames / rate if rate else 0,
         "capacity_bytes": cap,
         "capacity_kb":    cap / 1024,
     }

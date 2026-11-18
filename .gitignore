@@ -55,6 +55,7 @@ pip-log.txt
 DF Main Doc.docx
 Project Assignment.html
 Python/token_config.json
+Python/.token-ble.lock
 Python/envstego_settings.ini
 
 # ─── Local dev / verification tools (not part of the app) ─────

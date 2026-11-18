@@ -17,6 +17,14 @@ from pathlib import Path
 if getattr(sys, "frozen", False):
     os.chdir(os.path.dirname(sys.executable))
 
+if "--vault-worker" in sys.argv:
+    import vault_worker
+    sys.exit(vault_worker.main())
+
+if "--jpeg-worker" in sys.argv:
+    import stego_engine
+    sys.exit(stego_engine._jpeg_worker_main())
+
 from PyQt6.QtWidgets import QApplication, QMessageBox
 from PyQt6.QtGui import QIcon
 from PyQt6.QtCore import Qt
@@ -71,13 +79,6 @@ def main():
     )
 
     app = QApplication(sys.argv)
-    # The vault viewer decodes via Pillow and downscales, but lift Qt's default 256 MB
-    # image-allocation guard so the fallback loader never rejects a large local image.
-    try:
-        from PyQt6.QtGui import QImageReader
-        QImageReader.setAllocationLimit(0)
-    except Exception:
-        pass
     app.setApplicationName("EnvStego")
     app.setOrganizationName("SIT-ICT3215")
     app.setStyle("Fusion")          # Fusion base makes dark theme consistent

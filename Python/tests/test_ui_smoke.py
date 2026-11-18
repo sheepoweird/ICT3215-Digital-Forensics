@@ -15,6 +15,7 @@ Run from the Python/ directory:
 """
 
 import os
+from functools import partial
 import sys
 import tempfile
 import time
@@ -31,8 +32,8 @@ if str(APP_DIR) not in sys.path:
 import numpy as np
 import pytest
 from PIL import Image
-from PyQt6.QtCore import QEventLoop, QSettings
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtCore import QEventLoop, QSettings, QTimer
+from PyQt6.QtWidgets import QApplication, QMessageBox, QTextEdit
 
 import crypto_engine
 import token_comms as tc
@@ -112,6 +113,10 @@ def win(tmp_path_factory):
     mp.setattr(ui_main, "list_serial_ports", lambda: [("COM9", "USB-SERIAL CH340 (COM9)")])
     mp.setattr(crypto_engine, "request_env_key",
                lambda h: run_transaction(SIM, SIM.auth_key, SIM.token_id, tc.OP_DERIVE, h))
+    from test_vault_v2 import Token
+    vault_key = Token()
+    mp.setattr(ui_main.V, "create_vault", partial(ui_main.V.create_vault, key_provider=vault_key))
+    mp.setattr(ui_main.V, "unlock_env", partial(ui_main.V.unlock_env, key_provider=vault_key))
     # Modal dialogs would block an offscreen run: answer every question "Yes"
     mp.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
     for name in ("warning", "information", "critical"):
@@ -383,6 +388,7 @@ def test_multi_image_split_round_trip(win):
     win._apply_selection(DEVICE_BOUND, "builtin:Device-bound")
     win._enc_payload.set_path(str(payload))
     win._enc_split.setChecked(True)
+    win._enc_carriers.clear()
     for c in carriers:
         win._enc_carriers._add_paths(c)      # test helper: add without a dialog
     out_dir = win.files / "split_out"
@@ -394,14 +400,13 @@ def test_multi_image_split_round_trip(win):
     assert idle(win)
     assert "split" in win._enc_result.text()
     written = sorted(str(p) for p in out_dir.glob("*_stego.png"))
-    assert len(written) >= 2                  # spilled across multiple carriers
+    assert len(written) == 3
+    assert win._dec_split.isChecked()
+    assert set(win._dec_stegos.paths()) == set(written)
 
     # Decrypt the whole set
     rec = win.files / "split_rec"
     rec.mkdir()
-    win._dec_split.setChecked(True)
-    for p in written:
-        win._dec_stegos._add_paths(p)
     win._dec_output.set_path(str(rec))
     win._apply_selection(set(), None)         # v3 auto-selects from header
     win._do_decrypt()
@@ -419,13 +424,19 @@ def test_multi_image_split_round_trip(win):
     win._enc_output.set_path(str(win.files / "carrier_stego.png"))
 
 
-def test_audio_wav_carrier_round_trip(win):
-    # Hide a file inside a WAV carrier and recover it through the real UI flow.
+@pytest.mark.parametrize("extension", ["wav", "mp3"])
+def test_audio_carrier_round_trip(win, extension):
+    # Hide a file inside an audio carrier and recover it through the real UI flow.
     payload = win.files / "audio_secret.txt"
     msg = "hidden inside audio\n" * 20
     payload.write_text(msg, encoding="utf-8")
-    carrier = win.files / "song.wav"
-    _make_wav(carrier)
+    carrier = win.files / f"song.{extension}"
+    if extension == "mp3":
+        import soundfile
+
+        soundfile.write(carrier, np.zeros(16000, dtype=np.int16), 16000)
+    else:
+        _make_wav(carrier)
 
     win._apply_selection(DEVICE_BOUND, "builtin:Device-bound")
     win._enc_payload.set_path(str(payload))
@@ -440,7 +451,7 @@ def test_audio_wav_carrier_round_trip(win):
     assert "successfully" in win._enc_result.text()
     assert os.path.isfile(out_wav)
 
-    rec = win.files / "audio_rec"
+    rec = win.files / f"audio_rec_{extension}"
     rec.mkdir()
     win._dec_stego.set_path(out_wav)
     win._dec_output.set_path(str(rec))
@@ -471,6 +482,7 @@ def test_single_shard_decrypt_suggests_split_mode(win):
     win._apply_selection(DEVICE_BOUND, "builtin:Device-bound")
     win._enc_payload.set_path(str(payload))
     win._enc_split.setChecked(True)
+    win._enc_carriers.clear()
     for c in carriers:
         win._enc_carriers._add_paths(c)
     out_dir = win.files / "probe_out"
@@ -496,6 +508,147 @@ def test_single_shard_decrypt_suggests_split_mode(win):
     win._enc_payload.set_path(str(win.files / "secret.txt"))
     win._enc_carrier.set_path(str(win.files / "carrier.png"))
     win._enc_output.set_path(str(win.files / "carrier_stego.png"))
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_small_split_outputs_all_carriers_and_hands_complete_set_to_decrypt(win, tmp_path, mixed):
+    payload = tmp_path / "small.txt"
+    content = b"A small payload must still be split across every chosen carrier."
+    payload.write_bytes(content)
+    carriers = []
+    for index in range(3):
+        extension = ("jpg", "webp", "wav")[index] if mixed else "png"
+        path = tmp_path / f"carrier_{index}.{extension}"
+        if extension == "wav":
+            _make_wav(path)
+        else:
+            pixels = np.random.default_rng(index).integers(0, 256, (200, 200, 3), dtype=np.uint8)
+            Image.fromarray(pixels).save(path)
+        carriers.append(str(path))
+    output, recovered = tmp_path / "outputs", tmp_path / "recovered"
+    output.mkdir()
+    recovered.mkdir()
+    try:
+        win._apply_selection(DEVICE_BOUND, "builtin:Device-bound")
+        win._enc_payload.set_path(str(payload))
+        win._enc_split.setChecked(True)
+        win._enc_carriers.clear()
+        win._enc_carriers._add_paths(*carriers)
+        win._enc_out_dir.set_path(str(output))
+        win._do_encrypt()
+        assert idle(win)
+        written = {os.path.normpath(str(path)) for path in output.iterdir()}
+        assert len(written) == 3, win._enc_result.text()
+        assert win._dec_split.isChecked()
+        assert set(win._dec_stegos.paths()) == written  # No manual handoff required.
+        win._dec_output.set_path(str(recovered))
+        win._apply_selection(set(), None)
+        win._do_decrypt()
+        assert idle(win)
+        assert (recovered / payload.name).read_bytes() == content
+
+        # A lone piece of a real multi-piece set gives an actionable missing-set error.
+        win._dec_stegos.clear()
+        win._dec_stegos._add_paths(next(iter(written)))
+        assert win._dec_btn.isEnabled()
+        win._do_decrypt()
+        assert idle(win)
+        assert "Incomplete set" in win._dec_result.text()
+        assert len(list(recovered.iterdir())) == 1
+
+        # A later single encryption replaces the old split selection and mode.
+        win._apply_selection(DEVICE_BOUND, "builtin:Device-bound")
+        win._enc_split.setChecked(False)
+        win._enc_carrier.set_path(carriers[0])
+        single = tmp_path / ("single.jpg" if mixed else "single.png")
+        win._enc_output.set_path(str(single))
+        win._do_encrypt()
+        assert idle(win)
+        assert single.exists()
+        assert not win._dec_split.isChecked()
+        assert win._dec_stego.path() == str(single)
+        assert win._dec_stegos.count() == 0
+    finally:
+        win._enc_split.setChecked(False)
+        win._dec_split.setChecked(False)
+        win._enc_carriers.clear()
+        win._dec_stegos.clear()
+        win._apply_selection(DEVICE_BOUND, "builtin:Device-bound")
+        win._dec_stego.set_path(str(win.files / "carrier_stego.png"))
+        win._enc_payload.set_path(str(win.files / "secret.txt"))
+        win._enc_carrier.set_path(str(win.files / "carrier.png"))
+        win._enc_output.set_path(str(win.files / "carrier_stego.png"))
+
+
+@pytest.mark.parametrize("as_split_set", [False, True])
+def test_old_one_piece_split_output_is_recoverable(win, tmp_path, as_split_set):
+    selected = [signal for signal in fake_collect() if signal.id in DEVICE_BOUND]
+    env_key, _ = crypto_engine.derive_env_key(selected)
+    index_key = crypto_engine.request_index_key()
+    name, content = "previous_split.txt", b"recover the one file generated by the old splitter"
+    salt, nonce, ciphertext = crypto_engine.encrypt_payload(
+        crypto_engine.pack_payload(name, content), env_key, crypto_engine.PAYLOAD_AAD)
+    blob = crypto_engine.pack_header(index_key, salt, nonce, len(ciphertext), sorted(DEVICE_BOUND)) + ciphertext
+    tag = crypto_engine.pack_shard_tag(index_key, crypto_engine.new_manifest_id(), 0, 1, len(blob))
+    carrier, stego = tmp_path / "carrier.png", tmp_path / "old_single_piece.png"
+    _make_carrier(carrier)
+    ui_main.embed_blob(str(carrier), tag + blob, str(stego), order_key=index_key)
+    output = tmp_path / "recovered"
+    output.mkdir()
+    try:
+        win._dec_split.setChecked(as_split_set)
+        win._dec_stegos.clear()
+        win._dec_stegos._add_paths(str(stego))
+        win._dec_stego.set_path(str(stego))
+        win._dec_output.set_path(str(output))
+        win._apply_selection(set(), None)
+        win._do_decrypt()
+        assert idle(win)
+        assert (output / name).read_bytes() == content, win._dec_result.text()
+    finally:
+        win._dec_split.setChecked(False)
+        win._dec_stegos.clear()
+        win._apply_selection(DEVICE_BOUND, "builtin:Device-bound")
+        win._dec_stego.set_path(str(win.files / "carrier_stego.png"))
+
+
+@pytest.mark.parametrize("extension", ["jpg", "webp", "bmp", "tiff"])
+def test_native_image_ui_round_trip(win, tmp_path, extension):
+    carrier = tmp_path / f"carrier.{extension}"
+    pixels = np.random.default_rng(30).integers(0, 256, (240, 320, 3), dtype=np.uint8)
+    Image.fromarray(pixels).save(carrier)
+    payload = tmp_path / "document.pdf"
+    content = b"%PDF-1.7\n" + bytes(range(256))
+    payload.write_bytes(content)
+    original = carrier.read_bytes()
+    output = tmp_path / f"output.{extension}"
+    recovered = tmp_path / "recovered"
+    recovered.mkdir()
+    try:
+        win._apply_selection(DEVICE_BOUND, "builtin:Device-bound")
+        win._enc_split.setChecked(False)
+        win._enc_payload.set_path(str(payload))
+        win._enc_carrier.set_path(str(carrier))
+        win._enc_output.set_path(str(output))
+        assert win._enc_btn.isEnabled(), win._enc_hint.text()
+        win._do_encrypt()
+        assert idle(win)
+        assert output.exists(), win._enc_result.text()
+        assert carrier.read_bytes() == original
+        assert win._dec_stego.path() == str(output) and not win._dec_split.isChecked()
+        win._dec_output.set_path(str(recovered))
+        win._apply_selection(set(), None)
+        win._do_decrypt()
+        assert idle(win)
+        assert (recovered / payload.name).read_bytes() == content, win._dec_result.text()
+    finally:
+        win._enc_split.setChecked(False)
+        win._dec_split.setChecked(False)
+        win._apply_selection(DEVICE_BOUND, "builtin:Device-bound")
+        win._dec_stego.set_path(str(win.files / "carrier_stego.png"))
+        win._enc_payload.set_path(str(win.files / "secret.txt"))
+        win._enc_carrier.set_path(str(win.files / "carrier.png"))
+        win._enc_output.set_path(str(win.files / "carrier_stego.png"))
 
 
 def test_token_chip_tracks_reachability(win, monkeypatch):
@@ -576,7 +729,7 @@ def test_vault_empty_state_shows_howto(win, tmp_path):
     win._refresh_vault_ui()
 
 
-def test_vault_create_add_open_lock_unlock(win, monkeypatch, tmp_path):
+def test_vault_create_add_list_lock_unlock(win, monkeypatch, tmp_path):
     vdir = tmp_path / "EnvVault"
     win._vault_loc.setText(str(vdir))
     win._apply_selection(DEVICE_BOUND, "builtin:Device-bound")
@@ -609,16 +762,8 @@ def test_vault_create_add_open_lock_unlock(win, monkeypatch, tmp_path):
     assert idle(win)
     assert win._vault.count() == 2 and win._vault_table.rowCount() == 2
 
-    # Open in the in-memory viewer (don't actually exec a modal)
-    opened = {}
-    class FakeViewer:
-        def __init__(self, name, data, parent=None): opened["name"], opened["data"] = name, data
-        def exec(self): return 0
-    monkeypatch.setattr(ui_main, "VaultViewer", FakeViewer)
-    win._vault_table.selectRow(0)
-    win._vault_open_selected()
-    assert idle(win)
-    assert opened == {"name": "secret_note.txt", "data": b"vault body content"}
+    assert not hasattr(win, "_vault_open_btn")
+    assert not hasattr(win._vault, "read_bytes")
 
     # Lock, then unlock again with the token+environment
     win._vault_do_lock("locked for test")
@@ -628,29 +773,6 @@ def test_vault_create_add_open_lock_unlock(win, monkeypatch, tmp_path):
     assert win._vault is not None and win._vault.count() == 2   # both files survive re-unlock
 
 
-def test_vault_viewer_decodes_jpeg(win, tmp_path):
-    # Regression: QPixmap.loadFromData can't decode JPEG without Qt's plugin;
-    # the viewer must fall back to Pillow and show the image, not "can't preview".
-    import io
-    arr = (np.random.rand(60, 80, 3) * 255).astype("uint8")
-    buf = io.BytesIO()
-    Image.fromarray(arr, "RGB").save(buf, format="JPEG")
-    jpeg = buf.getvalue()
-
-    pm = ui_main.VaultViewer._pixmap_from(jpeg)
-    assert pm is not None and not pm.isNull()
-    assert pm.width() == 80 and pm.height() == 60
-
-
-def test_vault_viewer_downscales_huge_images(win):
-    # Regression: a large image must be capped (Qt's 256 MB allocation limit / memory).
-    import io
-    arr = (np.random.rand(600, 9000, 3) * 255).astype("uint8")   # 9000 px wide
-    buf = io.BytesIO()
-    Image.fromarray(arr, "RGB").save(buf, format="PNG")
-    pm = ui_main.VaultViewer._pixmap_from(buf.getvalue())
-    assert pm is not None and not pm.isNull()
-    assert max(pm.width(), pm.height()) <= ui_main.VaultViewer.MAX_DIM
 
 
 def test_vault_auto_locks_when_token_unreachable(win, monkeypatch, tmp_path):
@@ -669,6 +791,128 @@ def test_vault_auto_locks_when_token_unreachable(win, monkeypatch, tmp_path):
     win._vault_heartbeat_tick()
     assert wait_until(lambda: win._vault is None)         # heartbeat thread locks it
     assert "Auto-locked" in win._vault_result.text()
+
+
+def test_vault_ui_export_and_recovery_require_explicit_file_action(win, monkeypatch, tmp_path):
+    vdir, output = tmp_path / "vault", tmp_path / "output"
+    output.mkdir()
+    session, code = ui_main.V.create_vault(str(vdir), bytes(32), bytes(32), ["hw_cpu"])
+    session.add_bytes("document.pdf", b"selected plaintext")
+    win._vault_loc.setText(str(vdir))
+    win._vault = session
+    win._populate_vault_table()
+    win._vault_table.selectRow(0)
+    monkeypatch.setattr(ui_main.QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(ui_main.QFileDialog, "getExistingDirectory", lambda *a, **k: str(output))
+    win._vault_export_selected()
+    assert idle(win)
+    assert (output / "document.pdf").read_bytes() == b"selected plaintext"
+    win._vault_do_lock("test recovery")
+    prompts = []
+
+    def enter_code(*args, **kwargs):
+        prompts.append(args)
+        assert args[-1] == ui_main.QLineEdit.EchoMode.Password
+        return code, True
+
+    monkeypatch.setattr(ui_main.QInputDialog, "getText", enter_code)
+    win._vault_unlock_recovery()
+    assert win._vault.recovery and code not in win._vault.__dict__.values()
+    win._vault_table.selectRow(0)
+    win._vault_export_selected()
+    assert idle(win)
+    assert len(prompts) == 2  # Browsing recovery does not authorize a later export.
+    assert (output / "document (1).pdf").read_bytes() == b"selected plaintext"
+    win._vault_do_lock("test complete")
+
+
+def test_ui_submits_one_export_for_multiple_rows(win, monkeypatch, tmp_path):
+    session, _ = ui_main.V.create_vault(str(tmp_path / "vault"), bytes(32), bytes(32), ["hw_cpu"])
+    blobs = {session.add_bytes(name, name.encode())["blob"] for name in ("one", "two", "three")}
+    win._vault = session
+    win._populate_vault_table()
+    win._vault_table.selectAll()
+    calls = []
+    export_many = session.export_many
+    def export(selection, *args, **kwargs):
+        calls.append(set(selection))
+        return export_many(selection, *args, **kwargs)
+    monkeypatch.setattr(session, "export_many", export)
+    monkeypatch.setattr(ui_main.QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(ui_main.QFileDialog, "getExistingDirectory", lambda *a, **k: str(tmp_path))
+    win._vault_export_selected()
+    assert idle(win)
+    assert calls == [blobs]
+    assert all((tmp_path / name).read_bytes() == name.encode() for name in ("one", "two", "three"))
+    win._vault_do_lock("done")
+
+
+def test_vault_has_no_migration_action(win):
+    assert not hasattr(win, "_vault_upgrade_btn")
+    assert not hasattr(win, "_vault_upgrade")
+
+
+def test_old_heartbeat_result_does_not_cancel_a_file_approval_wait(win):
+    session = object()
+    win._vault = session
+    win._busy = True
+    try:
+        win._on_vault_heartbeat(session, False, "Another Bluetooth operation is in progress")
+        assert win._vault is session
+    finally:
+        win._vault = None
+        win._busy = False
+
+
+
+def test_vault_reports_originals_that_could_not_be_shredded(win, monkeypatch, tmp_path):
+    import winutils
+
+    v, _ = ui_main.V.create_vault(str(tmp_path / "vault"), bytes(32), bytes(32), [])
+    win._vault = v
+    source = tmp_path / "still-plaintext.txt"
+    source.write_bytes(b"sample")
+    monkeypatch.setattr(winutils, "shred_file", lambda _: False)
+    win._vault_add_files([str(source)])
+    assert idle(win)
+    assert source.exists() and v.count() == 1
+    assert "still-plaintext.txt" in win._vault_result.text()
+    assert "Plaintext may remain" in win._vault_result.text()
+    win._vault_do_lock("test complete")
+
+
+
+
+def test_partial_import_updates_reachability_and_lists_outcomes(win, tmp_path):
+    session, _ = ui_main.V.create_vault(str(tmp_path / "vault"), bytes(32), bytes(32), [])
+    win._vault = session
+    win._note_token_result(True)
+    win._on_vault_added(session, ["one", "two", "three"],
+                        [{"shred_status": "shredded"}, {"shred_status": "kept"},
+                         {"error": "Device not found", "unreachable": True}])
+    assert win._token_reachable is False
+    assert "Added 2 file(s)" in win._vault_result.text()
+    assert "Device not found" in win._vault_result.text()
+    win._vault_do_lock("test done")
+
+
+def test_vault_heartbeat_retries_only_transient_errors(monkeypatch):
+    failures = iter([tc.TokenTransientError("temporary"), None, tc.TokenAuthError("wrong token")])
+    attempts, results = [], []
+
+    def ping():
+        attempts.append(True)
+        failure = next(failures)
+        if failure is not None:
+            raise failure
+
+    monkeypatch.setattr(ui_main, "ping_token", ping)
+    worker = ui_main.VaultHeartbeatWorker()
+    worker.result.connect(lambda ok, msg: results.append((ok, msg)))
+    worker.run()
+    worker.run()
+    assert len(attempts) == 3
+    assert results == [(True, ""), (False, "wrong token")]
 
 
 def test_multi_picker_drop_filters_non_carriers(win):

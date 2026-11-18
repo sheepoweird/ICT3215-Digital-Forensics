@@ -1,128 +1,35 @@
-# Protecting the master secret: Flash Encryption & Secure Boot
+# ESP32 storage and boot protection status
 
-**Status: guide only — nothing here is enabled automatically.** These steps burn
-one-time fuses (eFuses) on the ESP32. They are **irreversible** and can brick the
-board. Read the whole page first, and ideally practise on a spare ESP32, not your
-only token.
+**The supplied Arduino firmware does not provision NVS encryption, flash
+encryption or Secure Boot. Vault v2 does not change this.** Firmware build success
+does not establish protection against physical token theft.
 
----
+## What remains exposed
 
-## Why this matters for EnvStego
+The master secret and pairing credential are stored through Arduino Preferences
+in NVS. With the current development configuration, a physical flash read can
+expose them. Possession of the master secret bypasses token-side key approval.
+Vault recovery codes are an independent route to recovery.
 
-The token's `master_secret` is stored in the NVS partition in the ESP32's flash
-**in clear**. Anyone who physically holds the token can read the whole flash out
-over USB in about a minute:
+## Correction to the previous guide
 
-```
-esptool.py --port COM3 read_flash 0 0x400000 dump.bin
-# the 32-byte master secret is somewhere in the NVS region of dump.bin
-```
+Enabling flash encryption alone does **not** encrypt an ordinary NVS partition.
+NVS uses a separate encryption mechanism and key partition. Adding a preprocessor
+flag to an Arduino application does not configure its prebuilt bootloader or
+provision that storage scheme. The earlier recipe claiming otherwise has been
+removed. See Espressif's [flash-encryption restrictions](https://docs.espressif.com/projects/esp-idf/en/v4.4.7/esp32/security/flash-encryption.html)
+and [NVS encryption configuration](https://docs.espressif.com/projects/esp-idf/en/v4.4.7/esp32/api-reference/storage/nvs_flash.html#nvs-encryption).
 
-With that secret and the seized laptop, every file encrypted with the token can be
-rebuilt — the environment binding and the auth key no longer matter. This is the
-single biggest weakness against a **confiscated token**.
+## Work needed for a hardened device
 
-**Flash Encryption** encrypts the entire flash (firmware *and* NVS) with a key that
-lives only in an eFuse and can never be read back. A flash dump then yields only
-ciphertext. **Secure Boot** additionally refuses to run firmware that isn't signed
-with your key, so an attacker can't flash a malicious reader.
+Build and validate a compatible bootloader, partition table and application with
+the intended security configuration. Provision encrypted NVS and its protected
+keys, use Secure Boot to control firmware authenticity, and select UART/JTAG
+restrictions appropriate to the exact chip revision and update process. The
+current source uses Arduino APIs; moving to an ESP-IDF build requires integration
+work and has not been validated as an unchanged-source port.
 
----
-
-## The two modes (choose carefully)
-
-| Mode | Re-flashing | Use when |
-|------|-------------|----------|
-| **Development** | Still allowed (limited number of times) over USB with the `--encrypt` flag | Testing; recommended first |
-| **Release** | **Permanently disabled** over USB; updates only via signed OTA | Final build only |
-
-Start in **development mode**. Only move to release mode for the token you actually
-carry, once everything works.
-
----
-
-## Prerequisites
-
-- A **stable-booting** token (the brownout fix is already in `main.cpp`).
-- A **full backup** of the current firmware and NVS *before* you start — once
-  encryption is on you cannot read the plain flash again:
-  ```
-  esptool.py --port COM3 read_flash 0 0x400000 backup_before_encryption.bin
-  ```
-- `espefuse.py` and `esptool.py` (bundled with PlatformIO:
-  `C:\Users\<you>\.platformio\packages\tool-esptoolpy\`).
-
----
-
-## Step 1 — Enable flash encryption in the build (PlatformIO)
-
-The Arduino framework needs a custom `sdkconfig`/menuconfig, which PlatformIO drives
-through an ESP-IDF build. The simplest path on the ESP32-CAM is to build the
-bootloader and app with flash encryption turned on and let the **first encrypted
-boot** generate the key on-device.
-
-Add a dedicated environment to `platformio.ini` (kept separate so the normal build
-is untouched):
-
-```ini
-[env:esp32cam_encrypted]
-extends = env:esp32cam
-build_flags =
-    ${env:esp32cam.build_flags}
-    -DCONFIG_SECURE_FLASH_ENC_ENABLED=1
-board_build.partitions = default.csv
-; Development mode: the key is generated on the device at first boot and
-; re-flashing stays possible with `--encrypt`.
-```
-
-> Note: full flash-encryption support with the Arduino core usually means switching
-> the build to the ESP-IDF framework, or using `idf.py menuconfig` →
-> *Security features → Enable flash encryption on boot (Development)*. The
-> EnvStego firmware compiles unchanged under ESP-IDF; only the build wrapper differs.
-
-## Step 2 — First encrypted flash
-
-```
-esptool.py --port COM3 --chip esp32 write_flash 0x1000 bootloader.bin \
-           0x8000 partitions.bin 0x10000 firmware.bin
-```
-
-On the **first boot** the chip generates the flash-encryption key in an eFuse,
-encrypts the flash in place, and reboots. From then on the master secret in NVS is
-stored encrypted.
-
-## Step 3 — Verify
-
-```
-esptool.py --port COM3 read_flash 0 0x400000 dump_after.bin
-```
-
-Search `dump_after.bin` for the token's old `master_secret` bytes from your backup —
-they must **not** appear. The flash should look like random data.
-
-## Step 4 (optional) — Secure Boot v2
-
-Only after flash encryption works:
-
-1. Generate a signing key and keep it offline:
-   `espsecure.py generate_signing_key --version 2 secure_boot_signing_key.pem`
-2. Enable *Secure Boot v2* in menuconfig and rebuild; the bootloader is signed.
-3. The first secure boot burns the public-key digest into eFuses. After that the
-   chip runs only firmware signed with your key.
-
----
-
-## Re-pairing after encryption
-
-Flash encryption does **not** erase NVS, so the existing pairing and master secret
-survive — your already-encrypted files stay decryptable. If you instead do a clean
-erase + encrypted flash, the token is unpaired and you must pair again (a new master
-secret means old files are lost, exactly like a factory reset).
-
-## Risks summary
-
-- **Irreversible.** Burned eFuses cannot be un-burned.
-- **Bricking.** A wrong partition offset or a power loss mid-encryption can leave an
-  unbootable board.
-- **Release mode ends USB flashing.** Keep a development-mode token for testing.
-- Always keep the pre-encryption backup until you have confirmed the token works.
+Test provisioning, retained credentials, existing-file decryption, updates and
+interrupted power on a spare board before modifying the only token holding real
+data. eFuse changes can be irreversible. This repository currently provides no
+verified provisioning command sequence; no fuses were changed for vault v2.

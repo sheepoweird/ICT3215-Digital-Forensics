@@ -1,8 +1,8 @@
 """
 EnvStego - multi_image.py
-Split one v3 payload blob across several PNG carriers, and rejoin it.
+Split a v3 payload across image or audio carriers and rejoin the output files.
 
-A payload too large for a single carrier is sharded across a set of images.
+A payload is sharded across every usable selected carrier, even if it fits in one.
 Each carrier stores a token-encrypted shard tag (which set it belongs to, its
 position and its length) followed by its slice of the blob. Reassembly needs the
 token (to read the tags) and every shard of the set; nothing on disk marks the
@@ -36,40 +36,53 @@ def total_capacity(carriers: list[str]) -> int:
 def split_embed(index_key: bytes, blob: bytes, carriers: list[str],
                 output_paths: list[str], match_timestamps: bool = False) -> list[str]:
     """
-    Embed `blob` across `carriers`, writing one stego PNG per used carrier.
+    Embed `blob` across every usable carrier, writing a stego PNG or WAV per piece.
 
-    Carriers are filled in order; a carrier too small to hold even one byte after
-    its tag is skipped. Returns the list of output paths actually written.
+    A carrier too small to hold even one byte after its tag is skipped. At least
+    two usable carriers are required, even if the blob fits in one. Returns the
+    list of output paths actually written, with a nonempty piece in each.
     Raises ValueError if the carriers cannot hold the whole blob.
     """
     if len(carriers) != len(output_paths):
         raise ValueError("Each carrier needs a matching output path.")
     if len(carriers) < 2:
-        raise ValueError("Multi-image split needs at least two carrier images.")
+        raise ValueError("Split mode needs at least two carrier files.")
 
     caps = [usable_capacity(c) for c in carriers]
+    usable = [(carrier, cap, outp) for carrier, cap, outp in zip(carriers, caps, output_paths) if cap > 0]
+    if len(usable) < 2:
+        raise ValueError("Split mode needs at least two usable carriers. Replace carriers too small for a shard tag.")
+    if len(blob) < len(usable):
+        raise ValueError("The payload is too small for a nonempty piece in every carrier. Choose fewer carriers.")
     if sum(max(0, c) for c in caps) < len(blob):
         raise ValueError(
-            f"The chosen images cannot hold this payload.\n"
+            f"The chosen carriers cannot hold this payload.\n"
             f"  Payload needs:   {len(blob):,} bytes\n"
-            f"  Images hold:     {sum(max(0, c) for c in caps):,} bytes total\n"
-            f"  Add more or larger carrier images."
+            f"  Carriers hold:   {sum(max(0, c) for c in caps):,} bytes total\n"
+            f"  Add more or larger carrier files."
         )
 
-    # Assign slices sequentially, skipping carriers with no usable room.
+    # Share bytes across all usable carriers. Prefer equal pieces, but put enough
+    # in this carrier that the remaining carriers can still hold the remainder.
     plan: list[tuple[str, str, bytes]] = []
-    remaining = blob
-    for carrier, cap, outp in zip(carriers, caps, output_paths):
-        if not remaining:
-            break
-        if cap <= 0:
-            continue
-        take = min(cap, len(remaining))
-        plan.append((carrier, outp, remaining[:take]))
-        remaining = remaining[take:]
-    if remaining:
+    offset = 0
+    later_capacity = sum(cap for _, cap, _ in usable)
+    for index, (carrier, cap, outp) in enumerate(usable):
+        remaining = len(blob) - offset
+        count = len(usable) - index
+        later_capacity -= cap
+        equal_share = (remaining + count - 1) // count
+        take = min(cap, max(equal_share, remaining - later_capacity))
+        plan.append((carrier, outp, blob[offset:offset + take]))
+        offset += take
+    if offset != len(blob):
         # Shouldn't happen after the capacity check, but guard anyway.
         raise ValueError("Internal error: payload did not fit after planning.")
+
+    sources = {Path(path).resolve() for path in carriers}
+    targets = {media.stego_output_path(carrier, path).resolve() for carrier, path, _ in plan}
+    if len(targets) != len(plan) or targets & sources:
+        raise ValueError("Choose distinct output files that differ from the carrier files.")
 
     total = len(plan)
     manifest = ce.new_manifest_id()
@@ -139,9 +152,11 @@ def join_extract(index_key: bytes, stego_paths: list[str]) -> bytes:
 
 
 def suggest_outputs(carriers: list[str], out_dir: str) -> list[str]:
-    """Default stego output names for a set: <out_dir>/<carrier stem>_stego.png (de-duplicated)."""
+    """Suggest unique PNG or WAV output names without replacing a source carrier."""
     out: list[str] = []
-    seen: set[str] = set()
+    directory = Path(out_dir).resolve()
+    sources = [Path(carrier).resolve() for carrier in carriers]
+    seen = {source.name.lower() for source in sources if source.parent == directory}
     for c in carriers:
         stem = Path(c).stem
         suffix = media.output_suffix(c)       # .png or .wav, matching the carrier

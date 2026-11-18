@@ -22,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import soundfile
 from cryptography.exceptions import InvalidTag
 from PIL import Image
 
@@ -181,6 +182,51 @@ def test_split_and_join_round_trip(tmp_path):
     assert recovered == blob
 
 
+def test_small_payload_is_split_across_every_selected_carrier(tmp_path):
+    carriers = _carriers(tmp_path, [(200, 200)] * 3)
+    blob = b"small payload that fits inside the first carrier"
+    written = mi.split_embed(INDEX_KEY, blob, carriers, _outs(tmp_path, carriers))
+    assert len(written) == 3
+    tags = [mi.inspect_shard(INDEX_KEY, path) for path in written]
+    assert [tag[1] for tag in tags] == [0, 1, 2]
+    assert all(tag[2] == 3 and tag[3] > 0 for tag in tags)
+    assert mi.join_extract(INDEX_KEY, written[::-1]) == blob
+    with pytest.raises(ValueError, match="Incomplete set"):
+        mi.join_extract(INDEX_KEY, written[:1])
+
+
+@pytest.mark.parametrize("sizes", [[(300, 300), (24, 24), (24, 24)],
+                                    [(24, 24), (300, 300), (24, 24)],
+                                    [(24, 24), (24, 24), (300, 300)]])
+def test_split_respects_unequal_capacities_and_uses_every_carrier(tmp_path, sizes):
+    carriers = _carriers(tmp_path, sizes)
+    blob = os.urandom(5000)
+    written = mi.split_embed(INDEX_KEY, blob, carriers, _outs(tmp_path, carriers))
+    assert len(written) == len(carriers)
+    lengths = [mi.inspect_shard(INDEX_KEY, path)[3] for path in written]
+    assert all(0 < length <= mi.usable_capacity(carrier) for length, carrier in zip(lengths, carriers))
+    assert mi.join_extract(INDEX_KEY, written) == blob
+
+
+def test_split_refuses_to_make_only_one_usable_piece(tmp_path):
+    carriers = _carriers(tmp_path, [(200, 200), (8, 8)])
+    outputs = _outs(tmp_path, carriers)
+    with pytest.raises(ValueError, match="at least two usable"):
+        mi.split_embed(INDEX_KEY, b"small", carriers, outputs)
+    assert not any(Path(path).exists() for path in outputs)
+
+
+@pytest.mark.parametrize("size", [3, 4, "full"])
+def test_split_nonempty_pieces_at_minimum_and_full_capacity(tmp_path, size):
+    carriers = _carriers(tmp_path, [(24, 24), (32, 32), (64, 64)])
+    length = mi.total_capacity(carriers) if size == "full" else size
+    blob = os.urandom(length)
+    written = mi.split_embed(INDEX_KEY, blob, carriers, _outs(tmp_path, carriers))
+    assert len(written) == 3
+    assert all(mi.inspect_shard(INDEX_KEY, path)[3] > 0 for path in written)
+    assert mi.join_extract(INDEX_KEY, written) == blob
+
+
 def test_join_is_order_independent(tmp_path):
     carriers = _carriers(tmp_path, [(220, 220), (220, 220), (220, 220)])
     blob = os.urandom(30_000)
@@ -303,6 +349,106 @@ def test_dispatcher_embed_extract_wav(tmp_path):
     blob = bytes((i * 7) % 256 for i in range(4000))
     out = media.embed_blob(wav, blob, str(tmp_path / "o.wav"))
     assert media.extract_lsb_bytes(out, len(blob)) == blob
+
+
+@pytest.mark.parametrize("extension, file_format, subtype", [
+    ("mp3", "MP3", "MPEG_LAYER_III"),
+    ("flac", "FLAC", "PCM_16"),
+    ("ogg", "OGG", "VORBIS"),
+    ("opus", "OGG", "OPUS"),
+    ("aiff", "AIFF", "PCM_16"),
+])
+def test_new_audio_carriers_convert_to_wav(tmp_path, extension, file_format, subtype):
+    carrier = tmp_path / f"track.{extension}"
+    rate = 48000
+    samples = np.sin(np.arange(rate // 2) * (2 * np.pi * 440 / rate)) * 0.3
+    soundfile.write(carrier, np.column_stack((samples, samples)), rate, format=file_format, subtype=subtype)
+    original = carrier.read_bytes()
+    blob = bytes(range(256)) * 2
+
+    info = media.carrier_info(carrier)
+    output = media.embed_blob(carrier, blob, str(tmp_path / f"output.{extension}"), order_key=INDEX_KEY)
+    assert Path(output).suffix == ".wav"
+    assert info["capacity_bytes"] == media.lsb_capacity_bytes(output)
+    with wave.open(output, "rb") as pcm:
+        assert (pcm.getnchannels(), pcm.getsampwidth(), pcm.getframerate()) == (2, 2, rate)
+    assert media.extract_lsb_bytes(output, len(blob), order_key=INDEX_KEY) == blob
+    assert carrier.read_bytes() == original
+
+
+@pytest.mark.parametrize("extension", ["jpg", "webp", "bmp", "tiff", "gif"])
+def test_image_carriers_keep_supported_native_format(tmp_path, extension):
+    carrier = tmp_path / f"photo.{extension}"
+    pixels = np.random.default_rng(3).integers(0, 256, (120, 160, 3), dtype=np.uint8)
+    Image.fromarray(pixels).save(carrier)
+    original = carrier.read_bytes()
+    blob = bytes(range(256)) * 2
+
+    info = media.carrier_info(carrier)
+    output = media.embed_blob(carrier, blob, str(tmp_path / f"output.{extension}"), order_key=INDEX_KEY)
+    assert Path(output).suffix == (".png" if extension == "gif" else f".{extension}")
+    assert info["capacity_bytes"] == media.lsb_capacity_bytes(output)
+    assert media.extract_lsb_bytes(output, len(blob), order_key=INDEX_KEY) == blob
+    assert carrier.read_bytes() == original
+
+
+@pytest.mark.parametrize("mode", ["RGB", "RGBA"])
+def test_optimized_png_preserves_pixels_and_payload_with_smaller_output(tmp_path, mode):
+    width, height = 640, 480
+    horizontal = np.tile(np.arange(width, dtype=np.uint16) % 256, (height, 1)).astype(np.uint8)
+    vertical = np.tile((np.arange(height, dtype=np.uint16) % 256)[:, None], (1, width)).astype(np.uint8)
+    pixels = np.dstack((horizontal, vertical, np.full_like(horizontal, 100)))
+    if mode == "RGBA":
+        pixels = np.dstack((pixels, np.full_like(horizontal, 123)))
+    carrier = tmp_path / "carrier.png"
+    Image.fromarray(pixels).save(carrier)
+    blob = bytes(range(256))
+    output = media.embed_blob(str(carrier), blob, str(tmp_path / "optimized.png"), order_key=INDEX_KEY)
+    # Compare identical stego pixels using the old encoder settings.
+    weak = tmp_path / "old_compression.png"
+    with Image.open(output) as image:
+        optimized_pixels = np.array(image)
+        image.save(weak, format="PNG", optimize=False, compress_level=1)
+    with Image.open(weak) as image:
+        assert np.array_equal(np.array(image), optimized_pixels)
+    assert Path(output).stat().st_size < weak.stat().st_size
+    assert media.extract_lsb_bytes(output, len(blob), order_key=INDEX_KEY) == blob
+    assert np.max(np.abs(optimized_pixels[..., :3].astype(int) - pixels[..., :3].astype(int))) <= 1
+    if mode == "RGBA":
+        assert np.array_equal(optimized_pixels[..., 3], pixels[..., 3])
+
+
+def test_jpeg_orientation_and_webp_transparency_are_preserved(tmp_path):
+    jpeg = tmp_path / "rotated.jpg"
+    exif = Image.Exif()
+    exif[274] = 6  # rotate 90 degrees in viewers
+    pixels = np.random.default_rng(4).integers(0, 256, (60, 80, 3), dtype=np.uint8)
+    Image.fromarray(pixels).save(jpeg, exif=exif)
+    output = media.embed_blob(jpeg, b"sample", str(tmp_path / "rotated_stego.jpg"))
+    assert media.carrier_info(jpeg)["summary"] == "60 × 80 px"
+    with Image.open(output) as image:
+        assert image.size == (80, 60) and image.getexif().get(274) == 6
+    assert media.extract_lsb_bytes(output, 6) == b"sample"
+
+    webp = tmp_path / "transparency.webp"
+    Image.new("RGBA", (80, 60), (10, 20, 30, 93)).save(webp, lossless=True)
+    output = media.embed_blob(webp, b"sample", str(tmp_path / "transparency_stego.webp"))
+    with Image.open(output) as image:
+        assert image.getchannel("A").getextrema() == (93, 93)
+    assert media.extract_lsb_bytes(output, 6) == b"sample"
+
+
+def test_mixed_jpeg_mp3_shards_round_trip(tmp_path):
+    jpeg = tmp_path / "photo.jpg"
+    pixels = np.random.default_rng(5).integers(0, 256, (64, 64, 3), dtype=np.uint8)
+    Image.fromarray(pixels).save(jpeg)
+    mp3 = tmp_path / "audio.mp3"
+    soundfile.write(mp3, np.zeros(16000, dtype=np.int16), 16000)
+    carriers = [str(jpeg), str(mp3)]
+    payload = os.urandom(200)  # Fits the JPEG alone; split mode must still write both.
+    written = mi.split_embed(INDEX_KEY, payload, carriers, mi.suggest_outputs(carriers, str(tmp_path)))
+    assert [Path(path).suffix for path in written] == [".jpg", ".wav"]
+    assert mi.join_extract(INDEX_KEY, written[::-1]) == payload
 
 
 def test_scatter_order_round_trips_and_hides_location(tmp_path):

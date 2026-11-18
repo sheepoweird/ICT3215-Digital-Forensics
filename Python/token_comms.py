@@ -2,7 +2,7 @@
 EnvStego - token_comms.py
 Communication with the 3T hardware token (ESP32).
 
-Phase 1 — USB pairing (trusted wired channel):
+Phase 1 — USB pairing (physical confirmation, with proof for re-pairing):
     The token generates a master secret that never leaves it, plus an auth key
     and token ID that it hands to this PC. The auth key is stored encrypted
     with Windows DPAPI so it is bound to the current Windows user account.
@@ -20,12 +20,13 @@ The byte layout must match "ESP32 Files/main.cpp".
 import asyncio
 import base64
 import concurrent.futures
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 import hashlib
 import hmac
 import json
 import os
-import platform
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,7 @@ import serial.tools.list_ports
 from bleak import BleakClient
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from winutils import atomic_write_text, process_file_lock
 
 
 def _app_dir() -> Path:
@@ -53,6 +55,8 @@ MSG_REQUEST, MSG_RESPONSE = 0x20, 0x21
 MSG_ERROR = 0x7F
 
 OP_DERIVE, OP_PING = 0x01, 0x02
+OP_VAULT_OPEN, OP_VAULT_MINT, OP_EXPORT_BEGIN, OP_EXPORT_NEXT = 0x13, 0x14, 0x15, 0x16
+OP_IMPORT_BATCH, OP_EXPORT_CHILD = 0x17, 0x18
 
 NONCE_LEN, TOKEN_ID_LEN, IV_LEN, TAG_LEN, HASH_LEN = 16, 16, 12, 16, 32
 CHALLENGE_LEN = 1 + NONCE_LEN + TOKEN_ID_LEN
@@ -64,6 +68,8 @@ TOKEN_ERRORS = {
     0x03: "Token rejected this PC's credentials. The pairing is stale or was replaced — pair again over USB.",
     0x04: "Token rejected a malformed request. Check the firmware version matches this app.",
     0x05: "Token is locked out after repeated failed requests. Wait 30 seconds and retry.",
+    0x06: "The token could not complete the request. Try again.",
+    0x07: "Vault access was not confirmed on the token within 60 seconds.",
 }
 
 
@@ -77,6 +83,14 @@ class TokenNotPairedError(TokenError):
 
 class TokenAuthError(TokenError):
     """The device answered but could not prove it is the paired token."""
+
+
+class TokenTransientError(TokenError):
+    """The connection failed or timed out without a token identity failure."""
+
+
+class TokenConfirmationPending(TokenError):
+    """An authenticated response is waiting for a physical IO0 confirmation."""
 
 
 # ── Credential storage (Windows DPAPI) ───────────────────────────
@@ -127,12 +141,6 @@ def _unprotect_secret(blob: str, scheme: str) -> bytes:
     return raw
 
 
-def get_host_id() -> str:
-    """Derives a stable ID for this PC. Used by the token to refuse re-binding to other hosts."""
-    raw_id = platform.node() + platform.system()
-    return hashlib.sha256(raw_id.encode()).hexdigest()[:16].upper()
-
-
 def load_config() -> dict | None:
     """Returns the saved pairing, or None if this PC is not paired (or uses the old insecure format)."""
     try:
@@ -140,7 +148,7 @@ def load_config() -> dict | None:
             cfg = json.load(f)
     except (OSError, ValueError):
         return None
-    if cfg.get("version") != CONFIG_VERSION or "auth_key" not in cfg:
+    if not isinstance(cfg, dict) or cfg.get("version") != CONFIG_VERSION or "auth_key" not in cfg:
         return None
     return cfg
 
@@ -195,8 +203,12 @@ NOT_CONFIRMED_MESSAGE = (
     "Click Pair Token again, and when the token's light stays on, press its IO0 button.")
 
 OUTDATED_FIRMWARE_MESSAGE = (
-    "This token's firmware is too old: it does not support encrypted, button-confirmed "
-    "pairing. Reflash it with the current firmware (SETUP.md, step 6), then pair again.")
+    "USB pairing requires firmware v5 or later. Update the firmware without erasing "
+    "its saved credentials. Your existing pairing still works over Bluetooth.")
+
+EXISTING_CREDENTIAL_MESSAGE = (
+    "This token is already paired. Re-pairing requires the saved credential for this token. "
+    "Use the original Windows account or restore its pairing config before trying again.")
 
 CANCELLED_MESSAGE = "Pairing cancelled."
 
@@ -230,16 +242,14 @@ def _open_port(com_port: str) -> serial.Serial:
     return ser
 
 
-# A token that is clearly alive but never answers PAIR_ECDH within this long is running
-# firmware from before v3, which only knew the (now removed) plaintext pairing.
+# An older token may print boot messages while ignoring the v5 request.
 ECDH_PROBE_S = 8.0
 
 
-def _save_pairing(host_id, token_id, auth_key, mac, fields) -> tuple[bool, str]:
+def _save_pairing(token_id, auth_key, mac, fields) -> tuple[bool, str]:
     key_blob, scheme = _protect_secret(auth_key)
     config = {
         "version": CONFIG_VERSION,
-        "host_id": host_id,
         "token_id": token_id.hex(),
         "ble_mac": mac,
         "char_uuid": fields.get("CHAR_UUID", CHARACTERISTIC_UUID),
@@ -249,8 +259,7 @@ def _save_pairing(host_id, token_id, auth_key, mac, fields) -> tuple[bool, str]:
         "auth_key_protection": scheme,
         "paired_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
+    atomic_write_text(CONFIG_FILE, json.dumps(config, indent=2), "utf-8")
     return True, f"Token {token_fingerprint(token_id.hex())} bound (BLE {mac})"
 
 
@@ -277,16 +286,13 @@ def _extract_auth_key(fields, pc_priv, pc_pub):
     return token_id, auth_key
 
 
-def _pair(com_port, host_id, request_id, pc_priv, pc_pub, report, deadline, should_cancel=None):
-    """
-    Run the encrypted, button-confirmed pairing exchange until the deadline.
+def _pair(com_port, request_id, pc_priv, pc_pub, existing, report, deadline, should_cancel=None):
+    """Run the v5 exchange, retrying with the same ephemeral key and request ID."""
+    from pair_crypto import pairing_proof
 
-    The command is repeated (same request ID, so the token never rotates the key twice).
-    The token first answers PAIRING_PENDING and waits for its IO0 button; once pressed it
-    answers PAIRING_SUCCESS. Returns (ok, message). should_cancel, if given, is polled
-    each loop so the UI can abort (e.g. the wrong COM port was chosen).
-    """
-    command = f"PAIR_ECDH:{host_id}:{request_id}:{pc_pub.hex()}\n".encode()
+    mode = "REPAIR" if existing is not None else "ENROLL"
+    begin = f"PAIR_V5:{request_id}:{pc_pub.hex()}:{mode}\n".encode()
+    command = begin
 
     ser, opened, open_error = None, False, None
     drops = restarts = 0
@@ -295,6 +301,12 @@ def _pair(com_port, host_id, request_id, pc_priv, pc_pub, report, deadline, shou
     try:
         while time.time() < deadline:
             if should_cancel is not None and should_cancel():
+                if ser is not None:
+                    try:
+                        ser.write(f"PAIR_CANCEL:{request_id}\n".encode())
+                        ser.flush()
+                    except serial.SerialException:
+                        pass
                 return False, CANCELLED_MESSAGE
             if ser is None:
                 try:
@@ -311,6 +323,7 @@ def _pair(com_port, host_id, request_id, pc_priv, pc_pub, report, deadline, shou
             except serial.SerialException:
                 drops += 1
                 ser.close(); ser = None
+                command = begin
                 report("Lost the connection to the token. Reconnecting…")
                 time.sleep(0.5)
                 continue
@@ -324,8 +337,6 @@ def _pair(com_port, host_id, request_id, pc_priv, pc_pub, report, deadline, shou
             if line:
                 alive_since = alive_since or time.time()
             if not line.startswith("PAIRING_"):
-                # Firmware older than v3 ignores PAIR_ECDH entirely. If the token is
-                # clearly alive but never answers, tell the user to reflash it.
                 if (not prompted and alive_since
                         and time.time() - alive_since > ECDH_PROBE_S):
                     return False, OUTDATED_FIRMWARE_MESSAGE
@@ -333,30 +344,54 @@ def _pair(com_port, host_id, request_id, pc_priv, pc_pub, report, deadline, shou
             fields = _parse_fields(line)
             if fields.get("REQ") != request_id:
                 continue
+            if line.startswith("PAIRING_PROOF"):
+                if existing is None:
+                    return False, EXISTING_CREDENTIAL_MESSAGE
+                saved_key, saved_id = existing
+                try:
+                    nonce = bytes.fromhex(fields["NONCE"])
+                    token_id = bytes.fromhex(fields["TOKEN_ID"])
+                except (KeyError, ValueError):
+                    return False, "The token sent an invalid pairing challenge."
+                if len(nonce) != NONCE_LEN or not hmac.compare_digest(token_id, saved_id):
+                    return False, EXISTING_CREDENTIAL_MESSAGE
+                proof = pairing_proof(saved_key, saved_id, nonce, request_id, pc_pub)
+                command = f"PAIR_PROVE:{request_id}:{proof.hex()}\n".encode()
+                continue
             if line.startswith("PAIRING_PENDING"):
-                # The token is waiting for its IO0 button; keep repeating the request.
+                command = begin
                 if not prompted:
                     report(PRESS_BUTTON_MESSAGE)
                     prompted = True
                 continue
             if line.startswith("PAIRING_REFUSED"):
                 reason = fields.get("REASON")
-                if reason == "BOUND_TO_OTHER_HOST":
-                    return False, (
-                        "This token is already bound to a different PC.\n"
-                        "Hold the IO0 button for 3 seconds while it boots to factory reset it. "
-                        "Note: a reset destroys its master secret, so files encrypted "
-                        "with it can never be decrypted again.")
+                if reason in {"PROOF_REQUIRED", "AUTH_FAILED"}:
+                    return False, EXISTING_CREDENTIAL_MESSAGE
+                if reason == "TOKEN_UNPAIRED":
+                    return False, ("This token has no pairing. Your app still has credentials for a paired "
+                                   "token. Keep a backup of those credentials before enrolling a replacement.")
+                if reason == "NO_PENDING" and command != begin:
+                    command = begin
+                    continue
                 if reason == "NOT_CONFIRMED":
                     return False, NOT_CONFIRMED_MESSAGE
                 return False, f"Token refused pairing ({reason or 'unknown'})."
+            if not line.startswith("PAIRING_SUCCESS"):
+                continue
             try:
                 token_id, auth_key = _extract_auth_key(fields, pc_priv, pc_pub)
                 mac = fields["BLE_MAC"]
             except (KeyError, ValueError) as e:
                 return False, f"Token sent an unreadable pairing reply ({e}). Is the firmware up to date?"
+            if not fields.get("FW", "").isdecimal() or int(fields["FW"]) < 5:
+                return False, OUTDATED_FIRMWARE_MESSAGE
+            if existing is not None:
+                saved_key, saved_id = existing
+                if not (hmac.compare_digest(token_id, saved_id) and hmac.compare_digest(auth_key, saved_key)):
+                    return False, EXISTING_CREDENTIAL_MESSAGE
             report("Confirmed on the token. Saving the pairing…")
-            return _save_pairing(host_id, token_id, auth_key, mac, fields)
+            return _save_pairing(token_id, auth_key, mac, fields)
     finally:
         if ser is not None:
             ser.close()
@@ -386,14 +421,21 @@ def pair_token_usb(com_port: str, progress=None, should_cancel=None) -> tuple[bo
     """
     from pair_crypto import new_keypair
     report = progress or (lambda _msg: None)
-    host_id = get_host_id()
+    cfg = load_config()
+    existing = None
+    if cfg is not None:
+        try:
+            _, key, token_id = _load_credentials(cfg)
+            existing = key, token_id
+        except TokenError as exc:
+            return False, str(exc)
     request_id = os.urandom(8).hex()
     pc_priv, pc_pub = new_keypair()
 
     report(f"Connecting to {com_port}…")
     report("Pairing securely (encrypted key exchange). You will be asked to press the "
            "token's IO0 button…")
-    return _pair(com_port, host_id, request_id, pc_priv, pc_pub, report,
+    return _pair(com_port, request_id, pc_priv, pc_pub, existing, report,
                  time.time() + PAIR_WINDOW_S, should_cancel=should_cancel)
 
 
@@ -411,6 +453,8 @@ def _check_error(msg: bytes):
             raise TokenNotPairedError(text)
         if code == 0x03:
             raise TokenAuthError(text)
+        if code in (0x02, 0x05):
+            raise TokenTransientError(text)
         raise TokenError(text)
 
 
@@ -441,10 +485,10 @@ def build_request(auth_key: bytes, token_id: bytes, token_nonce: bytes,
     return bytes([MSG_REQUEST]) + host_nonce + iv + ct, sk
 
 
-def parse_response(msg: bytes, session_key: bytes, token_id: bytes) -> bytes:
+def parse_response(msg: bytes, session_key: bytes, token_id: bytes, data_len=HASH_LEN) -> bytes:
     """Authenticates and decrypts the token's response, returning its 32-byte data field."""
     _check_error(msg)
-    if len(msg) != RESPONSE_LEN or msg[0] != MSG_RESPONSE:
+    if len(msg) != RESPONSE_LEN + data_len - HASH_LEN or msg[0] != MSG_RESPONSE:
         raise TokenError(f"Unexpected response from token ({len(msg)} bytes).")
     iv, ct = msg[1:1 + IV_LEN], msg[1 + IV_LEN:]
     try:
@@ -455,57 +499,130 @@ def parse_response(msg: bytes, session_key: bytes, token_id: bytes) -> bytes:
             "or the pairing was replaced — pair the token again over USB."
         )
     if plain[0] != 0x00:
+        if plain[0] == 0x01:
+            raise TokenConfirmationPending("Tap IO0 on the token to approve this vault action.")
         raise TokenError(f"Token returned status 0x{plain[0]:02X}.")
     return plain[1:]
 
 
 # ── Phase 2: BLE transport ───────────────────────────────────────
 
-def _load_credentials() -> tuple[dict, bytes, bytes]:
-    cfg = load_config()
+def _load_credentials(cfg=None) -> tuple[dict, bytes, bytes]:
+    if cfg is None:
+        cfg = load_config()
     if cfg is None:
         raise TokenNotPairedError("No hardware token is paired with this PC. Use 'Pair Token' first.")
-    auth_key = _unprotect_secret(cfg["auth_key"], cfg.get("auth_key_protection", "none"))
-    return cfg, auth_key, bytes.fromhex(cfg["token_id"])
+    try:
+        auth_key = _unprotect_secret(cfg["auth_key"], cfg.get("auth_key_protection", "none"))
+        token_id = bytes.fromhex(cfg["token_id"])
+        if len(auth_key) != HASH_LEN or len(token_id) != TOKEN_ID_LEN:
+            raise ValueError("invalid credential length")
+    except (KeyError, ValueError, TypeError) as exc:
+        raise TokenNotPairedError("The saved token credentials are invalid.") from exc
+    return cfg, auth_key, token_id
 
 
 # The UI looks for this phrase to tell "token offline" apart from other failures.
 UNREACHABLE_MSG = "Could not reach the hardware token over Bluetooth."
+_BLE_EXCHANGE_LOCK = threading.Lock()
+PING_TIMEOUT_S = 12.0
 
 
-async def _transaction(op: int, env_hash: bytes) -> bytes:
+@contextmanager
+def _ble_errors():
+    try:
+        yield
+    except TokenError:
+        raise
+    except Exception as exc:
+        raise TokenTransientError(
+            f"{UNREACHABLE_MSG} Is it powered on and in range?\n\nDetails: {exc}"
+        ) from exc
+
+
+@asynccontextmanager
+async def _ble_link():
+    """Keep notifications on one connection. Every exchange still authenticates a fresh challenge."""
     cfg, auth_key, token_id = _load_credentials()
     uuid = cfg.get("char_uuid", CHARACTERISTIC_UUID)
     inbox: asyncio.Queue[bytes] = asyncio.Queue()
 
-    async def receive() -> bytes:
+    async def receive(timeout=5.0) -> bytes:
         try:
-            return await asyncio.wait_for(inbox.get(), timeout=5.0)
+            return await asyncio.wait_for(inbox.get(), timeout=timeout)
         except asyncio.TimeoutError:
-            raise TokenError("The token stopped responding mid-exchange.")
+            raise TokenTransientError("The token stopped responding mid-exchange.")
 
-    try:
-        async with BleakClient(cfg["ble_mac"], timeout=10.0,
-                               winrt={"use_cached_services": False}) as client:
+    async with AsyncExitStack() as cleanup:
+        with _ble_errors():
+            client = await cleanup.enter_async_context(BleakClient(
+                cfg["ble_mac"], timeout=10.0, winrt={"use_cached_services": False}))
             await client.start_notify(uuid, lambda _s, data: inbox.put_nowait(bytes(data)))
-            try:
+
+        async def exchange(operation, context):
+            with _ble_errors():
                 await client.write_gatt_char(uuid, bytes([MSG_HELLO]), response=True)
                 token_nonce = parse_challenge(await receive(), token_id)
-
-                request, sk = build_request(auth_key, token_id, token_nonce, op, env_hash)
+                request, sk = build_request(auth_key, token_id, token_nonce, operation, context)
                 await client.write_gatt_char(uuid, request, response=True)
-                return parse_response(await receive(), sk, token_id)
-            finally:
+                reply = await receive()
+                if operation in (OP_IMPORT_BATCH, OP_EXPORT_CHILD) and reply == bytes([MSG_ERROR, 0x04]):
+                    raise TokenError("Batch-imported vault files require firmware v8. Check the firmware and export selection.")
+                if operation in (OP_VAULT_OPEN, OP_VAULT_MINT, OP_EXPORT_BEGIN) and reply == bytes([MSG_ERROR, 0x04]):
+                    raise TokenError("Vault operations require token firmware v7.")
+                approval = operation in (OP_VAULT_OPEN, OP_EXPORT_BEGIN)
                 try:
-                    await client.stop_notify(uuid)
-                except Exception:
-                    pass
-    except TokenError:
-        raise
-    except Exception as e:
-        raise TokenError(
-            f"{UNREACHABLE_MSG} Is it powered on and in range?\n\nDetails: {e}"
-        )
+                    data = parse_response(reply, sk, token_id, 48 if operation in (OP_VAULT_MINT, OP_IMPORT_BATCH) else 32)
+                except TokenConfirmationPending:
+                    if not approval:
+                        raise TokenAuthError("Unexpected vault approval response.")
+                    return parse_response(await receive(65), sk, token_id)
+                if approval:
+                    raise TokenAuthError("Missing authenticated vault approval prompt.")
+                return data
+
+        try:
+            yield exchange
+        finally:
+            try:
+                await client.stop_notify(uuid)
+            except Exception:
+                pass
+
+
+async def _transaction(op: int, env_hash: bytes, *, steps=(), consume=None):
+    with _ble_errors():
+        async with _ble_link() as exchange:
+            result = await exchange(op, env_hash)
+            if consume is None:
+                return result
+            for index, step in enumerate(steps):
+                operation = OP_EXPORT_CHILD if len(step) == 96 else OP_EXPORT_NEXT
+                key = await exchange(operation, step)
+                try:
+                    await asyncio.to_thread(consume, index, key)
+                except Exception as exc:
+                    raise TokenError(f"Export stopped after {index} completed file(s). {exc}") from exc
+                finally:
+                    del key
+
+
+def request_import_batch(vault_context):
+    """Acquire a new batch ID and secret. Disconnect before any source is encrypted."""
+    if len(vault_context) != HASH_LEN:
+        raise ValueError("Invalid vault context.")
+
+    async def acquire():
+        try:
+            return await _transaction(OP_IMPORT_BATCH, vault_context)
+        except TokenTransientError:
+            # A lost reply can only abandon a fresh ID. File processing has not started.
+            await asyncio.sleep(1)
+            return await _transaction(OP_IMPORT_BATCH, vault_context)
+
+    with _BLE_EXCHANGE_LOCK:
+        with process_file_lock(_app_dir() / ".token-ble.lock", timeout=80):
+            return _run_isolated(acquire())
 
 
 def _run_isolated(coro) -> bytes:
@@ -518,9 +635,54 @@ def request_env_key(env_hash: bytes) -> bytes:
     """Asks the token for HMAC(master_secret, env_hash). Blocking."""
     if len(env_hash) != HASH_LEN:
         raise ValueError("env_hash must be 32 bytes")
-    return _run_isolated(_transaction(OP_DERIVE, env_hash))
+    with _BLE_EXCHANGE_LOCK:
+        with process_file_lock(_app_dir() / ".token-ble.lock"):
+            return _run_isolated(_transaction(OP_DERIVE, env_hash))
+
+
+def request_vault_key(operation: str, context: bytes) -> bytes:
+    """Open an index with IO0, or mint a fresh file ID and key without IO0."""
+    operations = {"metadata": (OP_VAULT_OPEN, 32), "mint": (OP_VAULT_MINT, 48)}
+    if operation not in operations or len(context) != operations[operation][1]:
+        raise ValueError("Invalid vault key request.")
+    with _BLE_EXCHANGE_LOCK:
+        with process_file_lock(_app_dir() / ".token-ble.lock", timeout=80):
+            return _run_isolated(_transaction(operations[operation][0], context))
+
+
+def export_selected_keys(contexts, consume):
+    """Commit to the ordered selection before IO0. Consume keys on the same BLE link."""
+    if not contexts or any(len(context) not in (HASH_LEN, 2 * HASH_LEN) for context in contexts):
+        raise ValueError("Invalid vault export selection.")
+    cursor = bytes(HASH_LEN)
+    steps = []
+    for context in reversed(contexts):
+        step = context + cursor
+        steps.append(step)
+        cursor = hashlib.sha256(step).digest()
+    with _BLE_EXCHANGE_LOCK:
+        with process_file_lock(_app_dir() / ".token-ble.lock", timeout=80):
+            _run_isolated(_transaction(OP_EXPORT_BEGIN, cursor, steps=reversed(steps), consume=consume))
 
 
 def ping_token():
     """Performs a full authenticated handshake without deriving a key. Raises TokenError on failure."""
-    _run_isolated(_transaction(OP_PING, bytes(HASH_LEN)))
+    deadline = time.monotonic() + PING_TIMEOUT_S
+
+    async def bounded_ping():
+        try:
+            await asyncio.wait_for(_transaction(OP_PING, bytes(HASH_LEN)),
+                                   timeout=max(0, deadline - time.monotonic()))
+        except asyncio.TimeoutError as exc:
+            raise TokenTransientError(f"{UNREACHABLE_MSG} The check timed out.") from exc
+
+    if not _BLE_EXCHANGE_LOCK.acquire(timeout=PING_TIMEOUT_S):
+        raise TokenTransientError("Another Bluetooth exchange is still in progress.")
+    try:
+        try:
+            with process_file_lock(_app_dir() / ".token-ble.lock", timeout=PING_TIMEOUT_S):
+                _run_isolated(bounded_ping())
+        except TimeoutError as exc:
+            raise TokenTransientError("Another Bluetooth operation is in progress.") from exc
+    finally:
+        _BLE_EXCHANGE_LOCK.release()

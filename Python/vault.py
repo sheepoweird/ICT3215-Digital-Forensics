@@ -1,5 +1,8 @@
 """
-EnvStego - vault.py
+EnvStego - vault.py (legacy format 1; legacy API and shared storage helpers)
+The desktop application uses vault_v2.py. Do not use this shared-key implementation
+for new sessions.
+
 "Env Vault": an encrypted store whose key is bound to the token + environment.
 
 Design (see the project notes):
@@ -28,14 +31,17 @@ import json
 import os
 import secrets
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from winutils import atomic_write_text
 
 META_NAME = "vault.json"
 INDEX_NAME = "index.bin"
+LOCK_NAME = ".vault.lock"
 VERSION = 1
 NONCE_LEN = 12
 SALT_LEN = 16
@@ -58,21 +64,6 @@ _REC_AAD = b"EnvVault-recwrap-v1"
 _INDEX_AAD = b"EnvVault-index-v1"
 _BLOB_AAD = b"EnvVault-blob-v1"
 _CREATED_AAD = b"EnvVault-created-v1"
-
-
-def _atomic_write_text(path: Path, text: str, encoding: str):
-    """
-    Write text durably: a crash mid-write must never leave a half-written file.
-    vault.json holds BOTH wrapped copies of the key, so a torn write there would
-    destroy the vault, recovery code included. Write to a temp file, fsync, then
-    os.replace (atomic on the same filesystem).
-    """
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding=encoding) as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
 
 
 def _b64(b: bytes) -> str:
@@ -118,6 +109,20 @@ class VaultError(Exception):
     pass
 
 
+@contextmanager
+def _vault_file_lock(path: Path):
+    """Serialize vault writes across processes. Closing the handle releases the lock."""
+    with (path / LOCK_NAME).open("a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+        yield
+
+
 def is_vault(path: str) -> bool:
     return (Path(path) / META_NAME).is_file()
 
@@ -155,6 +160,7 @@ class Vault:
     def list_entries(self) -> list[dict]:
         """Metadata only: [{blob, name, size, added}, …] (newest first)."""
         self._require()
+        self._index = _load_index(self._path, self._key)
         return sorted(self._index, key=lambda e: e.get("added", 0), reverse=True)
 
     def count(self) -> int:
@@ -163,9 +169,11 @@ class Vault:
     def total_bytes(self) -> int:
         return sum(int(e.get("size", 0)) for e in self._index)
 
-    def _save_index(self):
-        blob = _seal(self._key, json.dumps(self._index).encode("utf-8"), _INDEX_AAD)
-        _atomic_write_text(self._path / INDEX_NAME, blob, "ascii")
+    def _save_index(self, entries):
+        blob = _seal(self._key, json.dumps(entries).encode("utf-8"), _INDEX_AAD)
+        atomic_write_text(self._path / INDEX_NAME, blob, "ascii")
+        if self.unlocked:
+            self._index = entries
 
     # -- files ----------------------------------------------------------------
     def add_bytes(self, name: str, data: bytes) -> dict:
@@ -175,15 +183,25 @@ class Vault:
         nonce = os.urandom(NONCE_LEN)
         padded = data + b"\x00" * (_bucketed(len(data)) - len(data))   # blur the on-disk size
         ct = AESGCM(self._key).encrypt(nonce, padded, _BLOB_AAD + blob_id.encode())
-        (self._path / blob_id).write_bytes(nonce + ct)
         entry = {
             "blob": blob_id,
             "name": os.path.basename(name) or "unnamed",
             "size": len(data),
             "added": int(time.time()),
         }
-        self._index.append(entry)
-        self._save_index()
+        with _vault_file_lock(self._path):
+            self._require()
+            entries = _load_index(self._path, self._key)
+            blob_path = self._path / blob_id
+            with blob_path.open("xb") as out:
+                out.write(nonce + ct)
+                out.flush()
+                os.fsync(out.fileno())
+            try:
+                self._save_index([*entries, entry])
+            except Exception:
+                blob_path.unlink(missing_ok=True)
+                raise
         return entry
 
     def add_file(self, src_path: str, *, shred_original: bool = True) -> dict:
@@ -191,20 +209,24 @@ class Vault:
         with open(src_path, "rb") as f:
             data = f.read()
         entry = self.add_bytes(os.path.basename(src_path), data)
+        shred_status = "kept"
         if shred_original:
             try:
                 from winutils import shred_file
-                shred_file(src_path)
+                shred_status = "shredded" if shred_file(src_path) else "unconfirmed"
             except OSError:
-                pass   # import succeeded; a failed shred must not lose the entry
-        return entry
+                shred_status = "unconfirmed"
+        return {**entry, "shred_status": shred_status}
 
     def read_bytes(self, blob_id: str) -> tuple[str, bytes]:
         """Decrypt a blob in memory. Returns (name, data)."""
-        self._require()
-        entry = self._find(blob_id)
-        raw = (self._path / blob_id).read_bytes()
-        data = AESGCM(self._key).decrypt(raw[:NONCE_LEN], raw[NONCE_LEN:], _BLOB_AAD + blob_id.encode())
+        with _vault_file_lock(self._path):
+            self._require()
+            key = self._key
+            self._index = _load_index(self._path, key)
+            entry = self._find(blob_id)
+            raw = (self._path / blob_id).read_bytes()
+        data = AESGCM(key).decrypt(raw[:NONCE_LEN], raw[NONCE_LEN:], _BLOB_AAD + blob_id.encode())
         return entry["name"], data[:entry["size"]]      # drop any size-blurring padding
 
     def export(self, blob_id: str, dest_dir: str) -> str:
@@ -220,17 +242,17 @@ class Vault:
 
     def remove(self, blob_id: str):
         """Shred the blob and drop its index entry."""
-        self._require()
-        self._find(blob_id)            # validates existence
-        blob_path = self._path / blob_id
-        try:
-            from winutils import shred_file
-            shred_file(str(blob_path))
-        except OSError:
-            if blob_path.exists():
-                blob_path.unlink()
-        self._index = [e for e in self._index if e["blob"] != blob_id]
-        self._save_index()
+        with _vault_file_lock(self._path):
+            self._require()
+            self._index = _load_index(self._path, self._key)
+            self._find(blob_id)
+            self._save_index([e for e in self._index if e["blob"] != blob_id])
+            blob_path = self._path / blob_id
+            try:
+                from winutils import shred_file
+                shred_file(str(blob_path))
+            except OSError:
+                blob_path.unlink(missing_ok=True)
 
     def _find(self, blob_id: str) -> dict:
         for e in self._index:
@@ -241,13 +263,14 @@ class Vault:
     # -- re-wrap (after environment drift) ------------------------------------
     def rewrap_env(self, index_key: bytes, env_key: bytes, signal_ids: list[str]):
         """Re-seal the vault key under a new environment (and update the sealed signal list)."""
-        self._require()
-        meta = _read_meta(self._path)
-        env_salt = os.urandom(SALT_LEN)
-        meta["env_salt"] = _b64(env_salt)
-        meta["env_wrapped"] = _seal(_wrap_key(env_key, env_salt, _ENV_AAD), self._key, _ENV_AAD)
-        meta["signals"] = _seal(index_key, json.dumps(sorted(signal_ids)).encode(), _SIG_AAD)
-        _write_meta(self._path, meta)
+        with _vault_file_lock(self._path):
+            self._require()
+            meta = _read_meta(self._path)
+            env_salt = os.urandom(SALT_LEN)
+            meta["env_salt"] = _b64(env_salt)
+            meta["env_wrapped"] = _seal(_wrap_key(env_key, env_salt, _ENV_AAD), self._key, _ENV_AAD)
+            meta["signals"] = _seal(index_key, json.dumps(sorted(signal_ids)).encode(), _SIG_AAD)
+            _write_meta(self._path, meta)
 
 
 # ── module-level key management ──────────────────────────────────────────────
@@ -257,7 +280,7 @@ def _read_meta(path) -> dict:
 
 
 def _write_meta(path, meta: dict):
-    _atomic_write_text(Path(path) / META_NAME, json.dumps(meta, indent=2), "utf-8")
+    atomic_write_text(Path(path) / META_NAME, json.dumps(meta, indent=2), "utf-8")
 
 
 def create_vault(path: str, index_key: bytes, env_key: bytes,
@@ -270,7 +293,7 @@ def create_vault(path: str, index_key: bytes, env_key: bytes,
     if is_vault(path):
         raise VaultError("A vault already exists here.")
     p.mkdir(parents=True, exist_ok=True)
-    if any(p.iterdir()):
+    if any(f.name != LOCK_NAME for f in p.iterdir()):
         raise VaultError("Choose an empty folder for a new vault.")
 
     vault_key = secrets.token_bytes(KEY_LEN)
@@ -287,9 +310,18 @@ def create_vault(path: str, index_key: bytes, env_key: bytes,
         "rec_salt": _b64(rec_salt),
         "rec_wrapped": _seal(_wrap_key(rec_raw, rec_salt, _REC_AAD), vault_key, _REC_AAD),
     }
-    _write_meta(p, meta)
-    v = Vault(path, vault_key, [])
-    v._save_index()
+    with _vault_file_lock(p):
+        if is_vault(path):
+            raise VaultError("A vault already exists here.")
+        if any(f.name != LOCK_NAME for f in p.iterdir()):
+            raise VaultError("Choose an empty folder for a new vault.")
+        v = Vault(path, vault_key, [])
+        v._save_index([])
+        try:
+            _write_meta(p, meta)
+        except Exception:
+            (p / INDEX_NAME).unlink(missing_ok=True)
+            raise
     return v, rec_code
 
 

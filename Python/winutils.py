@@ -18,6 +18,11 @@ ICT3215 Digital Forensics — SIT
 
 import base64
 import os
+import sys
+import tempfile
+import time
+from contextlib import contextmanager
+from pathlib import Path
 
 __all__ = [
     "copy_file_times", "timestomp",
@@ -25,6 +30,64 @@ __all__ = [
     "pictures_dir", "downloads_dir",
     "protect_str", "unprotect_str",
 ]
+
+
+def restore_worker_streams():
+    """Restore redirected handles when a windowed frozen worker has no Python streams."""
+    if os.name != "nt":
+        return
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    get_handle = ctypes.WinDLL("kernel32", use_last_error=True).GetStdHandle
+    get_handle.argtypes = [wintypes.DWORD]
+    get_handle.restype = wintypes.HANDLE
+    for name, number, mode, flags in (("stdin", -10, "r", os.O_RDONLY),
+                                      ("stdout", -11, "w", os.O_WRONLY)):
+        if getattr(sys, name) is None:
+            handle = get_handle(number & 0xffffffff)
+            if not handle or handle == ctypes.c_void_p(-1).value:
+                raise RuntimeError("Worker requires redirected input and output.")
+            descriptor = msvcrt.open_osfhandle(handle, flags | os.O_BINARY)
+            setattr(sys, name, os.fdopen(descriptor, mode, encoding="utf-8"))
+
+
+@contextmanager
+def process_file_lock(path: Path, timeout: float = 15):
+    """Hold an OS file lock that is released automatically on process exit."""
+    with path.open("a+b") as handle:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Another operation is still using this resource.")
+                time.sleep(0.05)
+        yield
+
+
+def atomic_write_text(path: Path, text: str, encoding: str):
+    """Flush a unique temporary file before replacing the destination."""
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=path.name + ".",
+                                     suffix=".tmp", encoding=encoding, delete=False) as out:
+        temporary = Path(out.name)
+        try:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+            out.close()
+            os.replace(temporary, path)
+        finally:
+            out.close()
+            temporary.unlink(missing_ok=True)
 
 
 # ─── File timestamps ──────────────────────────────────────────────────────────

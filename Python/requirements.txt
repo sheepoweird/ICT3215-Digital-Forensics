@@ -5,6 +5,8 @@ PyQt6>=6.6.0
 cryptography>=42.0.0
 Pillow>=10.0.0
 numpy>=1.26.0
+soundfile>=0.13.1
+jpeglib==1.0.2  # Native JPEG coefficient I/O (tested Windows abi3 wheel)
 pyserial
 bleak
 pytest          # only needed to run tests/test_offline.py
