@@ -30,7 +30,7 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget, QLabel,
-    QPushButton, QCheckBox, QProgressBar, QFileDialog, QTextEdit, QButtonGroup,
+    QPushButton, QCheckBox, QProgressBar, QFileDialog, QButtonGroup,
     QScrollArea, QFrame, QTableWidget, QTableWidgetItem, QLineEdit, QStatusBar,
     QGridLayout, QHeaderView, QMessageBox, QComboBox, QInputDialog, QToolButton,
     QApplication, QListWidget, QListWidgetItem, QSizePolicy,
@@ -231,16 +231,6 @@ QComboBox QAbstractItemView {
     selection-background-color: #1f6feb; outline: none; padding: 4px;
 }
 
-QTextEdit {
-    background-color: #0d1117;
-    border: 1px solid #262c36;
-    border-radius: 8px;
-    padding: 8px;
-    color: #c9d1d9;
-    font-family: 'Consolas', 'Courier New', monospace;
-    font-size: 12px;
-}
-
 /* ── Scrolling ───────────────────────────────────────────── */
 QScrollArea { border: none; background: transparent; }
 QScrollArea > QWidget > QWidget#page { background: #0d1117; }
@@ -439,6 +429,11 @@ BUILTIN_PRESETS = [
 
 CATEGORY_ORDER = ["Hardware", "Network", "OS", "Unknown"]
 
+# An open vault locks after this long without vault activity, even with the token in range.
+VAULT_IDLE_LOCK_S = 5 * 60
+# A copied recovery code is cleared from the clipboard after this long.
+RECOVERY_CLIPBOARD_S = 30
+
 
 # ─── WORKER THREADS ──────────────────────────────────────────────────────────
 
@@ -607,7 +602,7 @@ ENV_MISMATCH_MSG = (
 
 
 class DecryptWorker(QThread):
-    done         = pyqtSignal(str, str, str, bytes)
+    done         = pyqtSignal(str, str, str)
     error        = pyqtSignal(str)
     signals_used = pyqtSignal(list)   # IDs read from a v3 header, so the UI can show them
 
@@ -772,7 +767,7 @@ class DecryptWorker(QThread):
             f"  Signals used: {n_signals} ({how})\n"
             f"  Recovered:    {recovered}\n"
             f"  Saved to:     {saved}",
-            fp, saved, data)
+            fp, saved)
 
 
 # ─── VAULT WORKERS (token-bound; run off the GUI thread) ─────────────────────
@@ -2729,16 +2724,6 @@ class MainWindow(QMainWindow):
         layout.addLayout(result_row)
         self._dec_last_path = ""
 
-        self._dec_preview_lbl = _section("Preview (text files only)")
-        self._dec_preview_lbl.setVisible(False)
-        layout.addWidget(self._dec_preview_lbl)
-
-        self._dec_preview = QTextEdit()
-        self._dec_preview.setReadOnly(True)
-        self._dec_preview.setMaximumHeight(160)
-        self._dec_preview.setVisible(False)
-        layout.addWidget(self._dec_preview)
-
         layout.addStretch()
         return page
 
@@ -2770,8 +2755,6 @@ class MainWindow(QMainWindow):
         self._dec_result.show_info("Collecting live signals and requesting the key from the token over BLE…")
         self._dec_fp_lbl.setText("")
         self._dec_open_btn.setVisible(False)
-        self._dec_preview.setVisible(False)
-        self._dec_preview_lbl.setVisible(False)
 
         stego_arg = self._dec_stegos.paths() if self._dec_split.isChecked() else self._dec_stego.path()
         w = DecryptWorker(self._selected_ids, stego_arg, self._dec_output.path())
@@ -2786,7 +2769,7 @@ class MainWindow(QMainWindow):
         if ids and self._all_signals:
             self._apply_selection(set(ids), None)
 
-    def _on_decrypt_done(self, msg: str, fp: str, out_path: str, plaintext: bytes):
+    def _on_decrypt_done(self, msg: str, fp: str, out_path: str):
         self._set_busy(False)
         self._note_token_result(True)
         self._dec_btn.setText(self.DEC_LABEL)
@@ -2795,15 +2778,6 @@ class MainWindow(QMainWindow):
         self._dec_last_path = out_path
         self._dec_open_btn.setVisible(True)
         self._status.showMessage("Decryption successful")
-
-        if b"\x00" not in plaintext[:4096]:
-            try:
-                text = plaintext.decode("utf-8")
-                self._dec_preview.setPlainText(text[:2000] + ("…" if len(text) > 2000 else ""))
-                self._dec_preview.setVisible(True)
-                self._dec_preview_lbl.setVisible(True)
-            except UnicodeDecodeError:
-                pass
 
     def _on_decrypt_error(self, msg: str):
         self._set_busy(False)
@@ -3391,7 +3365,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._vault_table, stretch=1)
         layout.addStretch()
 
+        self._vault_table.itemSelectionChanged.connect(self._vault_touch)
+
         # heartbeat timer for auto-lock (started only while unlocked)
+        self._vault_last_used = time.monotonic()
         self._vault_timer = QTimer(self)
         self._vault_timer.setInterval(25_000)
         self._vault_timer.timeout.connect(self._vault_heartbeat_tick)
@@ -3527,7 +3504,12 @@ class MainWindow(QMainWindow):
         box.addButton("I've saved it", QMessageBox.ButtonRole.AcceptRole)
         box.exec()
         if box.clickedButton() is copy:
-            QApplication.clipboard().setText(code)
+            clipboard = QApplication.clipboard()
+            clipboard.setText(code)
+            # Clear it after a short while unless the user has copied something else since.
+            QTimer.singleShot(RECOVERY_CLIPBOARD_S * 1000,
+                              lambda: clipboard.text() == code and clipboard.clear())
+            self._status.showMessage(f"Recovery code copied. The clipboard is cleared in {RECOVERY_CLIPBOARD_S} seconds.")
 
     # -- unlock ---------------------------------------------------------------
     def _vault_unlock(self):
@@ -3601,10 +3583,22 @@ class MainWindow(QMainWindow):
         self._refresh_vault_ui()
 
     def _start_vault_heartbeat(self):
+        self._vault_touch()
         self._vault_timer.start()
 
+    def _vault_touch(self):
+        self._vault_last_used = time.monotonic()
+
     def _vault_heartbeat_tick(self):
-        if self._vault is None or self._busy or self._vault_heartbeat_worker is not None:
+        if self._vault is None:
+            return
+        if self._busy:
+            self._vault_touch()  # A running file action counts as activity.
+            return
+        if time.monotonic() - self._vault_last_used >= VAULT_IDLE_LOCK_S:
+            self._vault_do_lock(f"Auto-locked after {VAULT_IDLE_LOCK_S // 60} minutes without vault activity.")
+            return
+        if self._vault_heartbeat_worker is not None:
             return
         vault = self._vault
         w = VaultHeartbeatWorker()
@@ -3635,11 +3629,7 @@ class MainWindow(QMainWindow):
         paths = [p for p in paths if os.path.isfile(p)]      # ignore dropped folders
         if not paths:
             return
-        shred = QMessageBox.question(
-            self, "Shred originals?",
-            f"Add {len(paths)} file(s) to the vault and securely delete the originals?\n\n"
-            "Choose No to keep the originals in place.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes
+        shred = self._ask_delete_originals(len(paths))
 
         big = sum(os.path.getsize(p) for p in paths if os.path.isfile(p)) > 256 * 2**20
         self._set_busy(True)
@@ -3652,6 +3642,20 @@ class MainWindow(QMainWindow):
         w.done.connect(lambda results: self._on_vault_added(vault, paths, results))
         w.error.connect(self._on_vault_task_error)
         self._start_worker(w)
+
+    def _ask_delete_originals(self, count: int) -> bool:
+        """Keep is the default; closing the dialog also keeps the originals."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Keep or delete originals?")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"Add {count} file(s) to the vault.\n\n"
+                    "Keep the originals in place, or securely delete them after they are encrypted?")
+        delete = box.addButton("Delete", QMessageBox.ButtonRole.DestructiveRole)
+        keep = box.addButton("Keep", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+        return box.clickedButton() is delete
 
     def _on_vault_added(self, vault, paths, results):
         self._set_busy(False)
@@ -3752,8 +3756,9 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._vault_result.show_error(f"Could not remove item: {e}")
                 break
+        else:
+            self._vault_result.show_success("Removed.")
         self._populate_vault_table()
-        self._vault_result.show_success("Removed.")
         self._refresh_vault_ui()
 
     # ─────────────────────────────────────────────────────────────

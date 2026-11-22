@@ -42,6 +42,8 @@ from signals import EnvSignal
 from test_offline import SimToken, run_transaction
 
 SIM = SimToken()
+# The module fixture answers this prompt. Keep the real dialog for its own test.
+_ASK_DELETE_ORIGINALS = ui_main.MainWindow._ask_delete_originals
 FAKE_CFG = {
     "version": 2, "host_id": "TESTHOST", "token_id": SIM.token_id.hex(),
     "ble_mac": "AA:BB:CC:DD:EE:FF", "char_uuid": tc.CHARACTERISTIC_UUID, "firmware": "2",
@@ -119,6 +121,7 @@ def win(tmp_path_factory):
     mp.setattr(ui_main.V, "unlock_env", partial(ui_main.V.unlock_env, key_provider=vault_key))
     # Modal dialogs would block an offscreen run: answer every question "Yes"
     mp.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    mp.setattr(ui_main.MainWindow, "_ask_delete_originals", lambda self, count: True)
     for name in ("warning", "information", "critical"):
         mp.setattr(QMessageBox, name, staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok))
 
@@ -329,7 +332,7 @@ def test_decrypt(win):
     assert "decrypted" in win._dec_result.text()
     recovered = out_dir / "secret.txt"
     assert recovered.read_text(encoding="utf-8") == PAYLOAD
-    assert win._dec_preview.toPlainText() == PAYLOAD
+    assert not hasattr(win, "_dec_preview")  # Recovered plaintext is not shown in the window
     # The signals the image used are reflected back on the Signals page
     assert win._selected_ids == DEVICE_BOUND
 
@@ -742,18 +745,17 @@ def test_vault_create_add_list_lock_unlock(win, monkeypatch, tmp_path):
     assert win._vault is not None and win._vault.count() == 0
     assert ui_main.V.is_vault(str(vdir))
 
-    # Add a file (keep the original: answer "No" to the shred prompt)
+    # Add a file (choose Keep in the originals prompt)
     src = tmp_path / "secret_note.txt"
     src.write_text("vault body content", encoding="utf-8")
     monkeypatch.setattr(ui_main.QFileDialog, "getOpenFileNames",
                         staticmethod(lambda *a, **k: ([str(src)], "")))
-    monkeypatch.setattr(ui_main.QMessageBox, "question",
-                        staticmethod(lambda *a, **k: ui_main.QMessageBox.StandardButton.No))
+    monkeypatch.setattr(ui_main.MainWindow, "_ask_delete_originals", lambda self, count: False)
     win._vault_add_files()
     assert idle(win)
     assert win._vault.count() == 1
     assert win._vault_table.rowCount() == 1
-    assert src.exists()                                   # original kept (said No)
+    assert src.exists()                                   # original kept
 
     # Drag-and-drop path: a list of files goes straight in (no file dialog).
     drop = tmp_path / "dropped.txt"
@@ -791,6 +793,40 @@ def test_vault_auto_locks_when_token_unreachable(win, monkeypatch, tmp_path):
     win._vault_heartbeat_tick()
     assert wait_until(lambda: win._vault is None)         # heartbeat thread locks it
     assert "Auto-locked" in win._vault_result.text()
+
+
+def test_vault_auto_locks_when_idle_even_with_token_in_range(win, tmp_path):
+    session, _ = ui_main.V.create_vault(str(tmp_path / "vault"), bytes(32), bytes(32), [])
+    win._vault = session
+    win._start_vault_heartbeat()
+    win._vault_heartbeat_tick()
+    assert idle(win) and wait_until(lambda: win._vault_heartbeat_worker is None)
+    assert win._vault is session                          # recent activity: stays open
+
+    win._vault_last_used -= ui_main.VAULT_IDLE_LOCK_S
+    win._busy = True
+    try:
+        win._vault_heartbeat_tick()                       # a running action counts as activity
+        assert win._vault is session
+    finally:
+        win._busy = False
+
+    win._vault_last_used -= ui_main.VAULT_IDLE_LOCK_S
+    win._vault_heartbeat_tick()
+    assert win._vault is None and not session.unlocked
+    assert "without vault activity" in win._vault_result.text()
+
+
+def test_closing_the_originals_prompt_keeps_the_originals(win, monkeypatch):
+    shown = []
+
+    def close_without_choosing(box):
+        shown.append([button.text() for button in box.buttons()])
+        return 0
+
+    monkeypatch.setattr(ui_main.QMessageBox, "exec", close_without_choosing)
+    assert _ASK_DELETE_ORIGINALS(win, 2) is False
+    assert sorted(shown[0]) == ["Delete", "Keep"]
 
 
 def test_vault_ui_export_and_recovery_require_explicit_file_action(win, monkeypatch, tmp_path):

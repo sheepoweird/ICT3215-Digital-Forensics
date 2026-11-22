@@ -18,10 +18,13 @@ There is no shared content key in a normal v2 metadata session. The GUI does not
 receive file keys from import/export workers. Each worker exits after its action;
 large normal imports/exports stream in 1 MiB chunks. Vault preview and the
 `read_bytes` interface have been removed from the v2 GUI/API. The separate stego
-workflow still uses its existing environment-derived key and text preview.
+workflow still uses its existing environment-derived key. Its text preview was
+removed, so a recovered payload is written to disk without being shown in the window.
 
 Locking drops metadata references, empties the list and signals active file
-workers to terminate. Normal cancellation waits for worker exit and removes its
+workers to terminate. An open list locks after 5 minutes without vault activity
+(selection or a file action), checked every 25 seconds, as well as when the token
+stops answering. Normal cancellation waits for worker exit and removes its
 temporary export directory. This is **not guaranteed RAM zeroization**: Python,
 Qt, native cryptographic libraries, OS caches, pagefiles, hibernation and crash
 dumps can retain copies. Already exported plaintext remains on disk. A hard crash
@@ -33,7 +36,9 @@ import selection**, given the corresponding file identifiers. Capturing a select
 export key can expose that file. A previously captured file key can still decrypt that
 file later. A capture of the recovery code/private key during creation or recovery can recover **all** files; recovery is an explicit exception to
 per-file key isolation. The recovery dialog and optional clipboard copy also
-expose that secret to the desktop environment.
+expose that secret to the desktop environment. A copied code is cleared from the
+clipboard after 30 seconds unless something else was copied since; Windows
+clipboard history or cloud clipboard sync, if enabled, can still keep it.
 
 ## Token derivation and approval
 
