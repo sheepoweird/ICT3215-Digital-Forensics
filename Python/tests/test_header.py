@@ -89,7 +89,7 @@ def test_stego_image_has_no_plaintext_marker(tmp_path):
     out = se.embed_blob(carrier(tmp_path / "c.png"), header + ct, str(tmp_path / "s.png"))
 
     first = se.extract_lsb_bytes(out, 8)
-    assert first[:4] != se.MAGIC and first[:4] != se.LEGACY_MAGIC
+    assert first[:4] not in (b"ENV2", b"ENVS")   # no plaintext marker from older formats
 
 
 def test_full_v3_round_trip(tmp_path, monkeypatch):

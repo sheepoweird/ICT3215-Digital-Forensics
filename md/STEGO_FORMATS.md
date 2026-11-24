@@ -77,8 +77,8 @@ The splitter still uses every usable selected carrier and balances payload bytes
 as capacities allow. Mixed JPEG/WebP/PNG/WAV sets use each format's own capacity
 and method, while retaining the same encrypted manifest and ordering. The GUI
 passes the complete generated set to Decrypt. All pieces of a real split set
-remain necessary. Old one-piece split outputs and existing PNG/WAV files remain
-readable through their existing format paths. New JPEG output must be generated
+remain necessary. Old one-piece split outputs and existing v3 PNG/WAV files remain
+readable. Images in the pre-v3 "ENV2" format are no longer supported. New JPEG output must be generated
 by encryption; renaming a previous PNG is not sufficient.
 
 ## Validation
@@ -119,6 +119,40 @@ Both recovered byte-for-byte. Sizes can vary slightly with payload and stuffing.
 The ignored helper `build/validate_native_carriers.py` writes test outputs only
 under `build/native-carrier-validation/`. These results are not a measurement of
 steganalysis resistance, nor a new live ESP32 pairing/protocol test.
+
+### Real-encoder round trips (2026-11-22)
+
+Carriers were produced by real encoders (ffmpeg with libwebp, LAME, libvorbis, libopus)
+from one photograph and an 8-second stereo tone with noise. Each was run through the
+app's own header, payload encryption and `media.embed_blob`/`read_lsb_all` path with
+random stand-in token keys. Every carrier recovered its payload exactly, rejected a
+different ordering/index key, and left its source file unchanged.
+
+| Input | Output | Input bytes | Output bytes | Capacity (bytes) |
+| --- | --- | ---: | ---: | ---: |
+| JPEG, colour | `.jpg` | 44,315 | 46,109 | 3,027 |
+| JPEG, ffmpeg `-q:v 3` | `.jpeg` | 49,077 | 54,499 | 4,979 |
+| JPEG, greyscale | `.jpg` | 47,293 | 51,816 | 2,753 |
+| PNG | `.png` | 357,982 | 391,666 | 114,581 |
+| WebP, lossy | `.webp` (lossless) | 39,696 | 279,044 | 114,581 |
+| WebP, lossless | `.webp` | 266,848 | 279,618 | 114,581 |
+| BMP | `.bmp` | 918,054 | 918,054 | 114,581 |
+| TIFF | `.tiff` | 443,372 | 546,174 | 114,581 |
+| GIF | `.png` | 125,047 | 251,728 | 114,581 |
+| MP3, 192 kbit/s | `.wav` | 193,767 | 1,411,244 | 88,200 |
+| FLAC | `.wav` | 845,731 | 1,411,244 | 88,200 |
+| Ogg Vorbis | `.wav` | 81,809 | 1,411,244 | 88,200 |
+| Opus, 48 kHz | `.wav` | 73,513 | 1,536,044 | 96,000 |
+| AIFF | `.wav` | 1,411,254 | 1,411,244 | 88,200 |
+| WAV | `.wav` | 1,411,278 | 1,411,244 | 88,200 |
+
+A 30,000-byte payload split across a JPEG, a lossy WebP and an MP3 produced `.jpg`,
+`.webp` and `.wav` pieces. It recovered with the pieces supplied in reverse order and
+was rejected when one piece was missing. A JPEG file saved with a `.png` extension is
+handled by content and written as PNG.
+
+On 2026-11-24 the full suite passed **242 tests** (after removing the obsolete v1 vault and ENV2 code), and Bandit over `Python/` (tests
+excluded) reported **0 medium/high and 16 low** findings.
 
 ## Sources
 

@@ -14,7 +14,6 @@ they can be tested with a stand-in key without any BLE round-trip.
 ICT3215 Digital Forensics — SIT
 """
 
-import os
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
@@ -36,7 +35,8 @@ def total_capacity(carriers: list[str]) -> int:
 def split_embed(index_key: bytes, blob: bytes, carriers: list[str],
                 output_paths: list[str], match_timestamps: bool = False) -> list[str]:
     """
-    Embed `blob` across every usable carrier, writing a stego PNG or WAV per piece.
+    Embed `blob` across every usable carrier, writing one stego file per piece in
+    that carrier's supported output format (see media.output_suffix).
 
     A carrier too small to hold even one byte after its tag is skipped. At least
     two usable carriers are required, even if the blob fits in one. Returns the
@@ -152,14 +152,14 @@ def join_extract(index_key: bytes, stego_paths: list[str]) -> bytes:
 
 
 def suggest_outputs(carriers: list[str], out_dir: str) -> list[str]:
-    """Suggest unique PNG or WAV output names without replacing a source carrier."""
+    """Suggest unique output names in each carrier's format without replacing a source carrier."""
     out: list[str] = []
     directory = Path(out_dir).resolve()
     sources = [Path(carrier).resolve() for carrier in carriers]
     seen = {source.name.lower() for source in sources if source.parent == directory}
     for c in carriers:
         stem = Path(c).stem
-        suffix = media.output_suffix(c)       # .png or .wav, matching the carrier
+        suffix = media.output_suffix(c)       # e.g. .jpg stays .jpg, .gif -> .png, .mp3 -> .wav
         name = f"{stem}_stego{suffix}"
         i = 1
         while name.lower() in seen:

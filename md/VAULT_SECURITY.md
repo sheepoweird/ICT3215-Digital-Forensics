@@ -1,7 +1,7 @@
 # Vault v2: opening and exporting with IO0
 
-Implemented 2026-11-18. New imports require firmware **v8**. The desktop application uses
-`Python/vault_v2.py`; `Python/vault.py` supplies shared storage helpers.
+Implemented 2026-11-18. New imports require firmware **v8**. The implementation is
+`Python/vault.py`, with file operations run by `Python/vault_worker.py`.
 
 ## Behavior and memory boundary
 
@@ -59,7 +59,7 @@ vaults in the same environment; random 128-bit file IDs separate their files.
 | Opcode | Meaning | Response |
 | --- | --- | --- |
 | `0x13` | Open metadata | Authenticated pending response, then metadata key after IO0 |
-| `0x14` | Mint new file | Fresh token-generated 16-byte file ID and its 32-byte key |
+| `0x14` | Mint new file (v7) | Fresh token-generated 16-byte file ID and its 32-byte key. Firmware v8 still answers it; the app no longer sends it |
 | `0x15` | Authorize selection | Commit to a hash of the ordered file contexts. IO0 activates it on that connection |
 | `0x16` | Read next selected key | Present the next context and remaining hash, then consume one entry |
 | `0x17` | Mint an import batch | Fresh token-generated 16-byte batch ID and 32-byte batch secret |
@@ -142,14 +142,25 @@ See [flash provisioning](FLASH_ENCRYPTION.md) for hardware storage consideration
 
 ## Validation
 
-On Windows, `python -m pytest -q Python/tests` passed all 254 tests in 70.71 seconds.
+On 2026-11-24, `python -m pytest -q Python/tests` passed all 242 tests on Windows.
 The host tests exercise encrypted BLE responses, missing or forged approval,
 single-tap mixed v7/v8 export, selection substitution, single-request batch imports, worker
-cancellation, recovery, authenticated file output and the Qt interface. The v8
-ESP32-CAM PlatformIO build uses 1,198,685 bytes of program flash and 39,580 bytes
-of static RAM. The ESP32-CAM-MB used for these checks last ran v7. Validation of v8
-covered compilation and scripted BLE exchanges. A live v8 import and an IO0-approved
-export on that board are still pending.
+cancellation, recovery, authenticated file output, the 5-minute idle lock and the Qt
+interface. The v8 ESP32-CAM PlatformIO build uses 1,198,685 bytes of program flash and
+39,580 bytes of static RAM.
+
+Live v8 status: the board booted firmware v8 (advertising `3T-Token-v8`) and completed a
+fresh USB pairing on 2026-11-19 after its NVS had been cleared. One boot on a front-panel
+USB port crashed during Bluetooth start-up and the token then stayed unresponsive until
+reset; on a different port it booted cleanly. A live v8 import and an IO0-approved
+export are still pending.
+
+A local disk-acquisition adversary harness (`devtools/adversary_harness.py`, not
+committed) attacks a v2 vault built through `vault.py` with a simulated token. On
+2026-11-24 it reported 24 defences held, 0 broken, and 4 metadata-only exposures: item
+count, 4 KiB size buckets, the public environment hash and LSB detectability of stego
+carriers. It confirmed that the metadata key decrypts no file and one file's key decrypts
+no other file in the same import.
 
 ### Live v7 batch import
 

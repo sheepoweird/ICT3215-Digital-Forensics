@@ -38,7 +38,7 @@
 //
 // session_key = HMAC(auth_key, "3T-SK-v1" | token_nonce | host_nonce)
 // REQUEST plaintext  = op | context (32, 48, 64 or 96 bytes)      (AAD = "3T-REQ-v1" | token_id)
-// RESPONSE plaintext = status | data (32 bytes, or 48 for mint)      (AAD = "3T-RSP-v1" | token_id)
+// RESPONSE plaintext = status | data (32 bytes, or 48 for mint/import batch) (AAD = "3T-RSP-v1" | token_id)
 // env_key (DERIVE)   = HMAC(master_secret, "3T-ENV-v1" | env_hash)
 #define MSG_HELLO      0x10
 #define MSG_CHALLENGE  0x11

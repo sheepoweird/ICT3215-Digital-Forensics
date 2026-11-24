@@ -75,16 +75,6 @@ def _read_audio_carrier(path: str):
     return params, np.rint(samples, out=samples).astype(np.int16)
 
 
-def wav_capacity_bytes(path: str) -> int:
-    """Total bytes carriable in a WAV's sample LSBs (1 bit per sample, no header subtracted)."""
-    with _open_wav(path) as w:
-        p = w.getparams()
-    if p.sampwidth not in _DTYPE:
-        return 0
-    n_samples = p.nframes * p.nchannels
-    return n_samples // 8
-
-
 def embed_blob_wav(carrier_path: str, blob: bytes, output_path: str,
                    match_timestamps: bool = False, order_key: bytes | None = None) -> str:
     """

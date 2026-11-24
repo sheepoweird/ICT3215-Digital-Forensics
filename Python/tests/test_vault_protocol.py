@@ -90,10 +90,6 @@ class Link:
         elif op == tc.OP_IMPORT_BATCH:
             batch = os.urandom(16)
             value = batch + hmac.digest(MASTER, b"3T-VAULT-BATCH-v1" + context + batch, "sha256")
-        elif op == tc.OP_VAULT_MINT:
-            blob = os.urandom(16)
-            ctx = hashlib.sha256(b"EnvVault-v2" + context + blob).digest()
-            value = blob + hmac.digest(MASTER, b"3T-VAULT-FILE-v2" + ctx, "sha256")
         else:
             label = b"3T-VAULT-META-v2" if op == tc.OP_VAULT_OPEN else b"3T-ENV-v1"
             value = hmac.digest(MASTER, label + context, "sha256")
@@ -108,14 +104,14 @@ def connect(monkeypatch, mode="approve"):
     return link
 
 
-def test_mint_and_one_tap_export_for_a_selection(monkeypatch, tmp_path):
+def test_one_tap_export_of_direct_key_entries(monkeypatch, tmp_path):
+    # Vault entries imported by firmware v7 used a direct per-file key; they must still export.
     link = connect(monkeypatch)
     monkeypatch.setattr(tc, "_app_dir", lambda: tmp_path)
     vault = os.urandom(48)
-    files = [tc.request_vault_key("mint", vault) for _ in range(3)]
-    assert len(set(files)) == 3 and link.prompts == []
-    contexts = [hashlib.sha256(b"EnvVault-v2" + vault + file[:16]).digest() for file in files]
-    expected = [files[2][16:], files[0][16:]]
+    contexts = [hashlib.sha256(b"EnvVault-v2" + vault + os.urandom(16)).digest() for _ in range(3)]
+    keys = [hmac.digest(MASTER, b"3T-VAULT-FILE-v2" + context, "sha256") for context in contexts]
+    expected = [keys[2], keys[0]]
     received = []
     tc.export_selected_keys([contexts[2], contexts[0]], lambda i, key: received.append((i, key)))
     assert received == list(enumerate(expected))

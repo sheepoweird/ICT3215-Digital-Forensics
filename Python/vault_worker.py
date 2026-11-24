@@ -5,7 +5,6 @@ import sys
 
 import token_comms
 import vault
-import vault_v2
 from crypto_engine import INDEX_HASH, environment_hash
 from signals import collect_all_signals
 from winutils import restore_worker_streams as _restore_worker_streams
@@ -35,18 +34,18 @@ def main():
             return 0
         path = request["path"]
         code = request.get("recovery_code")
-        meta = vault_v2._meta(path)
+        meta = vault._meta(path)
         if code:
-            session = vault_v2.unlock_recovery(path, code, local=True)
+            session = vault.unlock_recovery(path, code, local=True)
         else:
             # The GUI already authenticated the signal IDs when it opened the list.
             # Low-level callers without that list can retrieve it through the paired token.
             signal_ids = request.get("signal_ids")
             if signal_ids is None:
-                signal_ids = vault_v2.read_signal_ids(path, token_comms.request_env_key(INDEX_HASH))
+                signal_ids = vault.read_signal_ids(path, token_comms.request_env_key(INDEX_HASH))
             if live_environment(signal_ids).hex() != meta["env_hash"]:
                 raise vault.VaultError("The vault environment has changed.")
-            session = vault_v2.Vault(path, bytes.fromhex(request["metadata_key"]), local=True)
+            session = vault.Vault(path, bytes.fromhex(request["metadata_key"]), local=True)
         try:
             if action == "import":
                 result = session.add_files(request["sources"], shred_original=request["shred_original"])

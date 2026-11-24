@@ -25,8 +25,8 @@ python --version
 ## Step 2 — Open the Project in VS Code
 
 1. Open VS Code
-2. **File → Open Folder** → select the `envstego` folder
-3. VS Code will detect the `.vscode/launch.json` automatically
+2. **File → Open Folder** → select the repository folder (`ICT3215-Digital-Forensics`).
+   The desktop app is in `Python/` and the token firmware in `ESP32 Files/`.
 
 ---
 
@@ -40,20 +40,20 @@ pip install -r requirements.txt
 
 Run this from `Python/`. This installs PyQt6, cryptography, Pillow, numpy,
 SoundFile, jpeglib, pyserial, Bleak and pytest. Native JPEG support uses the pinned
-`jpeglib==1.0.2` dependency; it is already installed in this project's `.venv`.
+`jpeglib==1.0.2` dependency, which installs as a prebuilt Windows wheel.
 
 ---
 
 ## Step 4 — Run the App
 
-**Option A — VS Code (with debugger):**
-Press `F5` or go to **Run → Start Debugging**
-Select **"Run EnvStego"** from the dropdown
-
-**Option B — Terminal:**
+**Option A — Terminal:**
 ```
+cd Python
 python main.py
 ```
+
+**Option B — VS Code:** open `Python/main.py` and press `F5` (**Run → Start Debugging**),
+choosing **Python File** if asked.
 
 ---
 
@@ -91,13 +91,29 @@ The count tells you what happened; short flashes are good news, long ones are pr
 | 1 short | Ready, paired |
 | 2 short | Ready, waiting for USB pairing |
 | 3 short | Pairing succeeded |
-| 2 very fast | The token served a generic environment or index key request. Use the import result in the app to see which files finished. |
+| 2 short, straight after an IO0 tap | Vault action approved (opening the list or exporting the selection) |
+| 2 very fast | The token served an environment or index key request (Encrypt, Decrypt, Test Key, vault signal check) |
 | 1 long | Rejected a bad request |
 | 2 long | Pairing confirmation timed out |
 | 3 long | The Bluetooth connection was closed after 5 authentication failures on that link |
 
-If the boot blink keeps repeating, the token is resetting itself, usually because the
-USB port can't supply enough power when Bluetooth starts. Try a rear USB port or a powered hub.
+### Token troubleshooting
+
+- **The boot blink keeps repeating:** the token is resetting itself, usually because the
+  USB port cannot supply enough current when Bluetooth starts. Try a rear (motherboard)
+  USB port, a short cable or a powered hub.
+- **The token stops responding** (no Test connection, pairing says the token did not answer,
+  or claims the firmware is older than v5): press **RST** once and wait for the ready
+  flashes. A token that crashed during start-up can stay frozen until it is reset. Open a
+  serial monitor at 115200 baud to confirm it reaches `BLE Server is running`, then close
+  the monitor before pairing.
+- **The port changed after moving the cable:** click **↻** and select the new COM port.
+
+| Pairing message | Cause | Fix |
+|---|---|---|
+| "This token is already paired. Re-pairing requires the saved credential…" | This PC has no credential for an already-paired token (for example after **Forget pairing**) | Restore the original pairing config, or factory reset the token (destroys its secret) |
+| "Token refused pairing (BUSY)" | An earlier pairing attempt is still waiting for IO0 (up to 60 s) | Wait a minute or press RST, then retry |
+| "Pairing was not confirmed on the token in time" | IO0 was not pressed within 60 s | Retry and press IO0 while the light is solid |
 
 ---
 
@@ -116,7 +132,7 @@ refreshes and restarts.
    encrypted (ECDH) exchange; the PC stores it encrypted with Windows DPAPI
 3. Click **Test connection** to run the authenticated BLE handshake. The USB cable is no longer needed
 - **Re-pair Token** requires the saved credential and an IO0 confirmation. It keeps the token's keys and works after a PC rename.
-- **Forget pairing** deletes this PC's credential. Keep a backup of the pairing config under the original Windows account if you need to re-pair. Losing the only copy prevents re-pairing without a factory reset.
+- **Forget pairing** deletes this PC's credential only; the token stays paired. Keep a backup of the pairing config under the original Windows account if you need to re-pair. Losing the only copy prevents re-pairing without a factory reset.
 - **Factory reset** (hold IO0 for 2 seconds while it boots) destroys the master secret.
   Stego files become unrecoverable; vaults need their offline recovery codes
 - Firmware **v5 or later** is required for USB pairing.
@@ -182,7 +198,8 @@ file), so leave it **off** if you want a file that only opens in one place — u
 
 ### Protect › Decrypt
 1. Choose the **stego carrier** (JPEG, PNG, WebP, BMP, TIFF or WAV). The last output
-   or complete split set is filled in for you. Old PNG/WAV outputs remain readable
+   or complete split set is filled in for you. Images made by builds older than the
+   current (v3) format are no longer supported
 2. For a payload split across several carriers, tick **This file was split across several
    carriers** and add the whole set. The app regroups and reorders them with the token. If a
    carrier is missing it tells you which pieces are absent
@@ -190,13 +207,13 @@ file), so leave it **off** if you want a file that only opens in one place — u
    **under its original filename**, and existing files are never overwritten
 4. The same signals (use the same preset) and the same token are required, otherwise
    authentication fails (forensic defense)
+5. The recovered file is written to disk only. The app does not display its contents;
+   use **Show recovered file** to open its folder
 
 If an older build produced only **one** file while split mode was selected, choose
-that file on Decrypt. The updated app can recover a complete one-piece split set
-in single mode, or with that one file added in split mode. This does not bypass a
-missing piece: a real multi-piece set still requires every generated stego file.
-Future split encryptions produce one file per usable selected carrier. This fix
-is in the desktop Python app; restart the app to load it.
+that file on Decrypt. A complete one-piece split set is recovered in single mode, or
+with that one file added in split mode. This does not bypass a missing piece: a real
+multi-piece set still requires every generated stego file.
 
 ### Output size and concealment
 
@@ -208,12 +225,21 @@ establish that embedded data is statistically undetectable. Progressive JPEG
 inputs are currently written as baseline JPEG, and indexed/other pixel modes
 may be converted to RGB/RGBA. See [STEGO_FORMATS.md](STEGO_FORMATS.md) for limits.
 
-In a 4 KiB native JPEG test on 2026-11-18, `_DSC0003.jpg` changed from 6,621,504 to
-6,621,532 bytes; `car.jpg` changed from 224,273 to 224,276 bytes. Both test payloads
-recovered exactly and the original carriers were unchanged. Test copies are kept
-under ignored `build/`; they are not replacements for your encrypted files.
-Restart the app and encrypt again to generate native-format outputs. Existing
-PNG outputs continue to decrypt as before; renaming them to JPEG does not convert them.
+Typical size changes, measured on 2026-11-22 with carriers produced by real encoders
+(ffmpeg/libwebp/LAME) and a hidden payload of up to 4 KiB:
+
+| Carrier | Output | Size change |
+|---|---|---|
+| JPEG (colour or greyscale) | JPEG | +4 % to +11 % |
+| PNG, BMP, TIFF | same format | 0 % (BMP) to about +25 % (TIFF) |
+| Lossy WebP | lossless WebP | about **7× larger** (40 KB → 279 KB) |
+| GIF | PNG | about 2× larger |
+| MP3, Ogg, Opus, FLAC | WAV | **several times larger** (a 194 KB MP3 → 1.4 MB WAV) |
+
+A large size jump or a format change (MP3 → WAV) is something an examiner can notice.
+JPEG capacity is far lower than the same picture as PNG (about 3 KB against 112 KB in
+that test), so use PNG, BMP, TIFF or WAV carriers for larger payloads. Existing
+PNG outputs continue to decrypt; renaming them to JPEG does not convert them.
 
 ### Protect › Vault
 
@@ -223,10 +249,14 @@ images and audio. No format-specific parser is needed for storing or exporting f
 1. Update the token to **v8** while preserving NVS and the saved pairing. Choose readable
    signals and an empty folder, then select **Create Env Vault**. When the token light
    stays on, tap IO0 once to open the new list. Save the 52-character recovery code offline.
+   If you use **Copy**, the clipboard is cleared after 30 seconds; Windows clipboard history
+   (Win+V) keeps its own copy if you have it turned on.
 2. **Browse files** checks the environment and asks for one IO0 tap each time you open
    a locked list. The open session holds the metadata key and displays filenames, sizes and dates.
-3. **Add files** checks the current environment and requests one temporary batch secret
-   for the selection. Bluetooth disconnects before file encryption starts. The worker
+3. **Add files** (or drag files onto the list) asks whether to **Keep** or **Delete** the
+   originals; Keep is the default. No IO0 tap is needed. The app checks the current
+   environment and requests one temporary batch secret for the selection. Bluetooth
+   disconnects before file encryption starts. The worker
    derives a separate AES key for each file, verifies the encrypted copy before any
    optional deletion, and releases the batch secret when the import ends. A transient
    connection failure during acquisition can trigger one retry before any files are
@@ -237,7 +267,10 @@ images and audio. No format-specific parser is needed for storing or exporting f
    connection drops, previously completed outputs remain and the remaining selection needs
    fresh approval. Existing output filenames are preserved.
 5. **Lock now** or **Ctrl+Shift+L** closes the list and cancels active file workers.
-   The app also locks after failed token heartbeat checks while idle.
+   The app also locks by itself when the token stops answering (checked every 25 s),
+   and after **5 minutes without vault activity** even with the token in range.
+   Selecting files or running an import or export counts as activity.
+   There is no in-app preview: use **Export** to open a file.
 6. **Unlock with recovery code** opens the list with the offline code. Re-enter it for
    each single-file recovery export. This route works without an IO0 press.
 
@@ -274,27 +307,31 @@ See [vault security and recovery](VAULT_SECURITY.md) for key handling and format
   pixels do not have the same one-level bound.
 - Minimum carrier size: ~200×200 px image, or a WAV a few seconds long, for small payloads
 - **Rule of thumb for capacity:** a 1920×1080 PNG holds ~759 KB; a 16-bit stereo WAV holds
-  ~1 byte per 8 samples (~10.6 KB per second at 44.1 kHz). For bigger files, split across
-  several carriers
+  ~1 byte per 8 samples (~10.6 KB per second at 44.1 kHz). A JPEG holds far less (only
+  coefficients of magnitude 2 or more are used). For bigger files, split across several carriers
 
 ---
 
 ## File Structure
 ```
-envstego/
-├── main.py            ← Entry point (run this)
-├── signals.py         ← Environment signal collection (22 signals)
-├── crypto_engine.py   ← HKDF key derivation + AES-256-GCM + v3 header/shard crypto
-├── stego_engine.py    ← Native JPEG coefficients + lossless pixel image steganography
-├── audio_engine.py    ← LSB steganography for WAV audio
-├── media.py           ← Image and audio carrier dispatcher
-├── multi_image.py     ← Split one payload across several carriers (+ rejoin)
-├── ui_main.py         ← Full PyQt6 user interface
-├── vault_v2.py        ← Metadata sessions, per-file encryption and recovery
-├── vault_worker.py    ← Short-lived import/export process
-├── vault.py           ← Shared storage helpers and legacy format-1 code
-├── requirements.txt   ← pip dependencies
-├── build.bat          ← Build EnvStego.exe
-└── .vscode/
-    └── launch.json    ← VS Code run config
+ICT3215-Digital-Forensics/
+├── Python/
+│   ├── main.py            ← Entry point (run this)
+│   ├── signals.py         ← Environment signal collection (22 signals)
+│   ├── crypto_engine.py   ← HKDF key derivation + AES-256-GCM + v3 header/shard crypto
+│   ├── stego_engine.py    ← Native JPEG coefficients + lossless pixel image steganography
+│   ├── audio_engine.py    ← LSB steganography for audio (written as PCM WAV)
+│   ├── media.py           ← Image and audio carrier dispatcher
+│   ├── multi_image.py     ← Split one payload across several carriers (+ rejoin)
+│   ├── archive.py         ← Folder payloads (zip, with zip-slip protection)
+│   ├── token_comms.py     ← USB pairing and the encrypted BLE protocol
+│   ├── pair_crypto.py     ← X25519 pairing key exchange
+│   ├── vault.py           ← Env Vault: metadata sessions, per-file encryption, recovery
+│   ├── vault_worker.py    ← Short-lived import/export process
+│   ├── winutils.py        ← Secure delete, atomic writes, DPAPI and Windows helpers
+│   ├── ui_main.py         ← PyQt6 user interface
+│   ├── requirements.txt   ← pip dependencies
+│   └── tests/             ← Automated tests (pytest, 242 tests)
+├── ESP32 Files/           ← 3T token firmware (PlatformIO, firmware v8)
+└── md/                    ← This guide and the design/validation documents
 ```

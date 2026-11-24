@@ -45,13 +45,12 @@ from crypto_engine import (
     assess_selection, recommended_ids, pack_payload, unpack_payload, packed_size,
     request_index_key, pack_header, unpack_header, OUTER_SIZE, PAYLOAD_AAD,
     SHARD_OUTER_SIZE, unpack_shard_tag, KIND_FILE, KIND_FOLDER, payload_kind,
+    environment_hash,
 )
 import multi_image as mi
 import media
-import vault_v2 as V
-from crypto_engine import environment_hash
+import vault as V
 from archive import zip_folder, safe_extract_zip
-from stego_engine import extract, MAGIC, LEGACY_MAGIC
 from media import embed_blob, read_lsb_all
 from winutils import pictures_dir, downloads_dir
 from winutils import protect_str, unprotect_str
@@ -606,9 +605,8 @@ class DecryptWorker(QThread):
     error        = pyqtSignal(str)
     signals_used = pyqtSignal(list)   # IDs read from a v3 header, so the UI can show them
 
-    def __init__(self, selected_ids, stego_paths, output_dir):
+    def __init__(self, stego_paths, output_dir):
         super().__init__()
-        self._selected_ids = set(selected_ids)
         self._split = not isinstance(stego_paths, str)
         self._stego_paths  = [stego_paths] if isinstance(stego_paths, str) else list(stego_paths)
         self._stego        = self._stego_paths[0] if self._stego_paths else ""
@@ -618,23 +616,8 @@ class DecryptWorker(QThread):
         try:
             if self._split:
                 self._decrypt_multi()        # a payload split across several images
-                return
-            if media.is_jpeg(self._stego):
-                self._decrypt_v3()           # native JPEG was introduced with the v3 payload
-                return
-
-            # A plain (unscattered) read just to tell a legacy v2 "ENV2" image apart from
-            # a current v3 one. v3 has no marker and is scattered, so this looks random.
-            marker = read_lsb_all(self._stego)[:4]
-            if marker == LEGACY_MAGIC:
-                self.error.emit(
-                    "This image was made by an older EnvStego build that used a hardcoded "
-                    "token secret. It is not supported by the secure token protocol.")
-                return
-            if marker == MAGIC:
-                self._decrypt_v2()           # legacy ENV2 image, uses the page's selection
             else:
-                self._decrypt_v3()           # current format, signals read from the header
+                self._decrypt_v3()           # signals are read from the encrypted header
         except InvalidTag:
             self.error.emit(ENV_MISMATCH_MSG)
         except Exception as e:
@@ -729,25 +712,6 @@ class DecryptWorker(QThread):
         blob = decrypt_payload(salt, nonce, ct, env_key, PAYLOAD_AAD)
         name, data = unpack_payload(blob)
         self._save_and_report(name, data, payload_kind(blob), fp, len(selected), how)
-
-    # -- legacy ENV2 format: signals come from the page's selection ----------------
-    def _decrypt_v2(self):
-        salt, nonce, ct = extract(self._stego)
-        selected, missing = _resolve_selection(self._selected_ids)
-        if not selected:
-            self.error.emit("This older image needs you to select, on the Signals page, the "
-                            "same signals used to encrypt it.")
-            return
-        if missing:
-            self.error.emit(
-                "Environment mismatch — these selected signals cannot be read here:\n  "
-                + "\n  ".join(s.name for s in missing)
-                + "\n\nThe key cannot be rebuilt without them (forensic defense active).")
-            return
-        env_key, fp = derive_env_key(selected)
-        blob = decrypt_payload(salt, nonce, ct, env_key, MAGIC)
-        name, data = unpack_payload(blob)
-        self._save_and_report(name, data, payload_kind(blob), fp, len(selected), "collected live at decrypt time")
 
     def _save_and_report(self, name, data, kind, fp, n_signals, how):
         out_dir = self._output_dir or str(Path(self._stego).parent)
@@ -860,8 +824,8 @@ class VaultHeartbeatWorker(QThread):
 
 
 class VaultTaskWorker(QThread):
-    """Runs a local vault operation (add/read/export) off the GUI thread so a big
-    file does not freeze the window. No token/BLE involved — the vault is unlocked."""
+    """Runs a vault import or export off the GUI thread so a big file does not freeze
+    the window. The vault worker process makes any token requests (IO0 for export)."""
     done  = pyqtSignal(object)
     error = pyqtSignal(str)
 
@@ -2757,7 +2721,7 @@ class MainWindow(QMainWindow):
         self._dec_open_btn.setVisible(False)
 
         stego_arg = self._dec_stegos.paths() if self._dec_split.isChecked() else self._dec_stego.path()
-        w = DecryptWorker(self._selected_ids, stego_arg, self._dec_output.path())
+        w = DecryptWorker(stego_arg, self._dec_output.path())
         w.done.connect(self._on_decrypt_done)
         w.error.connect(self._on_decrypt_error)
         w.signals_used.connect(self._on_decrypt_signals_used)

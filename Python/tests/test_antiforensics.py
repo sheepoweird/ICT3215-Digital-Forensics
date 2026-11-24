@@ -3,7 +3,7 @@ EnvStego — anti-forensics feature tests (no hardware required)
 
 Combines what used to be test_privacy, test_secure_delete and test_secret_store.
 Covers:
-  * embed(match_timestamps=True) copies the carrier's dates onto the stego image
+  * embed_blob(match_timestamps=True) copies the carrier's dates onto the stego image
   * timestamp copying is cosmetic: a failure never breaks embedding
   * pictures_dir / downloads_dir resolve real folders
   * shred_file overwrites then deletes the original plaintext
@@ -27,7 +27,8 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 import stego_engine
-from winutils import (copy_file_times, timestomp, shred_file, pictures_dir,
+import winutils
+from winutils import (atomic_write_text, copy_file_times, timestomp, shred_file, pictures_dir,
                       downloads_dir, protect_str, unprotect_str)
 
 
@@ -64,9 +65,8 @@ def test_copy_file_times_never_raises_on_bad_source(tmp_path):
 def test_embed_matches_timestamps_when_asked(tmp_path):
     old_epoch = time.time() - 365 * 24 * 3600
     carrier = _carrier(tmp_path / "holiday.png", old_epoch)
-    salt, nonce, ct = os.urandom(16), os.urandom(12), os.urandom(200)
-    out = stego_engine.embed(carrier, salt, nonce, ct, str(tmp_path / "out.png"),
-                             match_timestamps=True)
+    out = stego_engine.embed_blob(carrier, os.urandom(228), str(tmp_path / "out.png"),
+                                  match_timestamps=True)
     # The fresh output inherits the carrier's old modified date
     assert abs(os.stat(out).st_mtime - old_epoch) < 2
 
@@ -74,18 +74,33 @@ def test_embed_matches_timestamps_when_asked(tmp_path):
 def test_embed_keeps_fresh_timestamp_by_default(tmp_path):
     old_epoch = time.time() - 365 * 24 * 3600
     carrier = _carrier(tmp_path / "c.png", old_epoch)
-    salt, nonce, ct = os.urandom(16), os.urandom(12), os.urandom(120)
-    out = stego_engine.embed(carrier, salt, nonce, ct, str(tmp_path / "out.png"))
+    out = stego_engine.embed_blob(carrier, os.urandom(148), str(tmp_path / "out.png"))
     assert os.stat(out).st_mtime - old_epoch > 1000     # clearly a new date
 
 
 def test_embed_still_round_trips_with_timestamp_copy(tmp_path):
     carrier = _carrier(tmp_path / "c.png", time.time() - 10000)
-    salt, nonce, ct = os.urandom(16), os.urandom(12), os.urandom(300)
-    out = stego_engine.embed(carrier, salt, nonce, ct, str(tmp_path / "out.png"),
-                             match_timestamps=True)
-    r_salt, r_nonce, r_ct = stego_engine.extract(out)
-    assert (r_salt, r_nonce, r_ct) == (salt, nonce, ct)
+    blob = os.urandom(328)
+    out = stego_engine.embed_blob(carrier, blob, str(tmp_path / "out.png"),
+                                  match_timestamps=True, order_key=bytes(32))
+    assert stego_engine.read_lsb_all(out, order_key=bytes(32))[:len(blob)] == blob
+
+
+def test_atomic_write_retries_while_the_destination_is_briefly_locked(tmp_path, monkeypatch):
+    target = tmp_path / "index.bin"
+    target.write_text("old", encoding="ascii")
+    real_replace, attempts = os.replace, []
+
+    def locked_twice(src, dst):
+        attempts.append(dst)
+        if len(attempts) <= 2:
+            raise PermissionError(32, "being used by another process")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(winutils.os, "replace", locked_twice)
+    atomic_write_text(target, "new", "ascii")
+    assert target.read_text(encoding="ascii") == "new" and len(attempts) == 3
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_user_dirs_return_existing_folders():

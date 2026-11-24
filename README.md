@@ -49,7 +49,7 @@ code can recover the entire vault. [Vault security and recovery](md/VAULT_SECURI
 
 - **Hardware token (ESP32)** — USB ECDH pairing, authenticated BLE key requests, replay
   protection and lockout. Credentials sealed with Windows DPAPI.
-- **Environment signals** — 21 hardware/network/OS signals, each rated for stability, with
+- **Environment signals** — 22 hardware/network/OS signals, each rated for stability, with
   a one-click **Recommended** selection and **Portable / Place-bound** modes.
 - **Steganography** — hide any file, including DOCX or PDF, inside an image or audio
   carrier. Inputs include JPEG, PNG, WebP, BMP, TIFF, GIF, WAV, MP3, FLAC, Ogg, Opus,
@@ -60,10 +60,13 @@ code can recover the entire vault. [Vault security and recovery](md/VAULT_SECURI
   piece. Decrypt receives the complete output set automatically.
   WebP outputs are lossless and may grow from lossy inputs. Native JPEG support is
   implemented inside `stego_engine.py`; native MP3 embedding is not implemented.
+  Recovered files are written to disk only; the app never displays their contents.
   See [format behavior and validation](md/STEGO_FORMATS.md).
 - **Env Vault v2** — arbitrary file types, including DOCX and PDF; encrypted metadata,
-  one token request per import selection, locally derived per-file keys, and offline recovery. **No vault preview.** Auto-lock and **Ctrl+Shift+L** clear
-  the list and cancel active file workers. Deleting imported originals is optional;
+  one token request per import selection, locally derived per-file keys, and offline
+  recovery. **No in-app preview.** The list locks on **Ctrl+Shift+L**, when the token stops
+  answering, or after 5 minutes without vault activity, and locking cancels active file
+  workers. Each import asks whether to keep or delete the originals (keep by default);
   each deletion outcome is reported.
 - **Anti-forensic hygiene** — secure delete (overwrite + timestomp + rename + unlink),
   optional free-space wipe, Privacy mode, and settings kept out of the Windows registry.
@@ -87,8 +90,8 @@ Encrypt a file or create a Vault.
 ```
 Python/          Host application (PyQt6) + automated tests
   main.py        Entry point
-  crypto_engine, stego_engine, audio_engine, media, multi_image, vault, signals,
-  vault_v2, vault_worker, token_comms, pair_crypto, winutils, ui_main
+  crypto_engine, stego_engine, audio_engine, media, multi_image, archive, signals,
+  vault, vault_worker, token_comms, pair_crypto, winutils, ui_main
   tests/         Automated tests (pytest)
 ESP32 Files/     3T token firmware
 md/              Setup/usage guide and docs
@@ -97,7 +100,21 @@ md/              Setup/usage guide and docs
 ## Hardware
 
 The token is a single **ESP32-CAM** module, flashed with the firmware in `ESP32 Files/`.
-No custom PCB or extra components are required beyond a USB-to-serial programmer and cable.
+No custom PCB, soldering or extra components are required.
+
+**Bill of materials**
+
+| Item | Qty | Purpose |
+| --- | --- | --- |
+| ESP32-CAM module (ESP32-D0WD, 4 MB flash) | 1 | The token: holds the master secret, BLE radio, IO0 confirmation button, white LED for status |
+| ESP32-CAM-MB USB programmer board (CH340) | 1 | USB power, flashing and first-time USB pairing; the module plugs straight onto it |
+| USB data cable (Micro-USB or USB-C, to match the programmer board) | 1 | Connects the programmer to the PC |
+| Windows 10/11 PC with Bluetooth LE | 1 | Runs the EnvStego desktop app |
+
+The camera that ships with the ESP32-CAM is not used. Power the board from a rear
+(motherboard) USB port or a powered hub: Bluetooth start-up draws a current spike that
+weak ports cannot supply.
+
 Vault v2 needs **firmware v8**. Updating the application alone is insufficient.
 Preserve NVS and the pairing config when updating the firmware.
 
@@ -107,10 +124,11 @@ Preserve NVS and the pairing config when updating the firmware.
 python -m pytest Python/tests/ -q
 ```
 
-The suite covers stego round trips, host BLE protocol behavior, vault key separation,
-recovery, write failures, concurrency, batch approvals, subprocess cancellation and Qt UI
-flows. Host protocol simulation does not validate the physical IO0 circuit or BLE
-runtime. See [validation results](md/VAULT_SECURITY.md#validation).
+All 242 tests pass (2026-11-24). The suite covers stego round trips for every supported
+carrier, host BLE protocol behavior, vault key separation, recovery, write failures,
+concurrency, batch approvals, subprocess cancellation and Qt UI flows. Host protocol
+simulation does not validate the physical IO0 circuit or BLE runtime. See
+[validation results](md/VAULT_SECURITY.md#validation).
 
 ## Team
 

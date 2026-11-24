@@ -28,7 +28,6 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 
 PAIR_INFO = b"EnvStego-pair-v1"
-PUB_LEN = 32
 IV_LEN = 12
 TAG_LEN = 16
 

@@ -18,7 +18,7 @@ import re
 import sys
 import shutil
 import functools
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 
@@ -170,11 +170,6 @@ def _run_ps_ex(cmd: str, timeout: int = 12) -> Tuple[str, str, int]:
 def _run_cmd(cmd: list, timeout: int = 10) -> str:
     """Run a system command, return stdout or empty string on failure."""
     return _run_cmd_ex(cmd, timeout)[0]
-
-
-def _run_ps(cmd: str, timeout: int = 12) -> str:
-    """Run a PowerShell command, return stdout or empty string on failure."""
-    return _run_ps_ex(cmd, timeout)[0]
 
 
 def _ps_error(err: str, rc: int, fallback: str) -> str:

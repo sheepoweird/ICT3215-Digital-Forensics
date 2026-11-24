@@ -55,7 +55,7 @@ MSG_REQUEST, MSG_RESPONSE = 0x20, 0x21
 MSG_ERROR = 0x7F
 
 OP_DERIVE, OP_PING = 0x01, 0x02
-OP_VAULT_OPEN, OP_VAULT_MINT, OP_EXPORT_BEGIN, OP_EXPORT_NEXT = 0x13, 0x14, 0x15, 0x16
+OP_VAULT_OPEN, OP_EXPORT_BEGIN, OP_EXPORT_NEXT = 0x13, 0x15, 0x16   # 0x14 (v7 per-file mint) is unused
 OP_IMPORT_BATCH, OP_EXPORT_CHILD = 0x17, 0x18
 
 NONCE_LEN, TOKEN_ID_LEN, IV_LEN, TAG_LEN, HASH_LEN = 16, 16, 12, 16, 32
@@ -568,11 +568,11 @@ async def _ble_link():
                 reply = await receive()
                 if operation in (OP_IMPORT_BATCH, OP_EXPORT_CHILD) and reply == bytes([MSG_ERROR, 0x04]):
                     raise TokenError("Batch-imported vault files require firmware v8. Check the firmware and export selection.")
-                if operation in (OP_VAULT_OPEN, OP_VAULT_MINT, OP_EXPORT_BEGIN) and reply == bytes([MSG_ERROR, 0x04]):
+                if operation in (OP_VAULT_OPEN, OP_EXPORT_BEGIN) and reply == bytes([MSG_ERROR, 0x04]):
                     raise TokenError("Vault operations require token firmware v7.")
                 approval = operation in (OP_VAULT_OPEN, OP_EXPORT_BEGIN)
                 try:
-                    data = parse_response(reply, sk, token_id, 48 if operation in (OP_VAULT_MINT, OP_IMPORT_BATCH) else 32)
+                    data = parse_response(reply, sk, token_id, 48 if operation == OP_IMPORT_BATCH else 32)
                 except TokenConfirmationPending:
                     if not approval:
                         raise TokenAuthError("Unexpected vault approval response.")
@@ -641,13 +641,12 @@ def request_env_key(env_hash: bytes) -> bytes:
 
 
 def request_vault_key(operation: str, context: bytes) -> bytes:
-    """Open an index with IO0, or mint a fresh file ID and key without IO0."""
-    operations = {"metadata": (OP_VAULT_OPEN, 32), "mint": (OP_VAULT_MINT, 48)}
-    if operation not in operations or len(context) != operations[operation][1]:
+    """Open a vault's file list: the token returns its metadata key after an IO0 tap."""
+    if operation != "metadata" or len(context) != HASH_LEN:
         raise ValueError("Invalid vault key request.")
     with _BLE_EXCHANGE_LOCK:
         with process_file_lock(_app_dir() / ".token-ble.lock", timeout=80):
-            return _run_isolated(_transaction(operations[operation][0], context))
+            return _run_isolated(_transaction(OP_VAULT_OPEN, context))
 
 
 def export_selected_keys(contexts, consume):

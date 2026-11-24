@@ -26,7 +26,6 @@ if "--jpeg-worker" in sys.argv:
     sys.exit(stego_engine._jpeg_worker_main())
 
 from PyQt6.QtWidgets import QApplication, QMessageBox
-from PyQt6.QtGui import QIcon
 from PyQt6.QtCore import Qt
 
 from ui_main import MainWindow, STYLE

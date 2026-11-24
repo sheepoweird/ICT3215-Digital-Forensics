@@ -32,8 +32,8 @@ if str(APP_DIR) not in sys.path:
 import numpy as np
 import pytest
 from PIL import Image
-from PyQt6.QtCore import QEventLoop, QSettings, QTimer
-from PyQt6.QtWidgets import QApplication, QMessageBox, QTextEdit
+from PyQt6.QtCore import QEventLoop, QSettings
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 import crypto_engine
 import token_comms as tc
@@ -115,7 +115,7 @@ def win(tmp_path_factory):
     mp.setattr(ui_main, "list_serial_ports", lambda: [("COM9", "USB-SERIAL CH340 (COM9)")])
     mp.setattr(crypto_engine, "request_env_key",
                lambda h: run_transaction(SIM, SIM.auth_key, SIM.token_id, tc.OP_DERIVE, h))
-    from test_vault_v2 import Token
+    from test_vault import Token
     vault_key = Token()
     mp.setattr(ui_main.V, "create_vault", partial(ui_main.V.create_vault, key_provider=vault_key))
     mp.setattr(ui_main.V, "unlock_env", partial(ui_main.V.unlock_env, key_provider=vault_key))

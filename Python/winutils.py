@@ -84,7 +84,15 @@ def atomic_write_text(path: Path, text: str, encoding: str):
             out.flush()
             os.fsync(out.fileno())
             out.close()
-            os.replace(temporary, path)
+            # Antivirus or the search indexer can hold the destination open for a moment.
+            for delay in (0.05, 0.1, 0.2, 0.4, 0.8):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError:
+                    time.sleep(delay)
+            else:
+                os.replace(temporary, path)
         finally:
             out.close()
             temporary.unlink(missing_ok=True)

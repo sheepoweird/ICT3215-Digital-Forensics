@@ -7,13 +7,12 @@ actual challenge/response, key-derivation, crypto and steganography paths.
 
 What is covered (maps to the report's evaluation section):
   * key derivation      — env_key == HMAC(master, "3T-ENV-v1" | env_hash)
-  * stego round trip    — encrypt+embed then extract+decrypt restores bytes + name
+  * stego round trip    — v3 header + payload, scattered by the index key, restores bytes + name
   * wrong env / token    — a different signal set or a different token fails to decrypt
-  * tamper / JPEG        — a flipped LSB or a JPEG re-save makes extraction/decryption fail
+  * tamper / JPEG        — a flipped LSB or a JPEG re-save makes decryption fail
   * per-file salt        — the same payload encrypts to a fresh salt + ciphertext each time
   * replay / impostor    — a consumed nonce, a stale request and a wrong auth key are rejected
   * filename traversal   — "../../etc/passwd" is reduced to a bare basename on unpack
-  * legacy ENVS image    — v1 images are detected and refused
   * max pixel diff <= 1  — the carrier and stego image differ by at most 1 per channel
 
 Run from the Python/ directory:
@@ -41,15 +40,18 @@ import crypto_engine
 import stego_engine
 import token_comms as tc
 from crypto_engine import (
+    OUTER_SIZE,
+    PAYLOAD_AAD,
     assess_selection,
     decrypt_payload,
     encrypt_payload,
     environment_hash,
+    pack_header,
     pack_payload,
     recommended_ids,
+    unpack_header,
     unpack_payload,
 )
-from stego_engine import LEGACY_MAGIC, MAGIC, embed, extract
 
 # Firmware request length: type | host_nonce | iv | (op+hash) | tag
 REQUEST_LEN = 1 + tc.NONCE_LEN + tc.IV_LEN + (1 + tc.HASH_LEN) + tc.TAG_LEN  # 78
@@ -182,6 +184,23 @@ def make_carrier(path, w=256, h=256):
     return path
 
 
+INDEX_KEY = bytes(range(32))     # stand-in for the token's index key
+
+
+def hide(carrier, output, env_key, name, data):
+    """Embed a payload the way Encrypt does: v3 header + ciphertext, keyed bit order."""
+    salt, nonce, ct = encrypt_payload(pack_payload(name, data), env_key, PAYLOAD_AAD)
+    blob = pack_header(INDEX_KEY, salt, nonce, len(ct), ["cpu"]) + ct
+    return stego_engine.embed_blob(str(carrier), blob, str(output), order_key=INDEX_KEY)
+
+
+def reveal(stego, env_key):
+    stream = stego_engine.read_lsb_all(str(stego), order_key=INDEX_KEY)
+    salt, nonce, ct_len, _ids = unpack_header(INDEX_KEY, stream[:OUTER_SIZE])
+    ct = stream[OUTER_SIZE:OUTER_SIZE + ct_len]
+    return unpack_payload(decrypt_payload(salt, nonce, ct, env_key, PAYLOAD_AAD))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Key derivation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -220,12 +239,10 @@ def test_stego_round_trip_and_pixel_diff(tmp_path, env_key):
     payload = b"Top secret evidence \x00\x01\x02 payload bytes" * 20
     name = "report.pdf"
 
-    salt, nonce, ct = encrypt_payload(pack_payload(name, payload), env_key, MAGIC)
-    out = embed(str(carrier), salt, nonce, ct, str(tmp_path / "stego.png"))
+    out = hide(carrier, tmp_path / "stego.png", env_key, name, payload)
 
     # Round trip
-    r_salt, r_nonce, r_ct = extract(out)
-    rec_name, rec_data = unpack_payload(decrypt_payload(r_salt, r_nonce, r_ct, env_key, MAGIC))
+    rec_name, rec_data = reveal(out, env_key)
     assert rec_name == name
     assert rec_data == payload
 
@@ -240,13 +257,11 @@ def test_stego_round_trip_and_pixel_diff(tmp_path, env_key):
 # ─────────────────────────────────────────────────────────────────────────────
 def test_wrong_environment_fails(tmp_path, env_key):
     carrier = make_carrier(tmp_path / "c.png")
-    salt, nonce, ct = encrypt_payload(pack_payload("a.txt", b"data"), env_key, MAGIC)
-    embed(str(carrier), salt, nonce, ct, str(tmp_path / "s.png"))
-    r_salt, r_nonce, r_ct = extract(str(tmp_path / "s.png"))
+    out = hide(carrier, tmp_path / "s.png", env_key, "a.txt", b"data")
 
     wrong_env_key = os.urandom(32)  # a different signal set yields a different env_key
     with pytest.raises(InvalidTag):
-        decrypt_payload(r_salt, r_nonce, r_ct, wrong_env_key, MAGIC)
+        reveal(out, wrong_env_key)
 
 
 def test_wrong_token_fails(monkeypatch):
@@ -262,9 +277,9 @@ def test_wrong_token_fails(monkeypatch):
     key_b, _ = crypto_engine.derive_env_key(signals)
 
     assert key_a != key_b
-    salt, nonce, ct = encrypt_payload(pack_payload("x", b"secret"), key_a, MAGIC)
+    salt, nonce, ct = encrypt_payload(pack_payload("x", b"secret"), key_a, PAYLOAD_AAD)
     with pytest.raises(InvalidTag):
-        decrypt_payload(salt, nonce, ct, key_b, MAGIC)
+        decrypt_payload(salt, nonce, ct, key_b, PAYLOAD_AAD)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,31 +287,30 @@ def test_wrong_token_fails(monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────────
 def test_tampered_lsb_fails_decrypt(tmp_path, env_key):
     carrier = make_carrier(tmp_path / "c.png")
-    salt, nonce, ct = encrypt_payload(pack_payload("a", b"data" * 50), env_key, MAGIC)
-    out = embed(str(carrier), salt, nonce, ct, str(tmp_path / "s.png"))
+    out = hide(carrier, tmp_path / "s.png", env_key, "a", b"data" * 50)
 
     arr = np.array(Image.open(out).convert("RGB"), dtype=np.uint8)
     flat = arr.flatten()
-    idx = stego_engine.HEADER_BITS + 100  # a bit well inside the ciphertext region
-    flat[idx] ^= np.uint8(1)              # flip one embedded LSB
+    logical = (OUTER_SIZE + 100) * 8      # a bit well inside the ciphertext region
+    flat[stego_engine._permutation(INDEX_KEY, flat.size)[logical]] ^= np.uint8(1)
     tampered = tmp_path / "tampered.png"
     Image.fromarray(flat.reshape(arr.shape), "RGB").save(str(tampered), format="PNG")
 
-    r_salt, r_nonce, r_ct = extract(str(tampered))
     with pytest.raises(InvalidTag):
-        decrypt_payload(r_salt, r_nonce, r_ct, env_key, MAGIC)
+        reveal(tampered, env_key)
 
 
 def test_jpeg_recompression_destroys_payload(tmp_path, env_key):
     carrier = make_carrier(tmp_path / "c.png")
-    salt, nonce, ct = encrypt_payload(pack_payload("a", b"data" * 50), env_key, MAGIC)
-    out = embed(str(carrier), salt, nonce, ct, str(tmp_path / "s.png"))
+    out = hide(carrier, tmp_path / "s.png", env_key, "a", b"data" * 50)
 
-    jpeg = tmp_path / "s.jpg"
+    # A messaging app re-saves the picture as JPEG, and it is later converted back to PNG.
+    jpeg, again = tmp_path / "s.jpg", tmp_path / "again.png"
     Image.open(out).convert("RGB").save(str(jpeg), format="JPEG", quality=90)
-    # Lossy JPEG wrecks the LSB plane: the magic header no longer parses.
-    with pytest.raises(ValueError):
-        extract(str(jpeg))
+    Image.open(jpeg).save(str(again), format="PNG")
+    # Lossy JPEG wrecks the LSB plane: the encrypted header no longer authenticates.
+    with pytest.raises(InvalidTag):
+        reveal(again, env_key)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -304,14 +318,14 @@ def test_jpeg_recompression_destroys_payload(tmp_path, env_key):
 # ─────────────────────────────────────────────────────────────────────────────
 def test_per_file_salt_is_unique(env_key):
     plaintext = pack_payload("same.bin", b"identical payload bytes")
-    salt1, nonce1, ct1 = encrypt_payload(plaintext, env_key, MAGIC)
-    salt2, nonce2, ct2 = encrypt_payload(plaintext, env_key, MAGIC)
+    salt1, nonce1, ct1 = encrypt_payload(plaintext, env_key, PAYLOAD_AAD)
+    salt2, nonce2, ct2 = encrypt_payload(plaintext, env_key, PAYLOAD_AAD)
     assert salt1 != salt2
     assert nonce1 != nonce2
     assert ct1 != ct2  # fresh salt -> fresh file key -> different ciphertext
     # Both still decrypt correctly under their own salt.
-    assert decrypt_payload(salt1, nonce1, ct1, env_key, MAGIC) == plaintext
-    assert decrypt_payload(salt2, nonce2, ct2, env_key, MAGIC) == plaintext
+    assert decrypt_payload(salt1, nonce1, ct1, env_key, PAYLOAD_AAD) == plaintext
+    assert decrypt_payload(salt2, nonce2, ct2, env_key, PAYLOAD_AAD) == plaintext
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -409,30 +423,10 @@ def test_payload_name_strips_nul_and_control_chars():
     assert all(ch >= " " and ch != "\x7f" for ch in name2)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. Legacy ENVS image
-# ─────────────────────────────────────────────────────────────────────────────
-def test_legacy_envs_image_rejected(tmp_path):
-    # Craft a 36-byte header whose magic is the v1 LEGACY_MAGIC, then embed it in LSBs.
-    header = LEGACY_MAGIC + b"\x00\x00\x00\x20" + os.urandom(16) + os.urandom(12)
-    bits = np.unpackbits(np.frombuffer(header, dtype=np.uint8))
-
-    arr = np.array(Image.open(make_carrier(tmp_path / "c.png", 64, 64)).convert("RGB"),
-                   dtype=np.uint8)
-    flat = arr.flatten()
-    flat[:len(bits)] = (flat[:len(bits)] & np.uint8(0xFE)) | bits.astype(np.uint8)
-    legacy = tmp_path / "legacy.png"
-    Image.fromarray(flat.reshape(arr.shape), "RGB").save(str(legacy), format="PNG")
-
-    with pytest.raises(ValueError) as exc:
-        extract(str(legacy))
-    assert "older" in str(exc.value).lower() or "hardcoded" in str(exc.value).lower()
-
-
 def test_no_payload_image_rejected(tmp_path):
     plain = make_carrier(tmp_path / "plain.png", 64, 64)
-    with pytest.raises(ValueError):
-        extract(str(plain))
+    with pytest.raises(InvalidTag):
+        reveal(plain, os.urandom(32))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

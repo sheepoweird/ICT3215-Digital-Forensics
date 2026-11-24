@@ -298,7 +298,7 @@ def test_round_trip_each_width(tmp_path, width):
 def test_capacity_matches_samples(tmp_path):
     carrier = _wav(tmp_path / "c.wav", seconds=1.0, rate=44100, channels=2, width=2)
     # 44100 frames * 2 channels = 88200 samples -> 88200 // 8 bytes
-    assert ae.wav_capacity_bytes(carrier) == (44100 * 2) // 8
+    assert ae.get_audio_info(carrier)["capacity_bytes"] == (44100 * 2) // 8
 
 
 def test_too_small_raises(tmp_path):
@@ -339,7 +339,7 @@ def test_dispatcher_routes_by_extension(tmp_path):
     assert media.is_audio(wav) and not media.is_image(wav)
     assert media.output_suffix(wav) == ".wav"
     assert media.output_suffix("photo.png") == ".png"
-    assert media.lsb_capacity_bytes(wav) == ae.wav_capacity_bytes(wav)
+    assert media.lsb_capacity_bytes(wav) == ae.get_audio_info(wav)["capacity_bytes"]
     info = media.carrier_info(wav)
     assert info["kind"] == "audio" and "kHz" in info["summary"]
 
