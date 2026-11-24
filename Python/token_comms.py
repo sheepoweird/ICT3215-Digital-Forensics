@@ -170,12 +170,19 @@ def token_fingerprint(token_id_hex: str) -> str:
 # ── Phase 1: USB pairing ─────────────────────────────────────────
 
 def list_serial_ports() -> list[tuple[str, str]]:
-    """Returns [(device, description)], likely ESP32 USB-serial bridges first."""
-    bridges = ("CH340", "CP210", "USB-SERIAL", "USB SERIAL", "UART", "FTDI")
+    """Returns [(device, description)], likely ESP32 USB-serial bridges first.
+
+    Covers the ESP32-CAM's CH340/CP210x adapters, the ESP32-S3 board's CH343 "COM"
+    port, and the S3's native USB port (Espressif VID 0x303A, which Windows only
+    calls "USB Serial Device").
+    """
+    bridges = ("CH340", "CH343", "CH910", "CP210", "USB-SERIAL", "USB SERIAL", "UART", "FTDI",
+               "JTAG")
+    vendors = (0x303A, 0x1A86, 0x10C4, 0x0403)   # Espressif, WCH, Silicon Labs, FTDI
     ports = []
     for p in serial.tools.list_ports.comports():
         desc = p.description or p.device
-        likely = any(b in desc.upper() for b in bridges)
+        likely = p.vid in vendors or any(b in desc.upper() for b in bridges)
         ports.append((not likely, p.device, desc))
     ports.sort()
     return [(dev, desc) for _, dev, desc in ports]

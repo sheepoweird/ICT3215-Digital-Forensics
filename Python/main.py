@@ -25,6 +25,12 @@ if "--jpeg-worker" in sys.argv:
     import stego_engine
     sys.exit(stego_engine._jpeg_worker_main())
 
+# The firmware flasher runs esptool as a child process. A frozen build has no
+# separate Python to run `-m esptool` with, so the exe itself serves as esptool.
+if sys.argv[1:2] == ["--esptool"]:
+    import firmware_flasher
+    sys.exit(firmware_flasher.esptool_entry(sys.argv[2:]))
+
 from PyQt6.QtWidgets import QApplication, QMessageBox
 from PyQt6.QtCore import Qt
 
@@ -38,7 +44,8 @@ def _install_crash_guard():
     a crash. This logs the error and keeps the app running instead, and records a
     traceback so the cause can be found.
     """
-    log_path = Path(__file__).resolve().parent / "envstego_error.log"
+    app_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    log_path = app_dir / "envstego_error.log"
     state = {"showing": False, "last": None}
 
     def hook(exc_type, exc, tb):

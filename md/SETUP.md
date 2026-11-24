@@ -5,97 +5,120 @@
 
 ## Requirements
 - Windows 10 or 11 (signals rely on Windows APIs)
-- Python 3.10, 3.11, or 3.12
-- VS Code (optional but recommended)
+- A token: an **ESP32-CAM** (with its USB programmer board) or an **ESP32-S3-N16R8**
+  dev board, and a USB data cable
 
 ---
 
-## Step 1 — Install Python
+## Quick install (portable zip)
 
-Download from https://python.org/downloads  
-During install: **check "Add Python to PATH"**
+1. Unzip `EnvStego-portable.zip` somewhere you can write to, such as Desktop,
+   Documents or a USB stick. **Not** `C:\Program Files`: the app keeps its settings
+   and token pairing next to `EnvStego.exe`, and nothing in the Windows registry.
+2. Double-click `EnvStego.exe`. Python is not needed. If SmartScreen says the app is
+   unrecognised, click **More info → Run anyway**.
+3. Open **Setup › Token**, plug the token in and pick its port.
+4. Click **Install / update firmware** (see below), then **Pair Token**.
 
-Verify in a terminal:
-```
-python --version
-```
-
----
-
-## Step 2 — Open the Project in VS Code
-
-1. Open VS Code
-2. **File → Open Folder** → select the repository folder (`ICT3215-Digital-Forensics`).
-   The desktop app is in `Python/` and the token firmware in `ESP32 Files/`.
+Keep the folder together: `EnvStego.exe` needs `_internal\` and `firmware\` beside it.
 
 ---
 
-## Step 3 — Install Dependencies
+## Token firmware (one click)
 
-Open the VS Code terminal (`Ctrl + `` ` ``) and run:
+The app ships with firmware for both boards. **Setup › Token › Install / update firmware**:
 
-```
-pip install -r requirements.txt
-```
+1. Identifies the chip on the selected port (ESP32 → ESP32-CAM build, ESP32-S3 → S3 build).
+2. Reads the board's partition table. This step only reads from the board.
+3. Then, depending on what it finds:
+   - **Existing token** — writes only the firmware app area. The token's master
+     secret and pairing (in NVS) are **not touched**, so stego files, vaults and
+     this PC's pairing keep working.
+   - **Blank board** — writes the full firmware. Pair it afterwards.
+   - **Anything else** (a different partition layout) — refuses rather than risk
+     the data on it.
 
-Run this from `Python/`. This installs PyQt6, cryptography, Pillow, numpy,
-SoundFile, jpeglib, pyserial, Bleak and pytest. Native JPEG support uses the pinned
-`jpeglib==1.0.2` dependency, which installs as a prebuilt Windows wheel.
+**Erase and start fresh…** wipes the whole chip, master secret included, then installs.
+It asks you to type `ERASE`. Use it only for a new board or one whose files you no
+longer need.
+
+If flashing reports that the token did not enter download mode, hold **BOOT / IO0**,
+tap **RST / EN**, release BOOT and click again.
+
+### ESP32-S3-N16R8 notes
+- Either USB-C port works for pairing and flashing: **COM** (CH343 bridge) or
+  **USB** (native). The firmware answers on both.
+- The IO0 button is the one labelled **BOOT**.
+- Status uses the onboard RGB LED on GPIO48, with the same blink patterns as the
+  ESP32-CAM, coloured (see below).
+
+> Firmware **v9** adds ESP32-S3 support and a read-only `INFO` serial command that
+> the updater uses to show the running version. The BLE protocol and key derivation
+> are unchanged from v8, so updating keeps existing pairings, stego files and vaults.
+> Vault v2 requires firmware v8 or later; USB pairing requires v5 or later.
 
 ---
 
-## Step 4 — Run the App
+## Running from source (developers)
 
-**Option A — Terminal:**
+Needs Python 3.12.
+
 ```
 cd Python
+pip install -r requirements.txt
 python main.py
 ```
 
-**Option B — VS Code:** open `Python/main.py` and press `F5` (**Run → Start Debugging**),
-choosing **Python File** if asked.
+The in-app flasher looks for firmware in `Python/firmware/`, which `build.bat` creates.
 
----
+## Building the portable zip
 
-## Step 5 — Build a Standalone .exe (Windows only)
+From the repository root:
 
-Use the Python launcher above for the validated source build. This checkout has
-no `build.bat`; a standalone executable was not built during the vault v2 change.
-A future frozen build must include `vault_worker`, jpeglib's native libraries
-(including libjpeg 9f), and support the `--vault-worker` and `--jpeg-worker`
-entry points, including redirected standard handles in windowed mode.
+```
+build.bat
+```
 
----
+This creates `.venv` (Python 3.12), installs the app and build requirements
+(`packaging/requirements-build.txt`: PyInstaller and PlatformIO), builds both firmware
+environments, and writes `dist\EnvStego-portable.zip`. The first run downloads
+PlatformIO's ESP32 toolchains (about 1 GB); after that a build takes a few minutes.
+Every run is a full build, so the zip's firmware always matches the source.
 
-## Step 6 — Flash the 3T Token Firmware
+Only the zip is left in `dist\`: the unzipped app folder and PyInstaller's work files
+(`build\pyinstaller\`) are deleted after zipping. Unzip it somewhere else to test. If a
+folder can't be deleted (for example a copy of `EnvStego.exe` from it is still
+running), the build prints a warning and still succeeds; delete the folder yourself.
 
-Open `ESP32 Files/` as the PlatformIO project. Its configuration sets `src_dir = .`,
-so PlatformIO builds the firmware sources directly from that folder. To compile
-from the repository root, run `pio run --project-dir "ESP32 Files"`. To install a
-build, use PlatformIO's Upload action. Close the serial monitor before USB pairing
-so the app can open the COM port.
+The frozen exe also serves as its own child processes: `--vault-worker`,
+`--jpeg-worker` and `--esptool`.
 
-> Vault v2 requires **firmware v8**; USB pairing still uses the v5 protocol.
-> Update a paired older token without erasing NVS
-> and keep `Python/token_config.json`. The saved credential still works over Bluetooth.
-> Stego images made with the old hardcoded-secret build require that older build.
+### Flashing with PlatformIO directly (developers)
+
+`ESP32 Files/` is a PlatformIO project with two environments, `esp32cam` and
+`esp32s3` (`src_dir = .`). `pio run --project-dir "ESP32 Files" -e esp32s3 -t upload`
+builds and flashes one. PlatformIO's upload writes the bootloader and partition table
+but not NVS, so pairing survives. Never use **Erase Flash** on a token holding real
+keys. Close the serial monitor before USB pairing so the app can open the COM port.
 
 ### Token LED signals
 The count tells you what happened; short flashes are good news, long ones are problems.
 
-| Pattern | Meaning |
-|---------|---------|
-| Short blink every 0.5 s for 3 s | Booting. Hold IO0 for 2 s now to factory reset (a quick tap is ignored) |
-| Solid on | Pairing, opening the vault list or exporting a selection — release, then press IO0 within 60 s |
-| 10 rapid flashes | Factory reset done, all secrets wiped |
-| 1 short | Ready, paired |
-| 2 short | Ready, waiting for USB pairing |
-| 3 short | Pairing succeeded |
-| 2 short, straight after an IO0 tap | Vault action approved (opening the list or exporting the selection) |
-| 2 very fast | The token served an environment or index key request (Encrypt, Decrypt, Test Key, vault signal check) |
-| 1 long | Rejected a bad request |
-| 2 long | Pairing confirmation timed out |
-| 3 long | The Bluetooth connection was closed after 5 authentication failures on that link |
+The ESP32-CAM's LED is white. On the ESP32-S3 the same patterns are coloured.
+
+| Pattern | S3 colour | Meaning |
+|---------|-----------|---------|
+| Short blink every 0.5 s for 3 s | White | Booting. Hold IO0 for 2 s now to factory reset (a quick tap is ignored) |
+| Solid on | Blue | Pairing, opening the vault list or exporting a selection — release, then press IO0 within 60 s |
+| 10 rapid flashes | Red | Factory reset done, all secrets wiped |
+| 1 short | Green | Ready, paired |
+| 2 short | Blue | Ready, waiting for USB pairing |
+| 3 short | Green | Pairing succeeded |
+| 2 short, straight after an IO0 tap | Green | Vault action approved (opening the list or exporting the selection) |
+| 2 very fast | Green | The token served an environment or index key request (Encrypt, Decrypt, Test Key, vault signal check) |
+| 1 long | Red | Rejected a bad request |
+| 2 long | Red | Pairing confirmation timed out |
+| 3 long | Red | The Bluetooth connection was closed after 5 authentication failures on that link |
 
 ### Token troubleshooting
 
@@ -125,8 +148,8 @@ Your signal selection, presets, file paths and active page are remembered across
 refreshes and restarts.
 
 ### Setup › Token (do this first)
-1. Plug the token in over USB, pick its **serial port** (CH340/CP210x ports are listed first)
-2. Click **Pair Token**. When the token's light **stays on**, press its **IO0** button (not RST)
+1. Plug the token in over USB, pick its **serial port** (ESP32 USB ports — CH340, CP210x, CH343 and the S3's native USB — are listed first)
+2. Click **Pair Token**. When the token's light **stays on**, press its **IO0** button (**BOOT** on the ESP32-S3; not RST)
    within 60 seconds to confirm. Nothing can pair the token without this press. The token
    generates its master secret with its hardware RNG and gives this PC an auth key over an
    encrypted (ECDH) exchange; the PC stores it encrypted with Windows DPAPI
@@ -315,6 +338,8 @@ See [vault security and recovery](VAULT_SECURITY.md) for key handling and format
 ## File Structure
 ```
 ICT3215-Digital-Forensics/
+├── build.bat              ← Builds dist\EnvStego-portable.zip
+├── packaging/             ← build.py, PyInstaller spec, zip README, build requirements
 ├── Python/
 │   ├── main.py            ← Entry point (run this)
 │   ├── signals.py         ← Environment signal collection (22 signals)
@@ -326,12 +351,14 @@ ICT3215-Digital-Forensics/
 │   ├── archive.py         ← Folder payloads (zip, with zip-slip protection)
 │   ├── token_comms.py     ← USB pairing and the encrypted BLE protocol
 │   ├── pair_crypto.py     ← X25519 pairing key exchange
+│   ├── firmware_flasher.py← One-click token firmware install/update (esptool)
 │   ├── vault.py           ← Env Vault: metadata sessions, per-file encryption, recovery
 │   ├── vault_worker.py    ← Short-lived import/export process
 │   ├── winutils.py        ← Secure delete, atomic writes, DPAPI and Windows helpers
 │   ├── ui_main.py         ← PyQt6 user interface
 │   ├── requirements.txt   ← pip dependencies
-│   └── tests/             ← Automated tests (pytest, 242 tests)
-├── ESP32 Files/           ← 3T token firmware (PlatformIO, firmware v8)
+│   ├── firmware/          ← (built by build.bat) firmware bundles for the flasher
+│   └── tests/             ← Automated tests (pytest)
+├── ESP32 Files/           ← 3T token firmware (PlatformIO: esp32cam + esp32s3, firmware v9)
 └── md/                    ← This guide and the design/validation documents
 ```

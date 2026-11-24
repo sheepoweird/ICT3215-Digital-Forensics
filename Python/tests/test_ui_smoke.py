@@ -1164,3 +1164,63 @@ def test_shred_button_appears_and_wipes_original(win, monkeypatch):
     assert not payload.exists()               # original overwritten + deleted
     assert win._enc_shred_btn.isHidden()
     assert os.path.isfile(str(win.files / "shred_out.png"))   # stego copy kept
+
+
+# ── Token firmware install / update ──────────────────────────────
+
+def _firmware_plan(mode, running=8):
+    import firmware_flasher as ff
+    bundle = ff.Bundle(board="esp32s3", version=9, flash_size_mb=16, segments=[], app_offset=0x10000)
+    return ff.FlashPlan("COM9", "ESP32-S3", bundle, 16, mode, running, [],
+                        reason="" if mode else "The board's partition table has no NVS key storage.")
+
+
+def test_firmware_update_keeps_keys_and_reports_new_version(win, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ui_main, "inspect_token", lambda port, status: _firmware_plan("update"))
+    monkeypatch.setattr(ui_main, "flash_token",
+                        lambda plan, erase, status, progress: calls.append((plan.mode, erase)) or {"FW": "9"})
+    win._start_firmware(erase=False)
+    assert idle(win)
+    assert calls == [("update", False)]
+    text = win._fw_result.text()
+    assert "v9 is installed" in text and "keys and pairing were kept" in text
+    assert win._fw_btn.isEnabled() and win._fw_progress.isHidden()
+
+
+def test_firmware_unknown_layout_is_not_flashed(win, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ui_main, "inspect_token", lambda port, status: _firmware_plan(None))
+    monkeypatch.setattr(ui_main, "flash_token", lambda *a, **k: calls.append(a))
+    win._start_firmware(erase=False)
+    assert idle(win)
+    assert calls == []
+    assert "no NVS" in win._fw_result.text() and "Erase and start fresh" in win._fw_result.text()
+
+
+def test_firmware_erase_needs_typed_confirmation(win, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ui_main, "inspect_token", lambda port, status: _firmware_plan("update"))
+    monkeypatch.setattr(ui_main, "flash_token",
+                        lambda plan, erase, status, progress: calls.append(erase) or {"FW": "9"})
+    monkeypatch.setattr(ui_main.QInputDialog, "getText", staticmethod(lambda *a, **k: ("erase it", True)))
+    win._start_firmware(erase=True)
+    assert idle(win)
+    assert calls == [] and "Nothing was erased" in win._fw_result.text()
+
+    monkeypatch.setattr(ui_main.QInputDialog, "getText", staticmethod(lambda *a, **k: ("ERASE", True)))
+    win._start_firmware(erase=True)
+    assert idle(win)
+    assert calls == [True]
+    assert "Forget pairing" in win._fw_result.text()      # this PC's pairing no longer matches
+
+
+def test_firmware_failure_is_shown(win, monkeypatch):
+    import firmware_flasher as ff
+
+    def fail(port, status):
+        raise ff.FlashError("The token did not enter download mode.")
+    monkeypatch.setattr(ui_main, "inspect_token", fail)
+    win._start_firmware(erase=False)
+    assert idle(win)
+    assert "download mode" in win._fw_result.text()

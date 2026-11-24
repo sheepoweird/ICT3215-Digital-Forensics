@@ -61,6 +61,9 @@ from token_comms import (
     UNREACHABLE_MSG as TOKEN_UNREACHABLE_HINT,
     CANCELLED_MESSAGE as PAIR_CANCELLED_MSG,
 )
+from firmware_flasher import (
+    inspect_token, flash_token, bundled_versions, FlashError, BOARD_NAMES,
+)
 
 
 # ─── STYLESHEET ──────────────────────────────────────────────────────────────
@@ -477,6 +480,45 @@ class PingWorker(QThread):
             self.done.emit(True, "Token answered and proved its identity.")
         except TokenError as e:
             self.done.emit(False, str(e))
+
+
+class FirmwareInspectWorker(QThread):
+    """Identifies the board and reads its partition table. Writes nothing."""
+    done = pyqtSignal(object, str)      # FlashPlan or None, error message
+    progress = pyqtSignal(str)
+
+    def __init__(self, port: str):
+        super().__init__()
+        self._port = port
+
+    def run(self):
+        try:
+            self.done.emit(inspect_token(self._port, status=self.progress.emit), "")
+        except FlashError as e:
+            self.done.emit(None, str(e))
+        except Exception as e:      # never leave the UI stuck in the busy state
+            self.done.emit(None, f"Unexpected error while checking the token: {e}")
+
+
+class FirmwareFlashWorker(QThread):
+    done = pyqtSignal(bool, str, object)    # ok, error message, TOKEN_INFO dict or None
+    progress = pyqtSignal(str)
+    percent = pyqtSignal(int)
+
+    def __init__(self, plan, erase: bool):
+        super().__init__()
+        self._plan = plan
+        self._erase = erase
+
+    def run(self):
+        try:
+            info = flash_token(self._plan, self._erase, status=self.progress.emit,
+                               progress=self.percent.emit)
+            self.done.emit(True, "", info)
+        except FlashError as e:
+            self.done.emit(False, str(e), None)
+        except Exception as e:
+            self.done.emit(False, f"Unexpected error while flashing: {e}", None)
 
 
 class TestKeyWorker(QThread):
@@ -2866,9 +2908,58 @@ class MainWindow(QMainWindow):
             "authenticated BLE channel, so the cable is not needed afterwards.", "subtle"))
         layout.addWidget(pair_card)
 
+        layout.addWidget(self._build_firmware_card())
         layout.addWidget(self._build_troubleshooting())
         layout.addStretch()
         return page
+
+    def _build_firmware_card(self) -> QFrame:
+        """One-click install / update of the token firmware bundled with the app."""
+        card, fl = _card(spacing=12)
+        fl.addWidget(_section("Token firmware"))
+        bundled = bundled_versions()
+        if bundled:
+            shipped = ", ".join(f"{BOARD_NAMES[b]} v{v}" for b, v in sorted(bundled.items()))
+            intro = (f"Firmware included with this app: {shipped}. Plug the token in, pick its port above "
+                     "and click Install / update. The board type is detected automatically.")
+        else:
+            intro = ("This copy of EnvStego has no bundled firmware. Use the EnvStego zip, or run build.bat "
+                     "to build it.")
+        fl.addWidget(_label(intro, "muted"))
+        fl.addWidget(_label(
+            "Updating replaces only the firmware: the token's keys and pairing stay on it, so your stego "
+            "files and vaults keep working. A blank board gets the full firmware; pair it afterwards.",
+            "subtle"))
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self._fw_btn = QPushButton("Install / update firmware")
+        self._fw_btn.setObjectName("btn_primary")
+        self._fw_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._fw_btn.clicked.connect(lambda: self._start_firmware(erase=False))
+        self._fw_erase_btn = QPushButton("Erase and start fresh…")
+        self._fw_erase_btn.setObjectName("btn_danger")
+        self._fw_erase_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._fw_erase_btn.setToolTip("Wipes the whole chip, including the token's master secret, "
+                                      "then installs the firmware")
+        self._fw_erase_btn.clicked.connect(lambda: self._start_firmware(erase=True))
+        row.addWidget(self._fw_btn)
+        row.addStretch()
+        row.addWidget(self._fw_erase_btn)
+        fl.addLayout(row)
+
+        self._fw_progress = QProgressBar()
+        self._fw_progress.setObjectName("capacity_bar")
+        self._fw_progress.setRange(0, 100)
+        self._fw_progress.setFixedHeight(8)
+        self._fw_progress.setTextVisible(False)
+        self._fw_progress.hide()
+        fl.addWidget(self._fw_progress)
+        self._fw_result = StatusPanel()
+        fl.addWidget(self._fw_result)
+        self._fw_erase = False
+        self._fw_plan = None
+        return card
 
     def _build_troubleshooting(self) -> QFrame:
         """Collapsed by default: LED meanings, power problems and the factory reset."""
@@ -2902,6 +2993,10 @@ class MainWindow(QMainWindow):
             legend.addWidget(_label(meaning, "muted"), r, 1)
         legend.setColumnStretch(1, 1)
         bl.addLayout(legend)
+        bl.addWidget(_label(
+            "On an ESP32-S3 the same patterns are coloured: white = starting up, green = good, "
+            "blue = waiting for you (pairing or a BOOT/IO0 press), red = problem or factory reset. "
+            "Its IO0 button is the one labelled BOOT.", "subtle"))
 
         bl.addWidget(_section("If pairing fails"))
         bl.addWidget(_label(
@@ -3131,6 +3226,111 @@ class MainWindow(QMainWindow):
         self._refresh_token_ui()
         self._refresh_actions()
         self._status.showMessage("Token pairing removed from this PC")
+
+    # ── Firmware install / update ────────────────────────────────
+
+    def _start_firmware(self, erase: bool):
+        port = self._port_combo.currentData()
+        if not port:
+            return
+        if erase:
+            if QMessageBox.warning(
+                    self, "Erase the token",
+                    "Erasing wipes the token's master secret and pairing.\n\n"
+                    "Every stego file protected by this token becomes permanently unreadable, and "
+                    "vaults can then only be opened with their offline recovery codes.\n\n"
+                    "Only do this for a new board or one whose files you no longer need.",
+                    QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
+                    QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Ok:
+                return
+            text, ok = QInputDialog.getText(self, "Erase the token", "Type ERASE to wipe the token:")
+            if not ok or text.strip() != "ERASE":
+                self._fw_result.show_info("Nothing was erased.")
+                return
+        if self._vault is not None:
+            # The token restarts while flashing, so close the list rather than let it time out.
+            self._vault_do_lock("Locked: the token restarts during a firmware update.")
+        self._fw_erase = erase
+        self._set_busy(True)
+        self._fw_result.show_info(f"Checking the token on {port}…")
+        self._status.showMessage(f"Checking the token on {port}…")
+        w = FirmwareInspectWorker(port)
+        w.progress.connect(lambda msg: self._fw_result.show_info(msg))
+        w.done.connect(self._on_firmware_inspected)
+        self._start_worker(w)
+
+    def _on_firmware_inspected(self, plan, error: str):
+        if plan is None:
+            self._set_busy(False)
+            self._fw_result.show_error(error)
+            self._status.showMessage("Firmware check failed")
+            return
+        bundle = plan.bundle
+        board = f"{plan.board_name} ({plan.chip}) on {plan.port}"
+        running = (f"v{plan.running_version}" if plan.running_version is not None
+                   else "unknown (v8 or older, or no firmware running)")
+        if self._fw_erase:
+            title = "Erase and reinstall"
+            text = (f"{board}\n\nThe whole chip will be erased, then firmware v{bundle.version} installed. "
+                    "Pair the token again afterwards.\n\nThis is your last chance to cancel.")
+        elif plan.mode is None:
+            self._set_busy(False)
+            self._fw_result.show_error(
+                f"{board}\n{plan.reason}\n\nIt can't be updated without risking the data on it. If this board "
+                "holds no keys you need, use Erase and start fresh.")
+            self._status.showMessage("Firmware unchanged")
+            return
+        elif plan.mode == "update":
+            title = "Update token firmware"
+            text = (f"{board}\nRunning firmware: {running}\nIncluded firmware: v{bundle.version}\n\n"
+                    "Only the firmware is replaced. The token's keys and pairing stay on it.")
+            if plan.running_version is not None and plan.running_version >= bundle.version:
+                text += "\n\nThe token already runs this version or newer. Reinstall anyway?"
+            else:
+                text += "\n\nUpdate now?"
+        else:
+            title = "Install token firmware"
+            text = (f"{board}\nThe board's flash is blank.\n\nInstall EnvStego token firmware "
+                    f"v{bundle.version}? Pair the token afterwards.")
+        if QMessageBox.question(self, title, text) != QMessageBox.StandardButton.Yes:
+            self._set_busy(False)
+            self._fw_result.show_info("Firmware unchanged.")
+            self._status.showMessage("Firmware unchanged")
+            return
+        self._fw_plan = plan
+        self._fw_progress.setValue(0)
+        self._fw_progress.show()
+        self._fw_result.show_info("Writing firmware… keep the token plugged in.")
+        self._status.showMessage(f"Flashing the token on {plan.port}…")
+        w = FirmwareFlashWorker(plan, self._fw_erase)
+        w.progress.connect(lambda msg: self._fw_result.show_info(f"{msg}\nKeep the token plugged in."))
+        w.percent.connect(self._fw_progress.setValue)
+        w.done.connect(self._on_firmware_flashed)
+        self._start_worker(w)
+
+    def _on_firmware_flashed(self, ok: bool, error: str, info):
+        self._fw_progress.hide()
+        self._set_busy(False)
+        self._refresh_ports()
+        plan, erased = self._fw_plan, self._fw_erase
+        if not ok:
+            self._fw_result.show_error(error)
+            self._status.showMessage("Firmware update failed")
+            return
+        if info:
+            done = f"Firmware v{info.get('FW', '?')} is installed and running on the {plan.board_name}."
+        else:
+            done = (f"Firmware v{plan.bundle.version} was written. The token has not answered over USB yet; "
+                    "watch its light: 1 short flash = ready and paired, 2 short = waiting to pair.")
+        if erased and self._token_cfg:
+            done += ("\nThe token was wiped, so this PC's pairing no longer matches it. "
+                     "Click Forget pairing, then Pair Token.")
+        elif erased or plan.mode == "install":
+            done += "\nNext: click Pair Token."
+        else:
+            done += "\nThe token's keys and pairing were kept."
+        self._fw_result.show_success(done)
+        self._status.showMessage("Token firmware updated")
 
     # ─────────────────────────────────────────────────────────────
     #  TAB 5 — INSPECTOR
@@ -3810,6 +4010,9 @@ class MainWindow(QMainWindow):
                                   (not self._busy and self._port_combo.currentData() is not None))
         self._ping_btn.setEnabled(not self._busy and paired)
         self._forget_btn.setEnabled(not self._busy and paired)
+        has_port = self._port_combo.currentData() is not None
+        self._fw_btn.setEnabled(not self._busy and has_port)
+        self._fw_erase_btn.setEnabled(not self._busy and has_port)
         self._populate_inspector_marks()
         self._refresh_vault_ui()
         self._refresh_nav(enc_block, dec_block)

@@ -8,5 +8,6 @@ numpy>=1.26.0
 soundfile>=0.13.1
 jpeglib==1.0.2  # Native JPEG coefficient I/O (tested Windows abi3 wheel)
 pyserial
+esptool==4.8.1   # one-click token firmware install/update
 bleak
 pytest          # only needed to run tests/test_offline.py

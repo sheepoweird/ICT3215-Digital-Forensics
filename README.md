@@ -76,6 +76,13 @@ code can recover the entire vault. [Vault security and recovery](md/VAULT_SECURI
 See **[md/SETUP.md](md/SETUP.md)** for the full install, build, firmware-flash and usage
 guide. In short:
 
+1. Unzip `EnvStego-portable.zip` and run `EnvStego.exe` (no Python needed).
+2. Plug in the token (ESP32-CAM or ESP32-S3-N16R8), open **Setup › Token**, and click
+   **Install / update firmware**. An existing token keeps its keys.
+3. Click **Pair Token** and press the token's IO0 / BOOT button when its light stays on.
+
+To build the zip yourself, run `build.bat`. To run from source (Python 3.12):
+
 ```bash
 cd Python
 pip install -r requirements.txt
@@ -91,32 +98,36 @@ Encrypt a file or create a Vault.
 Python/          Host application (PyQt6) + automated tests
   main.py        Entry point
   crypto_engine, stego_engine, audio_engine, media, multi_image, archive, signals,
-  vault, vault_worker, token_comms, pair_crypto, winutils, ui_main
+  vault, vault_worker, token_comms, pair_crypto, winutils, ui_main, firmware_flasher
   tests/         Automated tests (pytest)
-ESP32 Files/     3T token firmware
+ESP32 Files/     3T token firmware (PlatformIO: esp32cam, esp32s3)
+packaging/       Portable zip build (used by build.bat)
+build.bat        Builds dist/EnvStego-portable.zip
 md/              Setup/usage guide and docs
 ```
 
 ## Hardware
 
-The token is a single **ESP32-CAM** module, flashed with the firmware in `ESP32 Files/`.
-No custom PCB, soldering or extra components are required.
+The token is a single **ESP32-CAM** module or an **ESP32-S3-N16R8** dev board, flashed
+with the firmware in `ESP32 Files/`. No custom PCB, soldering or extra components are required.
 
-**Bill of materials**
+**Bill of materials** (either option A or option B)
 
 | Item | Qty | Purpose |
 | --- | --- | --- |
-| ESP32-CAM module (ESP32-D0WD, 4 MB flash) | 1 | The token: holds the master secret, BLE radio, IO0 confirmation button, white LED for status |
-| ESP32-CAM-MB USB programmer board (CH340) | 1 | USB power, flashing and first-time USB pairing; the module plugs straight onto it |
-| USB data cable (Micro-USB or USB-C, to match the programmer board) | 1 | Connects the programmer to the PC |
+| **A:** ESP32-CAM module (ESP32-D0WD, 4 MB flash) | 1 | The token: holds the master secret, BLE radio, IO0 confirmation button, white LED for status |
+| **A:** ESP32-CAM-MB USB programmer board (CH340) | 1 | USB power, flashing and first-time USB pairing; the module plugs straight onto it |
+| **B:** ESP32-S3-N16R8 dev board (16 MB flash, 8 MB PSRAM) | 1 | The token on one board: USB built in (either USB-C port works), BOOT button as IO0, RGB LED on GPIO48 for coloured status |
+| USB data cable (Micro-USB or USB-C, to match the board) | 1 | Connects the token to the PC |
 | Windows 10/11 PC with Bluetooth LE | 1 | Runs the EnvStego desktop app |
 
 The camera that ships with the ESP32-CAM is not used. Power the board from a rear
 (motherboard) USB port or a powered hub: Bluetooth start-up draws a current spike that
 weak ports cannot supply.
 
-Vault v2 needs **firmware v8**. Updating the application alone is insufficient.
-Preserve NVS and the pairing config when updating the firmware.
+The app's **Install / update firmware** button flashes either board. Updating writes only
+the firmware and preserves NVS (the token's keys and pairing). Vault v2 needs firmware v8
+or later; the current firmware is v9.
 
 ## Testing
 
@@ -124,7 +135,7 @@ Preserve NVS and the pairing config when updating the firmware.
 python -m pytest Python/tests/ -q
 ```
 
-All 242 tests pass (2026-11-24). The suite covers stego round trips for every supported
+All 271 tests pass (2026-11-24). The suite covers stego round trips for every supported
 carrier, host BLE protocol behavior, vault key separation, recovery, write failures,
 concurrency, batch approvals, subprocess cancellation and Qt UI flows. Host protocol
 simulation does not validate the physical IO0 circuit or BLE runtime. See

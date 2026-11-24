@@ -16,6 +16,7 @@ ENV/
 build/
 dist/
 *.spec
+!packaging/EnvStego.spec
 
 # ─── Test files (don't commit sample payloads or stego images) ─
 *.stego.png
@@ -70,3 +71,5 @@ Python/envstego_settings.ini
 
 # ─── PlatformIO build output (ESP32 firmware) ───
 .pio/
+# Firmware bundled by build.bat for the in-app flasher (built, not source)
+Python/firmware/

@@ -16,7 +16,12 @@
 
 #define SERVICE_UUID        "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define CHARACTERISTIC_UUID "beb5483f-36e1-4688-b7f5-ea07361b26a8"
-#define FIRMWARE_VERSION    8
+// v9: ESP32-S3 support and the read-only INFO serial command. The BLE protocol and
+// every key derivation are unchanged from v8, so v8 pairings, stego files and vaults
+// keep working after an update.
+#define FIRMWARE_VERSION    9
+#define TOKEN_STR_(x) #x
+#define TOKEN_STR(x) TOKEN_STR_(x)
 
 // Pairing must be confirmed by pressing IO0 within this long, so nothing can re-pair
 // the token silently while it is plugged in.
@@ -25,9 +30,53 @@
 // so pressing IO0 to confirm pairing can never wipe the token by accident).
 #define FACTORY_HOLD_MS     2000
 
-// --- ESP32-CAM FLASH LED CONFIGURATION ---
-// Pin 4 is the bright white LED on the front. Uses standard logic (HIGH = ON).
-#define LED_PIN 4
+// --- BOARD CONFIGURATION ---
+// The same source builds for both supported tokens (see platformio.ini). The IO0 /
+// BOOT button is GPIO0 on both boards.
+#if CONFIG_IDF_TARGET_ESP32S3
+// ESP32-S3-N16R8 dev boards: WS2812 RGB LED on GPIO48. The status patterns are the
+// same as on the ESP32-CAM, coloured so they are easier to read.
+#define BOARD_NAME  "esp32s3"
+#define LED_PIN     48
+#define LED_IS_RGB  1
+#define RGB_LEVEL   40     // 0-255 per channel; dim enough to keep USB current low
+#else
+// ESP32-CAM: pin 4 is the bright white flash LED on the front (HIGH = ON).
+#define BOARD_NAME  "esp32cam"
+#define LED_PIN     4
+#define LED_IS_RGB  0
+#endif
+
+// Serial console. On the S3 the token answers on both USB-C ports: the native USB
+// port (USB Serial/JTAG, which is Serial when ARDUINO_USB_CDC_ON_BOOT=1) and the
+// "COM" port wired to UART0 through the CH343 bridge (Serial0). Output goes to both
+// and commands are accepted from either, so it does not matter which one is plugged in.
+#if CONFIG_IDF_TARGET_ESP32S3 && ARDUINO_USB_CDC_ON_BOOT
+class DualSerial : public Stream {
+public:
+    void begin(unsigned long baud) {
+        Serial0.begin(baud);
+        // Keep HWCDC's default TX timeout: it already discards output when no USB host
+        // is connected, and a zero timeout would truncate replies longer than its
+        // 256-byte buffer (the pairing reply is) when a host is reading.
+        Serial.begin(baud);
+    }
+    int available() override { return Serial0.available() + Serial.available(); }
+    int read() override { return Serial0.available() ? Serial0.read() : Serial.read(); }
+    int peek() override { return Serial0.available() ? Serial0.peek() : Serial.peek(); }
+    void flush() override { Serial0.flush(); Serial.flush(); }
+    size_t write(uint8_t c) override { return write(&c, 1); }
+    size_t write(const uint8_t *buffer, size_t size) override {
+        Serial0.write(buffer, size);
+        Serial.write(buffer, size);
+        return size;
+    }
+    using Print::write;
+};
+DualSerial Console;
+#else
+HardwareSerial &Console = Serial;
+#endif
 
 // --- BLE PROTOCOL (must match Python/token_comms.py) ---
 // Host  -> Token  HELLO     : 0x10
@@ -144,12 +193,41 @@ bool pairButtonReleased = false;
 #define PAT_SHORT_MS 150
 #define PAT_LONG_MS  600
 
+// Colours only show on the S3's RGB LED; the ESP32-CAM LED is white whatever is asked.
+//   white = boot window, green = good, blue = waiting (IO0 press or USB pairing),
+//   red   = problem or factory reset
+enum LedColour : uint8_t { LED_WHITE, LED_GREEN, LED_BLUE, LED_RED };
+
+// Writes the LED only when its state changes: loop() asks for "solid on" every
+// pass while waiting for IO0, and each RGB write is a short RMT transaction.
+void ledWrite(bool on, LedColour colour = LED_WHITE) {
+    static int16_t last = -1;
+    const int16_t state = on ? (int16_t)colour : 0x100;
+    if (state == last) return;
+    last = state;
+#if LED_IS_RGB
+    uint8_t r = 0, g = 0, b = 0;
+    if (on) {
+        switch (colour) {
+            case LED_GREEN: g = RGB_LEVEL; break;
+            case LED_BLUE:  b = RGB_LEVEL; break;
+            case LED_RED:   r = RGB_LEVEL; break;
+            default:        r = g = b = RGB_LEVEL; break;
+        }
+    }
+    neopixelWrite(LED_PIN, r, g, b);
+#else
+    (void)colour;
+    digitalWrite(LED_PIN, on ? HIGH : LOW);
+#endif
+}
+
 // Blocking flash, only used in setup() before BLE is running
-void flashLED(int times, int delayMs) {
+void flashLED(int times, int delayMs, LedColour colour) {
     for (int i = 0; i < times; i++) {
-        digitalWrite(LED_PIN, HIGH); // HIGH = ON for Pin 4
+        ledWrite(true, colour);
         delay(delayMs);
-        digitalWrite(LED_PIN, LOW);  // LOW = OFF
+        ledWrite(false);
         if (i < times - 1) delay(delayMs);
     }
 }
@@ -158,12 +236,14 @@ void flashLED(int times, int delayMs) {
 // played by updateLED() in loop(), so the BLE stack is never stalled by delay().
 volatile uint8_t ledToggles = 0;
 volatile uint16_t ledOnMs = 0, ledOffMs = 0;
+volatile LedColour ledColour = LED_WHITE;
 bool ledIsOn = false;
 unsigned long ledNextMs = 0;
 
-void playPattern(uint8_t count, uint16_t onMs, uint16_t offMs) {
+void playPattern(uint8_t count, uint16_t onMs, uint16_t offMs, LedColour colour) {
     ledOnMs = onMs;
     ledOffMs = offMs;
+    ledColour = colour;
     ledIsOn = false;
     ledNextMs = millis();
     ledToggles = count * 2;
@@ -171,12 +251,12 @@ void playPattern(uint8_t count, uint16_t onMs, uint16_t offMs) {
 
 void updateLED() {
     if (pairState == PairState::Confirming) {
-        digitalWrite(LED_PIN, HIGH);
+        ledWrite(true, LED_BLUE);
         return;
     }
     if (!ledToggles || (long)(millis() - ledNextMs) < 0) return;
     ledIsOn = !ledIsOn;
-    digitalWrite(LED_PIN, ledIsOn ? HIGH : LOW);
+    ledWrite(ledIsOn, ledColour);
     ledNextMs = millis() + (ledIsOn ? ledOnMs : ledOffMs);
     ledToggles--;
 }
@@ -228,13 +308,13 @@ void handleHello(uint16_t connId, BleSession &session) {
 
 void recordAuthFailure(uint16_t connId, BleSession &session) {
     session.failures++;
-    Serial.printf("[SEC] Rejected BLE request (%u/%d failures on this link)\n", session.failures, MAX_AUTH_FAILURES);
+    Console.printf("[SEC] Rejected BLE request (%u/%d failures on this link)\n", session.failures, MAX_AUTH_FAILURES);
     sendError(connId, ERR_AUTH_FAILED);
     if (session.failures >= MAX_AUTH_FAILURES) {
         bleServer->disconnect(connId);
-        playPattern(3, PAT_LONG_MS, 300);
+        playPattern(3, PAT_LONG_MS, 300, LED_RED);
     } else {
-        playPattern(1, PAT_LONG_MS, 0);
+        playPattern(1, PAT_LONG_MS, 0, LED_RED);
     }
 }
 
@@ -365,7 +445,7 @@ void handleRequest(uint16_t connId, BleSession &session, const uint8_t *data, si
         // Signal that this connection must now wait for a fresh physical press.
         respPlain[0] = 0x01;
         memset(respPlain + 1, 0, SHA256_LEN);
-        Serial.println(op == OP_VAULT_OPEN ? "[VAULT] Confirm opening the list with IO0." :
+        Console.println(op == OP_VAULT_OPEN ? "[VAULT] Confirm opening the list with IO0." :
                                            "[VAULT] Confirm selected export with IO0.");
     } else {
         secureWipe(sessionKey, sizeof(sessionKey));
@@ -394,10 +474,10 @@ void handleRequest(uint16_t connId, BleSession &session, const uint8_t *data, si
     sendToLink(connId, msg, 1 + GCM_IV_LEN + responseLen + GCM_TAG_LEN);
 
     if (op == OP_DERIVE) {
-        Serial.println("[BLE] Authenticated key request served.");
-        playPattern(2, 50, 80);
+        Console.println("[BLE] Authenticated key request served.");
+        playPattern(2, 50, 80, LED_GREEN);
     } else if (op == OP_PING) {
-        Serial.println("[BLE] Authenticated ping served.");
+        Console.println("[BLE] Authenticated ping served.");
     }
 }
 
@@ -405,13 +485,13 @@ class MyServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer*, esp_ble_gatts_cb_param_t *param) override {
         std::lock_guard<std::mutex> guard(bleMutex);
         bleSessions[param->connect.conn_id] = BleSession{};
-        Serial.println("[BLE] Host connected wirelessly.");
+        Console.println("[BLE] Host connected wirelessly.");
     }
     void onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) override {
         std::lock_guard<std::mutex> guard(bleMutex);
         if (fileApproval.active && fileApproval.connection == param->disconnect.conn_id) clearFileApproval();
         bleSessions.erase(param->disconnect.conn_id);
-        Serial.println("[BLE] Host disconnected. Restarting advertising...");
+        Console.println("[BLE] Host disconnected. Restarting advertising...");
         pServer->getAdvertising()->start();
     }
 };
@@ -453,7 +533,7 @@ bool isValidField(const String &s, unsigned int maxLen) {
 }
 
 void refusePairing(const String &req, const char *reason) {
-    Serial.println("PAIRING_REFUSED;REQ=" + req + ";REASON=" + reason);
+    Console.println("PAIRING_REFUSED;REQ=" + req + ";REASON=" + reason);
 }
 
 void clearPendingPairing() {
@@ -461,16 +541,16 @@ void clearPendingPairing() {
     pendingReq = "";
     secureWipe(pendingPcPub, sizeof(pendingPcPub));
     secureWipe(pendingPairNonce, sizeof(pendingPairNonce));
-    digitalWrite(LED_PIN, LOW);
+    ledWrite(false);
 }
 
 void sendPairingState() {
     if (pairState == PairState::Proving) {
-        Serial.println("PAIRING_PROOF;REQ=" + pendingReq +
+        Console.println("PAIRING_PROOF;REQ=" + pendingReq +
                        ";NONCE=" + toHex(pendingPairNonce, NONCE_LEN) +
                        ";TOKEN_ID=" + toHex(tokenId, TOKEN_ID_LEN));
     } else {
-        Serial.println("PAIRING_PENDING;REQ=" + pendingReq + ";REASON=PRESS_BUTTON");
+        Console.println("PAIRING_PENDING;REQ=" + pendingReq + ";REASON=PRESS_BUTTON");
     }
 }
 
@@ -484,7 +564,7 @@ void waitForButton() {
 // PAIR_V5:<request_id>:<pc_pub>:<ENROLL|REPAIR>
 void handlePairStart(const String &args) {
     if (fileApproval.active) {
-        Serial.println("PAIRING_REFUSED;REASON=BUSY");
+        Console.println("PAIRING_REFUSED;REASON=BUSY");
         return;
     }
     int separator = args.indexOf(':');
@@ -500,7 +580,7 @@ void handlePairStart(const String &args) {
         return;
     }
     if (req == lastPairRequest && memcmp(lastPairPcPub, pcPub, X25519_LEN) == 0) {
-        Serial.println(lastPairReply);
+        Console.println(lastPairReply);
         return;
     }
     if (!storageHealthy) {
@@ -650,8 +730,8 @@ void completePairing() {
                     ";BLE_MAC=" + String(mac.c_str()) +
                     ";CHAR_UUID=" + String(CHARACTERISTIC_UUID) +
                     ";FW=" + String(FIRMWARE_VERSION);
-    Serial.println(lastPairReply);
-    playPattern(3, PAT_SHORT_MS, PAT_SHORT_MS);
+    Console.println(lastPairReply);
+    playPattern(3, PAT_SHORT_MS, PAT_SHORT_MS, LED_GREEN);
 }
 
 void setup() {
@@ -665,14 +745,16 @@ void setup() {
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);   // pause the detector for start-up
     setCpuFrequencyMhz(80);                       // ~half the current of 240 MHz
 
-    Serial.begin(115200);
+    Console.begin(115200);
 
     // Initialize LED Pin and turn it OFF to start
+#if !LED_IS_RGB
     pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
+#endif
+    ledWrite(false);
     pinMode(0, INPUT_PULLUP);
 
-    Serial.println("\n--- 3T Token Booting ---");
+    Console.println("\n--- 3T Token Booting ---");
 
     bool factoryResetTriggered = false;
 
@@ -681,7 +763,7 @@ void setup() {
     // a quick tap (e.g. someone pressing it early to confirm pairing) does nothing.
     int heldMs = 0;
     for (int i = 0; i < 30; i++) {
-        digitalWrite(LED_PIN, (i % 5 == 0) ? HIGH : LOW);
+        ledWrite(i % 5 == 0, LED_WHITE);
         heldMs = (digitalRead(0) == LOW) ? heldMs + 100 : 0;
         if (heldMs >= FACTORY_HOLD_MS) {
             factoryResetTriggered = true;
@@ -689,27 +771,27 @@ void setup() {
         }
         delay(100);
     }
-    digitalWrite(LED_PIN, LOW);
+    ledWrite(false);
 
     storageHealthy = preferences.begin("3t_storage", false);
 
     if (factoryResetTriggered) {
         // Destroys the master secret: every file encrypted with this token
         // becomes permanently unrecoverable.
-        Serial.println("[HW] Factory Reset triggered! Wiping all secrets...");
+        Console.println("[HW] Factory Reset triggered! Wiping all secrets...");
         storageHealthy = storageHealthy && preferences.clear();
-        if (storageHealthy) flashLED(10, 40);
+        if (storageHealthy) flashLED(10, 40, LED_RED);
     } else if (storageHealthy) {
         devicePaired = loadSecrets();
         if (devicePaired) {
-            Serial.println("[HW] Restored pairing credentials from NVS flash.");
+            Console.println("[HW] Restored pairing credentials from NVS flash.");
         } else if (storageHealthy) {
-            Serial.println("[HW] Token is UNPAIRED. Waiting for USB handshake...");
+            Console.println("[HW] Token is UNPAIRED. Waiting for USB handshake...");
         }
     }
-    if (!storageHealthy) Serial.println("[HW] Pairing storage could not be read or reset.");
+    if (!storageHealthy) Console.println("[HW] Pairing storage could not be read or reset.");
 
-    BLEDevice::init("3T-Token-v8");
+    BLEDevice::init("3T-Token-v" TOKEN_STR(FIRMWARE_VERSION));
     // Lower the radio TX power to cut the current spike that causes brownouts.
     // The PC pairs over USB first, so a shorter BLE range is an acceptable trade.
     BLEDevice::setPower(ESP_PWR_LVL_N9);
@@ -741,13 +823,13 @@ void setup() {
     pAdvertising->setMinPreferred(0x12);
     pAdvertising->start();
 
-    Serial.println("BLE Server is running. Waiting for connections...");
+    Console.println("BLE Server is running. Waiting for connections...");
 
     // Start-up is over: switch the brownout detector back on (see the top of setup()).
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, brownoutReg);
 
     // Ready: 1 short flash if paired, 2 if waiting for USB pairing
-    playPattern(devicePaired ? 1 : 2, PAT_SHORT_MS, PAT_SHORT_MS);
+    playPattern(devicePaired ? 1 : 2, PAT_SHORT_MS, PAT_SHORT_MS, devicePaired ? LED_GREEN : LED_BLUE);
 }
 
 void loop() {
@@ -755,11 +837,11 @@ void loop() {
     updateLED();
 
     if (fileApproval.active) {
-        digitalWrite(LED_PIN, HIGH);
+        ledWrite(true, LED_BLUE);
         if ((long)(millis() - fileApproval.deadline) >= 0) {
             sendError(fileApproval.connection, ERR_FILE_TIMEOUT);
             clearFileApproval();
-            digitalWrite(LED_PIN, LOW);
+            ledWrite(false);
         } else if (digitalRead(0) != LOW) {
             fileApproval.released = true;
         } else if (fileApproval.released) {
@@ -789,8 +871,8 @@ void loop() {
                 }
                 secureWipe(plain, sizeof(plain));
                 clearFileApproval();
-                digitalWrite(LED_PIN, LOW);
-                playPattern(2, PAT_SHORT_MS, PAT_SHORT_MS);
+                ledWrite(false);
+                playPattern(2, PAT_SHORT_MS, PAT_SHORT_MS, LED_GREEN);
             }
         }
     }
@@ -799,11 +881,11 @@ void loop() {
         const char *reason = pairState == PairState::Proving ? "NO_PENDING" : "NOT_CONFIRMED";
         refusePairing(pendingReq, reason);
         clearPendingPairing();
-        playPattern(2, PAT_LONG_MS, 300);
+        playPattern(2, PAT_LONG_MS, 300, LED_RED);
     }
 
-    if (Serial.available() > 0) {
-        String command = Serial.readStringUntil('\n');
+    if (Console.available() > 0) {
+        String command = Console.readStringUntil('\n');
         command.trim();
 
         if (command.startsWith("PAIR_V5:")) {
@@ -812,6 +894,10 @@ void loop() {
             handlePairProof(command.substring(11));
         } else if (command.startsWith("PAIR_CANCEL:") && command.substring(12) == pendingReq) {
             clearPendingPairing();
+        } else if (command == "INFO") {
+            // Read-only identification for the app's firmware updater. It reveals no
+            // secret and not even whether the token is paired.
+            Console.println("TOKEN_INFO;FW=" + String(FIRMWARE_VERSION) + ";BOARD=" BOARD_NAME);
         }
     }
     if (pairState == PairState::Confirming && confirmButtonPressed()) completePairing();
