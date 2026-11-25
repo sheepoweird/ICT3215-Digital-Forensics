@@ -33,7 +33,7 @@ from winutils import atomic_write_text
 META_NAME = "vault.json"
 INDEX_NAME = "index.bin"
 LOCK_NAME = ".vault.lock"
-VERSION = 2
+VERSION = 3
 _CHUNK = 1 << 20
 _NONCE_LEN = 12
 # Plaintext is zero-padded to a 4 KiB bucket, so a blob's size on disk reveals only
@@ -115,34 +115,41 @@ def _meta(path):
     meta = _read_meta(path)
     if meta.get("version") != VERSION:
         raise UnsupportedVault("Unsupported vault format. Choose an empty folder to create a new vault.")
-    for field, length in (("vault_id", 16), ("env_hash", 32), ("recovery_pub", 32)):
+    for field, length in (("vault_id", 16), ("recovery_pub", 32)):
         if len(bytes.fromhex(meta[field])) != length:
             raise VaultError("Invalid vault metadata.")
     return meta
 
 
 def _binding(meta):
-    fields = {key: meta[key] for key in ("version", "vault_id", "env_hash", "recovery_pub", "signals", "created")}
-    return b"EnvVault-v2" + json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
+    fields = {key: meta[key] for key in ("version", "vault_id", "recovery_pub", "signals", "created")}
+    return b"EnvVault-v3" + json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
 
 
-def key_context(meta, blob_id=None):
-    context = b"EnvVault-v2" + bytes.fromhex(meta["vault_id"]) + bytes.fromhex(meta["env_hash"])
-    if blob_id is not None:
-        blob = bytes.fromhex(blob_id)
-        if len(blob) != 16:
-            raise VaultError("Invalid vault file identifier.")
-        context += blob
-    return hashlib.sha256(context).digest()
+def _id_bytes(hex_id, what):
+    try:
+        raw = bytes.fromhex(hex_id)
+    except (TypeError, ValueError) as exc:
+        raise VaultError(f"Invalid vault {what} identifier.") from exc
+    if len(raw) != 16:
+        raise VaultError(f"Invalid vault {what} identifier.")
+    return raw
 
 
-def export_context(meta, entry):
-    if "batch" not in entry:  # Earlier format-2 entries used a direct token-derived file key.
-        return key_context(meta, entry["blob"])
-    batch_id = bytes.fromhex(entry["batch"])
-    if len(batch_id) != 16:
-        raise VaultError("Invalid import batch identifier.")
-    return key_context(meta) + batch_id + bytes.fromhex(entry["blob"])
+def key_context(meta, env_hash):
+    """The token context for this vault in the live environment.
+
+    The environment hash is never stored: a different environment gives a different
+    context, so the token derives keys that fail to open the index.
+    """
+    if env_hash is None or len(env_hash) != 32:
+        raise VaultError("The vault environment is unavailable.")
+    return hashlib.sha256(b"EnvVault-v3" + bytes.fromhex(meta["vault_id"]) + env_hash).digest()
+
+
+def export_context(meta, env_hash, entry):
+    return (key_context(meta, env_hash) + _id_bytes(entry.get("batch"), "batch")
+            + _id_bytes(entry["blob"], "file"))
 
 
 def _recovery_private(code):
@@ -181,7 +188,7 @@ def _entries(path, metadata_key, meta):
         raise VaultError("Invalid vault index.")
     seen = set()
     for entry in entries:
-        key_context(meta, entry["blob"])
+        _id_bytes(entry["blob"], "file")
         if entry["blob"] in seen or entry["size"] < 0 or not isinstance(entry["size"], int):
             raise VaultError("Invalid vault index entry.")
         if entry["name"] != os.path.basename(entry["name"]) or entry["name"] in ("", ".", ".."):
@@ -230,9 +237,11 @@ def _worker(request, cancel=None):
 class Vault:
     """An open metadata session. No vault root, recovery secret, or file key is cached."""
 
-    def __init__(self, path, metadata_key, *, recovery=False, key_provider=None, local=False, signal_ids=None):
+    def __init__(self, path, metadata_key, *, recovery=False, key_provider=None, local=False, signal_ids=None,
+                 env_hash=None):
         self._path = Path(path)
         self._metadata_key = metadata_key
+        self._env_hash = env_hash
         self.recovery = recovery
         self._signal_ids = tuple(signal_ids) if signal_ids is not None else None
         self._provider = key_provider
@@ -251,6 +260,7 @@ class Vault:
     def lock(self):
         self._cancel.set()
         self._metadata_key = None
+        self._env_hash = None
         self._signal_ids = None
         self._index = []
 
@@ -278,8 +288,10 @@ class Vault:
     def _action_worker(self, request):
         # The list was already physically approved. Send its metadata key via stdin
         # so a short-lived worker can authenticate the index without reopening it.
-        return _worker({**request, "path": self.path, "metadata_key": self._metadata_key.hex()},
-                       self._cancel)
+        request = {**request, "path": self.path, "metadata_key": self._metadata_key.hex()}
+        if self._env_hash is not None:
+            request["env_hash"] = self._env_hash.hex()
+        return _worker(request, self._cancel)
 
     def add_file(self, src_path, *, shred_original=True):
         self._require()
@@ -294,7 +306,7 @@ class Vault:
         return result
 
     def _new_batch(self, meta):
-        context = key_context(meta)
+        context = key_context(meta, self._env_hash)
         response = (self._provider("batch", context) if self._provider else
                     token_comms.request_import_batch(context))
         if len(response) != 48:
@@ -461,7 +473,7 @@ class Vault:
                 consume(i, key)
                 del key
         else:
-            contexts = [export_context(meta, entry) for entry in entries]
+            contexts = [export_context(meta, self._env_hash, entry) for entry in entries]
             if self._provider:
                 for i, context in enumerate(contexts):
                     consume(i, self._provider("read", context))
@@ -511,8 +523,8 @@ class Vault:
             (self._path / blob_id).unlink(missing_ok=True)
 
 
-def _open_metadata(meta, provider, cancel):
-    context = key_context(meta)
+def _open_metadata(meta, env_hash, provider, cancel):
+    context = key_context(meta, env_hash)
     if cancel is not None and cancel.is_set():
         raise VaultError("Vault opening cancelled.")
     if cancel is not None and provider is None:
@@ -531,11 +543,11 @@ def create_vault(path, index_key, env_hash, signal_ids, *, key_provider=None, lo
     raw = private.private_bytes_raw()
     encoded = base64.b32encode(raw).decode().rstrip("=")
     code = "-".join(encoded[i:i + 4] for i in range(0, len(encoded), 4))
-    meta = {"version": VERSION, "vault_id": secrets.token_hex(16), "env_hash": env_hash.hex(),
+    meta = {"version": VERSION, "vault_id": secrets.token_hex(16),
             "recovery_pub": private.public_key().public_bytes_raw().hex(),
             "signals": _seal(index_key, json.dumps(sorted(signal_ids)).encode(), _SIG_AAD),
             "created": _seal(index_key, str(int(time.time())).encode(), _CREATED_AAD)}
-    metadata_key = _open_metadata(meta, key_provider, cancel)
+    metadata_key = _open_metadata(meta, env_hash, key_provider, cancel)
     meta["recovery_index"] = _recovery_wrap(bytes.fromhex(meta["recovery_pub"]), metadata_key, _binding(meta))
     with _vault_file_lock(directory):
         if any(item.name != LOCK_NAME for item in directory.iterdir()):
@@ -546,15 +558,15 @@ def create_vault(path, index_key, env_hash, signal_ids, *, key_provider=None, lo
         except Exception:
             (directory / INDEX_NAME).unlink(missing_ok=True)
             raise
-    return Vault(path, metadata_key, key_provider=key_provider, local=local, signal_ids=signal_ids), code
+    return Vault(path, metadata_key, key_provider=key_provider, local=local, signal_ids=signal_ids,
+                 env_hash=env_hash), code
 
 
 def unlock_env(path, env_hash, *, key_provider=None, local=False, cancel=None, signal_ids=None):
+    """Open the file list. A wrong environment or token raises InvalidTag on the index."""
     meta = _meta(path)
-    if env_hash.hex() != meta["env_hash"]:
-        raise InvalidTag
-    key = _open_metadata(meta, key_provider, cancel)
-    return Vault(path, key, key_provider=key_provider, local=local, signal_ids=signal_ids)
+    key = _open_metadata(meta, env_hash, key_provider, cancel)
+    return Vault(path, key, key_provider=key_provider, local=local, signal_ids=signal_ids, env_hash=env_hash)
 
 
 def unlock_recovery(path, recovery_code, *, local=False):

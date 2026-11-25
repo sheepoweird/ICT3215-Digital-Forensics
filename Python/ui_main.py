@@ -435,6 +435,28 @@ CATEGORY_ORDER = ["Hardware", "Network", "OS", "Unknown"]
 VAULT_IDLE_LOCK_S = 5 * 60
 # A copied recovery code is cleared from the clipboard after this long.
 RECOVERY_CLIPBOARD_S = 30
+# Windows messages that lock the vault: Win+L / sign-out, sleep or hibernate, shutdown.
+WM_QUERYENDSESSION, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE = 0x0011, 0x0218, 0x02B1
+WTS_SESSION_LOGOFF, WTS_SESSION_LOCK, PBT_APMSUSPEND = 0x6, 0x7, 0x4
+
+
+def _session_notifications(function, hwnd):
+    """Register or unregister a window for Win+L / sign-out notifications (no-op off Windows)."""
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+    try:
+        call = getattr(ctypes.windll.wtsapi32, function)
+    except (AttributeError, OSError):
+        return
+    call.restype = wintypes.BOOL
+    if function == "WTSRegisterSessionNotification":
+        call.argtypes = [wintypes.HWND, wintypes.DWORD]
+        call(hwnd, 0)                                    # NOTIFY_FOR_THIS_SESSION
+    else:
+        call.argtypes = [wintypes.HWND]
+        call(hwnd)
 
 
 # ─── WORKER THREADS ──────────────────────────────────────────────────────────
@@ -1529,6 +1551,8 @@ class MainWindow(QMainWindow):
         # Panic lock: instantly lock the vault from anywhere in the app.
         self._panic_sc = QShortcut(QKeySequence("Ctrl+Shift+L"), self)
         self._panic_sc.activated.connect(self._panic_lock)
+        # Also lock when Windows locks (Win+L) or the session ends; see nativeEvent.
+        _session_notifications("WTSRegisterSessionNotification", int(self.winId()))
         self._restore_state()
         self._refresh_token_ui()
         self._refresh_ports()
@@ -1600,7 +1624,35 @@ class MainWindow(QMainWindow):
         self._settings.remove("files/last_dir")
         self._settings.sync()
 
+    def nativeEvent(self, event_type, message):
+        if os.name == "nt" and bytes(event_type) == b"windows_generic_MSG":
+            from ctypes import wintypes
+            msg = wintypes.MSG.from_address(int(message))
+            self._on_windows_message(msg.message, msg.wParam)
+        # Return (False, 0) to let Qt handle the message as usual. Calling
+        # super().nativeEvent() here crashes PyQt6 when the native window is created.
+        return False, 0
+
+    def _on_windows_message(self, message, wparam):
+        """Lock the vault before Windows locks, sleeps, hibernates or ends the session.
+
+        Locking first stops vault workers (their memory is released before a hibernation
+        image is written) and means the list needs a new IO0 tap after resuming.
+        """
+        if message == WM_WTSSESSION_CHANGE and wparam in (WTS_SESSION_LOCK, WTS_SESSION_LOGOFF):
+            reason = "Locked because Windows was locked."
+        elif message == WM_POWERBROADCAST and wparam == PBT_APMSUSPEND:
+            reason = "Locked because the PC is going to sleep or hibernate."
+        elif message == WM_QUERYENDSESSION:
+            reason = "Locked because Windows is signing out or shutting down."
+        else:
+            return
+        self._vault_open_cancel.set()
+        if self._vault is not None:
+            self._vault_do_lock(reason)
+
     def closeEvent(self, event):
+        _session_notifications("WTSUnRegisterSessionNotification", int(self.winId()))
         self._vault_open_cancel.set()
         # Lock the vault on exit so its key never outlives the window.
         if self._vault is not None:
@@ -3488,7 +3540,8 @@ class MainWindow(QMainWindow):
         self._vault_recovery_btn.clicked.connect(self._vault_unlock_recovery)
         self._vault_lock_btn = QPushButton("Lock now")
         self._vault_lock_btn.setObjectName("btn_danger")
-        self._vault_lock_btn.setToolTip("Lock the vault now  (Ctrl+Shift+L from anywhere)")
+        self._vault_lock_btn.setToolTip("Lock the vault now  (Ctrl+Shift+L in EnvStego; also locks on Win+L, "
+                                        "sleep and sign-out)")
         self._vault_lock_btn.clicked.connect(lambda: self._vault_do_lock("Locked."))
         for b in (self._vault_create_btn, self._vault_unlock_btn,
                   self._vault_recovery_btn, self._vault_lock_btn):

@@ -817,6 +817,22 @@ def test_vault_auto_locks_when_idle_even_with_token_in_range(win, tmp_path):
     assert "without vault activity" in win._vault_result.text()
 
 
+@pytest.mark.parametrize("message,wparam,reason", [
+    (ui_main.WM_WTSSESSION_CHANGE, ui_main.WTS_SESSION_LOCK, "Windows was locked"),
+    (ui_main.WM_WTSSESSION_CHANGE, ui_main.WTS_SESSION_LOGOFF, "Windows was locked"),
+    (ui_main.WM_POWERBROADCAST, ui_main.PBT_APMSUSPEND, "sleep or hibernate"),
+    (ui_main.WM_QUERYENDSESSION, 0, "signing out or shutting down"),
+])
+def test_vault_locks_when_windows_locks_sleeps_or_ends_the_session(win, tmp_path, message, wparam, reason):
+    session, _ = ui_main.V.create_vault(str(tmp_path / "vault"), bytes(32), bytes(32), [])
+    win._vault = session
+    win._on_windows_message(0x0400, 0)                    # an unrelated message changes nothing
+    assert win._vault is session
+    win._on_windows_message(message, wparam)
+    assert win._vault is None and not session.unlocked
+    assert reason in win._vault_result.text()
+
+
 def test_closing_the_originals_prompt_keeps_the_originals(win, monkeypatch):
     shown = []
 

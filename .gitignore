@@ -1,75 +1,60 @@
-# ─── Python ───────────────────────────────────────────────────
-.python-version
+# Only the codebase goes to GitHub. Everything at the top level is ignored unless it is listed below
+# images, local tools) stay local by default. To publish a new top-level code
+# folder or file, add a "!/name" line here.
+/*
+!/.gitignore
+!/README.md
+!/build.bat
+!/Python/
+!/ESP32 Files/
+!/packaging/
+!/md/
+
+# ─── Private runtime files (never commit) ─────────────────────
+# Pairing credential, app settings and lock files written next to the app.
+Python/token_config.json
+Python/envstego_settings.ini
+Python/.token-ble.lock
+.vault.lock
+
+# ─── Generated output ─────────────────────────────────────────
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-.Python
-
-# ─── Virtual environments ─────────────────────────────────────
-.venv/
-venv/
-env/
-ENV/
-
-# ─── PyInstaller build output ─────────────────────────────────
+.pytest_cache/
+.python-version
+*.egg-info/
+*.log
 build/
 dist/
 *.spec
-!packaging/EnvStego.spec
+!/packaging/EnvStego.spec
+# Firmware bundled by build.bat for the in-app flasher (built, not source)
+Python/firmware/
+# PlatformIO build output and per-user editor settings
+.pio/
+.vscode/
 
-# ─── Test files (don't commit sample payloads or stego images) ─
-*.stego.png
-test_carrier.png
-test_stego.png
-recovered.*
-secret.*
-
-# ─── VS Code ──────────────────────────────────────────────────
-.vscode/*
-!.vscode/launch.json
-!.vscode/settings.json
+# ─── Non-code files that may land in code folders ─────────────
+# Documents, and carriers/payloads left behind by manual testing.
+*.doc
+*.docx
+*.pdf
+*.odt
+*.pptx
+*.rtf
+Python/**/*.png
+Python/**/*.jp*g
+Python/**/*.webp
+Python/**/*.bmp
+Python/**/*.tif*
+Python/**/*.gif
+Python/**/*.wav
+Python/**/*.mp3
+Python/**/*.flac
+Python/**/*.ogg
+Python/**/*.zip
 
 # ─── OS junk ──────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# ─── pip / eggs ───────────────────────────────────────────────
-*.egg-info/
-.eggs/
-pip-log.txt
-.pytest_cache/
-
-# ─── Logs ─────────────────────────────────────────────────────
-*.log
-
-# ─── Report / office documents (local only — never push to GitHub) ───
-# Only app code and markdown setup docs belong in the repo; the written
-# report, proposal and templates stay out of git.
-*.docx
-*.doc
-*.pdf
-*.odt
-*.pptx
-*.rtf
-DF Main Doc.docx
-Project Assignment.html
-Python/token_config.json
-Python/.token-ble.lock
-Python/envstego_settings.ini
-
-# ─── Local dev / verification tools (not part of the app) ─────
-# Screenshot renderer + live token security checker. They drive or
-# verify the app but are not needed to run it; kept local, not shipped.
-/devtools/
-/Images/
-# ─── Evidence (local only — report artifacts, not app code) ───
-# Logs + screenshots documenting test/verification runs. Kept locally
-# for the report; not pushed. The app and tests do not depend on them.
-/evidence/
-
-# ─── PlatformIO build output (ESP32 firmware) ───
-.pio/
-# Firmware bundled by build.bat for the in-app flasher (built, not source)
-Python/firmware/

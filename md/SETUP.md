@@ -55,7 +55,7 @@ tap **RST / EN**, release BOOT and click again.
 > Firmware **v9** adds ESP32-S3 support and a read-only `INFO` serial command that
 > the updater uses to show the running version. The BLE protocol and key derivation
 > are unchanged from v8, so updating keeps existing pairings, stego files and vaults.
-> Vault v2 requires firmware v8 or later; USB pairing requires v5 or later.
+> The vault requires firmware v8 or later; USB pairing requires v5 or later.
 
 ---
 
@@ -274,8 +274,10 @@ images and audio. No format-specific parser is needed for storing or exporting f
    stays on, tap IO0 once to open the new list. Save the 52-character recovery code offline.
    If you use **Copy**, the clipboard is cleared after 30 seconds; Windows clipboard history
    (Win+V) keeps its own copy if you have it turned on.
-2. **Browse files** checks the environment and asks for one IO0 tap each time you open
+2. **Browse files** collects the vault's signals and asks for one IO0 tap each time you open
    a locked list. The open session holds the metadata key and displays filenames, sizes and dates.
+   The environment is part of the vault's keys and is never stored, so in a different
+   environment the list does not open: you see "environment does not match" after the tap.
 3. **Add files** (or drag files onto the list) asks whether to **Keep** or **Delete** the
    originals; Keep is the default. No IO0 tap is needed. The app checks the current
    environment and requests one temporary batch secret for the selection. Bluetooth
@@ -291,13 +293,16 @@ images and audio. No format-specific parser is needed for storing or exporting f
    fresh approval. Existing output filenames are preserved.
 5. **Lock now** or **Ctrl+Shift+L** closes the list and cancels active file workers.
    The app also locks by itself when the token stops answering (checked every 25 s),
-   and after **5 minutes without vault activity** even with the token in range.
+   after **5 minutes without vault activity** even with the token in range, and as soon as
+   Windows is locked (**Win+L**), goes to sleep or hibernates, or signs out or shuts down.
    Selecting files or running an import or export counts as activity.
    There is no in-app preview: use **Export** to open a file.
 6. **Unlock with recovery code** opens the list with the offline code. Re-enter it for
    each single-file recovery export. This route works without an IO0 press.
 
-See [vault security and recovery](VAULT_SECURITY.md) for key handling and format compatibility.
+Vaults created before 2026-11-25 used an older format and are no longer supported; create
+new vaults in empty folders. See [vault security and recovery](VAULT_SECURITY.md) for key
+handling and format details.
 
 ### Diagnostics › Inspector
 - Shows raw values of every collected signal and which ones are in the key
@@ -315,7 +320,7 @@ See [vault security and recovery](VAULT_SECURITY.md) for key handling and format
 | USB pairing | Token creates `master_secret` (never leaves it), `auth_key` and `token_id` from its hardware RNG. `auth_key` + `token_id` go to the PC (DPAPI-encrypted) |
 | BLE request | HELLO → token sends a fresh nonce. PC sends its own nonce + an AES-GCM request keyed by `HMAC(auth_key, nonces)`. The token replies AES-GCM encrypted under the same session key |
 | Stego key | Domain-separated environment HMAC on the token; per-file HKDF on the PC |
-| Vault v2 keys | Separate metadata/file HMAC domains on the token. File context binds vault ID, environment hash and random file ID. The worker imports with fresh keys and requests selected export keys after one IO0 tap |
+| Vault keys | Separate metadata/file HMAC domains on the token. The context binds the vault ID and the live environment hash (never stored), and file keys add a random file ID. The worker imports with fresh keys and requests selected export keys after one IO0 tap |
 | Vault recovery | X25519 public-key envelopes wrap metadata and individual file keys; only the offline code supplies the private recovery key |
 | Defences | Raw signal values never leave the PC. Replays fail (single-use nonces). Impostor tokens/hosts fail the GCM tag. Five authentication failures close only the affected link. |
 

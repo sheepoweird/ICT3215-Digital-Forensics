@@ -50,7 +50,7 @@ def test_browsing_caches_only_a_metadata_key(tmp_path):
     assert token.calls[0][0] == "metadata" and token.calls[1][0] == "batch"
     vault.list_entries()
     assert len(token.calls) == 2
-    file_key = token("read", V.export_context(V._meta(vault.path), entry))
+    file_key = token("read", V.export_context(V._meta(vault.path), ENV, entry))
     assert vault._metadata_key != file_key
     assert file_key not in vault.__dict__.values()
     assert not hasattr(vault, "_key")
@@ -67,7 +67,7 @@ def test_each_file_requires_its_own_key_and_each_export_requests_again(tmp_path)
     second = vault.add_bytes("b.docx", os.urandom(2000))
     assert first["blob"] != second["blob"]
     meta = V._meta(vault.path)
-    wrong_key = token("read", V.export_context(meta, first))
+    wrong_key = token("read", V.export_context(meta, ENV, first))
     with pytest.raises(InvalidTag):
         vault._decrypt_to(second, wrong_key, meta, lambda _: None)
     vault.export(first["blob"], str(tmp_path))
@@ -290,7 +290,7 @@ def test_lock_terminates_export_child_and_cleans_partial_plaintext(tmp_path, mon
 def test_open_worker_uses_one_approval_for_all_selected_files(tmp_path, monkeypatch):
     vault, _, token = new(tmp_path)
     entries = [vault.add_bytes(name, name.encode()) for name in ("a", "b", "c")]
-    session = V.Vault(vault.path, vault._metadata_key, local=True)
+    session = V.Vault(vault.path, vault._metadata_key, local=True, env_hash=ENV)
     calls = []
     def approve(contexts, consume):
         calls.append(contexts)
@@ -300,11 +300,11 @@ def test_open_worker_uses_one_approval_for_all_selected_files(tmp_path, monkeypa
     selected = [entries[2]["blob"], entries[0]["blob"]]
     outputs = session.export_many(selected, tmp_path)
     assert [Path(p).read_bytes() for p in outputs] == [b"c", b"a"]
-    assert calls == [[V.export_context(V._meta(vault.path), entries[i]) for i in (2, 0)]]
+    assert calls == [[V.export_context(V._meta(vault.path), ENV, entries[i]) for i in (2, 0)]]
     assert not (tmp_path / "b").exists()
 
 
-@pytest.mark.parametrize("field,value", [("recovery_pub", "ab" * 32), ("env_hash", "cd" * 32),
+@pytest.mark.parametrize("field,value", [("recovery_pub", "ab" * 32), ("created", "AAAA"),
                                          ("vault_id", "ef" * 16)])
 def test_modified_vault_binding_cannot_open_recovery_index(tmp_path, field, value):
     vault, code, _ = new(tmp_path)
@@ -367,18 +367,21 @@ def test_import_worker_reports_each_file_and_preserves_committed_entries(tmp_pat
         path = recovered.export(entry["blob"], tmp_path, recovery_code=code)
         assert Path(path).read_bytes() == entry["name"].encode()
 
-def test_mixed_legacy_and_batch_entries_export(tmp_path):
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    session, _, token = new(tmp_path)
-    modern = session.add_bytes("modern", b"new")
-    meta = V._meta(session.path)
-    blob = os.urandom(16)
-    old = {"blob": blob.hex(), "size": 3, "name": "legacy", "added": 1}
-    aad = V._binding(meta) + blob
-    key = token("read", V.key_context(meta, old["blob"]))
-    nonce = os.urandom(12)
-    (Path(session.path) / old["blob"]).write_bytes(nonce + AESGCM(key).encrypt(nonce, b"old", aad))
-    old["recovery_wrapped"] = V._recovery_wrap(bytes.fromhex(meta["recovery_pub"]), key, aad)
-    V._save_entries(session.path, session._metadata_key, meta, [old, modern])
-    outputs = session.export_many([old["blob"], modern["blob"]], tmp_path)
-    assert [Path(path).read_bytes() for path in outputs] == [b"old", b"new"]
+
+def test_environment_hash_is_not_stored_and_a_wrong_environment_cannot_open(tmp_path):
+    vault, _, token = new(tmp_path)
+    vault.add_bytes("note.txt", b"bound to this environment")
+    stored = (Path(vault.path) / V.META_NAME).read_text(encoding="utf-8")
+    assert "env_hash" not in stored and ENV.hex() not in stored
+    with pytest.raises(InvalidTag):           # the token derives a different key
+        V.unlock_env(vault.path, bytes(range(64, 96)), key_provider=token)
+    reopened = V.unlock_env(vault.path, ENV, key_provider=token)
+    assert [entry["name"] for entry in reopened.list_entries()] == ["note.txt"]
+
+
+def test_a_file_imported_in_another_environment_cannot_be_exported_here(tmp_path):
+    vault, _, token = new(tmp_path)
+    elsewhere = V.Vault(vault.path, vault._metadata_key, key_provider=token, env_hash=bytes(range(64, 96)))
+    entry = elsewhere.add_bytes("other.txt", b"x")
+    with pytest.raises(InvalidTag):
+        vault.export(entry["blob"], str(tmp_path))

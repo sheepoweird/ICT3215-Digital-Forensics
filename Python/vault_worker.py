@@ -34,7 +34,7 @@ def main():
             return 0
         path = request["path"]
         code = request.get("recovery_code")
-        meta = vault._meta(path)
+        vault._meta(path)  # refuse unsupported formats before doing anything else
         if code:
             session = vault.unlock_recovery(path, code, local=True)
         else:
@@ -43,9 +43,13 @@ def main():
             signal_ids = request.get("signal_ids")
             if signal_ids is None:
                 signal_ids = vault.read_signal_ids(path, token_comms.request_env_key(INDEX_HASH))
-            if live_environment(signal_ids).hex() != meta["env_hash"]:
+            # Keys are derived from the live environment, so it must still be the one the
+            # list was opened with; otherwise new files would be bound to another environment.
+            env_hash = live_environment(signal_ids)
+            opened_with = request.get("env_hash")
+            if opened_with is not None and env_hash.hex() != opened_with:
                 raise vault.VaultError("The vault environment has changed.")
-            session = vault.Vault(path, bytes.fromhex(request["metadata_key"]), local=True)
+            session = vault.Vault(path, bytes.fromhex(request["metadata_key"]), local=True, env_hash=env_hash)
         try:
             if action == "import":
                 result = session.add_files(request["sources"], shred_original=request["shred_original"])

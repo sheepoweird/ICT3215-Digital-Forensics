@@ -157,7 +157,8 @@ A vault is an encrypted folder for files you want to keep together.
    the originals.
 4. To get a file out, select it, click **Export** and tap IO0.
 5. Press **Ctrl+Shift+L** to lock the vault. It also locks itself after 5 minutes of
-   inactivity or when the token goes out of range.
+   inactivity, when the token goes out of range, and when you lock Windows (**Win+L**),
+   put the PC to sleep or sign out.
 
 There's no preview inside the app. Export a file to open it.
 
@@ -198,11 +199,12 @@ There's no preview inside the app. Export a file to open it.
   support is implemented inside `stego_engine.py`; native MP3 embedding is not
   implemented. Recovered files are written to disk only; the app never displays their
   contents. See [format behavior and validation](md/STEGO_FORMATS.md).
-- **Env Vault v2**: arbitrary file types, including DOCX and PDF; encrypted metadata,
+- **Env Vault**: arbitrary file types, including DOCX and PDF; encrypted metadata,
   one token request per import selection, locally derived per-file keys, and offline
-  recovery. **No in-app preview.** The list locks on **Ctrl+Shift+L**, when the token stops
-  answering, or after 5 minutes without vault activity, and locking cancels active file
-  workers. Each import asks whether to keep or delete the originals (keep by default);
+  recovery. The environment is part of the vault's keys and is never stored, so the vault
+  only opens with matching signals. **No in-app preview.** The list locks on
+  **Ctrl+Shift+L**, on Win+L, sleep or sign-out, when the token stops answering, or after
+  5 minutes without vault activity, and locking cancels active file workers. Each import asks whether to keep or delete the originals (keep by default);
   each deletion outcome is reported.
 - **Anti-forensic hygiene**: secure delete (overwrite + timestomp + rename + unlink),
   optional free-space wipe, Privacy mode, and settings kept out of the Windows registry.
