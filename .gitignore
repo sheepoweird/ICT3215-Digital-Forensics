@@ -3,6 +3,7 @@
 # folder or file, add a "!/name" line here.
 /*
 !/.gitignore
+!/.gitattributes
 !/README.md
 !/build.bat
 !/Python/

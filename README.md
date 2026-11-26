@@ -344,8 +344,15 @@ for you to press IO0. See the full [LED table](md/SETUP.md#token-led-signals).
 <details>
 <summary><b><code>build.bat</code> fails</b></summary>
 
-It needs Python 3.12 available as `py -3.12`. The first run downloads about 1 GB of
-PlatformIO toolchains, so it needs an internet connection and some time.
+It needs Python 3.12 available as `py -3.12` (install it from python.org with the
+py launcher ticked; the Microsoft Store Python has no `py`). Run `py --list` to see
+what is installed. A `.venv` copied from another PC is rebuilt automatically.
+
+The first run downloads about 1 GB of PlatformIO toolchains, so it needs an internet
+connection and some time. If your Windows username has spaces or non-English
+characters, run `set PLATFORMIO_CORE_DIR=C:\pio` first, because the ESP32 compiler can
+fail on such paths. Keep the project out of OneDrive-synced folders and short paths
+help too (e.g. `C:\src\ICT3215-Digital-Forensics`).
 
 </details>
 

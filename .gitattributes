@@ -1,0 +1,4 @@
+# Windows batch files must have CRLF line endings: with LF only, cmd.exe can fail
+# to find "goto" labels. This holds whatever the cloning PC's core.autocrlf is.
+*.bat text eol=crlf
+*.cmd text eol=crlf
