@@ -50,7 +50,7 @@ disk image.
 
 ### 1. Build the app
 
-From the repository root, run:
+From the repository root, run (ensure that the relevant python versions are installed):
 
 ```bat
 build.bat
