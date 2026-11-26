@@ -79,7 +79,15 @@ From the repository root:
 build.bat
 ```
 
-This creates `.venv` (Python 3.12), installs the app and build requirements
+If `py -3.12` doesn't work, `build.bat` offers to download Python 3.12.10 from
+python.org (the last 3.12 release with a Windows installer), checks that the installer
+is signed by the Python Software Foundation, and installs it silently for all users
+after one administrator prompt. It doesn't add Python to `PATH` and it keeps an existing
+py launcher, so your default `python` stays the same. Answering `N` or cancelling the
+prompt stops the build with manual install steps. When double-clicked, the window
+waits for a key before closing.
+
+It then creates `.venv` (Python 3.12), installs the app and build requirements
 (`packaging/requirements-build.txt`: PyInstaller and PlatformIO), builds both firmware
 environments, and writes `dist\EnvStego-portable.zip`. The first run downloads
 PlatformIO's ESP32 toolchains (about 1 GB); after that a build takes a few minutes.

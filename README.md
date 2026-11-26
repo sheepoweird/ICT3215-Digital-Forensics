@@ -42,7 +42,8 @@ disk image.
 - A **token**: either an **ESP32-CAM** with its USB programmer board, or an
   **ESP32-S3-N16R8** dev board. See [Hardware](#hardware) for the parts list.
 - A **USB data cable** that fits the board. Some cables only carry power.
-- **Python 3.12**, only to build the app. The finished app doesn't need Python.
+- **Python 3.12**, only to build the app. `build.bat` offers to install it for you if
+  it's missing. The finished app doesn't need Python.
 
 ---
 
@@ -50,11 +51,15 @@ disk image.
 
 ### 1. Build the app
 
-From the repository root, run (ensure that the relevant python versions are installed):
+From the repository root, run `build.bat` (or double-click it):
 
 ```bat
 build.bat
 ```
+
+If Python 3.12 isn't installed, `build.bat` asks whether to download Python 3.12.10
+from python.org and install it for all users. Answer `Y` and approve the administrator
+prompt; the build then continues on its own.
 
 This creates `dist\EnvStego-portable.zip`. The first build downloads about 1 GB of
 ESP32 tools; after that a build takes a few minutes.
@@ -344,9 +349,16 @@ for you to press IO0. See the full [LED table](md/SETUP.md#token-led-signals).
 <details>
 <summary><b><code>build.bat</code> fails</b></summary>
 
-It needs Python 3.12 available as `py -3.12` (install it from python.org with the
-py launcher ticked; the Microsoft Store Python has no `py`). Run `py --list` to see
-what is installed. A `.venv` copied from another PC is rebuilt automatically.
+It needs Python 3.12 available as `py -3.12`. If that's missing, `build.bat` offers to
+download Python 3.12.10 from python.org, checks the installer is signed by the Python
+Software Foundation, and installs it for all users. That needs administrator rights:
+if you cancel the administrator prompt, nothing is installed. To install it yourself
+instead, use the python.org installer with the py launcher ticked (the Microsoft Store
+Python has no `py`). Run `py --list` to see what is installed. A `.venv` copied from
+another PC is rebuilt automatically.
+
+When you double-click `build.bat`, the window stays open at the end so you can read
+the result. Press any key to close it.
 
 The first run downloads about 1 GB of PlatformIO toolchains, so it needs an internet
 connection and some time. If your Windows username has spaces or non-English
