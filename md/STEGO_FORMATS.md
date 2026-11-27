@@ -83,7 +83,8 @@ by encryption; renaming a previous PNG is not sufficient.
 
 ## Validation
 
-Final Windows checks on 2026-11-18:
+Windows checks on 2026-11-18 (the current full suite is 279 tests, last passed
+2026-11-28; see `md/TESTING.md`):
 
 - `python -m pytest Python/tests -q`: **246 passed in 69.02 seconds**.
 - `pip check`: no broken requirements.
@@ -152,7 +153,9 @@ was rejected when one piece was missing. A JPEG file saved with a `.png` extensi
 handled by content and written as PNG.
 
 On 2026-11-24 the full suite passed **242 tests** (after removing the obsolete v1 vault and ENV2 code), and Bandit over `Python/` (tests
-excluded) reported **0 medium/high and 16 low** findings.
+excluded) reported **0 medium/high and 16 low** findings. After the vault format 3 changes
+(2026-11-25) the suite has **279 tests**, all passing, and Bandit reports **0 medium/high
+and 18 low**.
 
 ## Sources
 

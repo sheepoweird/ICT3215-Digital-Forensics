@@ -10,7 +10,7 @@ and which screenshots to capture for the report and video. Results are from comm
 
 | Area | Status | Result |
 |---|---|---|
-| A. Automated test suite | ✅ | 279 / 279 passed (2026-11-25, vault format 3) |
+| A. Automated test suite | ✅ | 279 / 279 passed (2026-11-25, vault format 3; re-run 2026-11-28 on Python 3.12.7, 279 passed) |
 | S1. Disk-acquisition adversary harness | ⚠️ | 26 held, 3 metadata-only leaks, 0 broken; software-only baseline recovered |
 | S2. Fuzz harness | ✅ | 42 hostile-input checks, 0 vulnerabilities |
 | S3. Static analysis (Bandit) | ✅ | 0 high, 0 medium, 18 low |
@@ -18,16 +18,16 @@ and which screenshots to capture for the report and video. Results are from comm
 | F. Real-file format round trips | ✅ | 15 carrier types + 1 mixed split set, all recovered |
 | H1. Token boot and USB pairing (firmware v8) | ⚠️ | Paired 2026-11-19; one crash loop on a front USB port (see §8) |
 | H2. Firmware update to v9 | ⏳ | |
-| H3. Vault with physical IO0 taps | ⏳ | |
+| H3. Vault with physical IO0 taps | ⏳ | H3.1, H3.3–H3.5 and H3.10 passed on v9 hardware (2026-11-27); the rest pending |
 | M. Manual functional tests | ⏳ | |
-| E. Forensic tool evaluation | ⏳ | |
+| E. Forensic tool evaluation | ⚠️ | E7, E9 done; E10, E11 found memory residue (see §8); E1–E6, E8 pending |
 
 ## 2. Test environment
 
 | Item | Value |
 |---|---|
 | OS | Windows 11 Home (10.0.26200) |
-| Python | 3.10.0 |
+| Python | 3.10.0 (2026-11-25 run); 3.12.7 in the build `.venv` (2026-11-28 run) |
 | Token | ESP32-CAM (ESP32-D0WD-V3 rev 3.1) on an ESP32-CAM-MB (CH340) programmer |
 | Firmware | v9 in the repository; the test board ran v8 for H1 |
 | Automated tests | Simulated token (same key derivations as the firmware); no Bluetooth hardware needed |
@@ -66,7 +66,7 @@ and a simulated token, then attack them without the token.
 | Recover the hidden payload with 20,000 index-key and 5,000 file-key guesses | Held: all rejected |
 | Locate the payload without the token's bit-scatter key (PNG and JPEG) | Held: header not found |
 | Group or order split-set pieces among decoy images | Held: indistinguishable, 0/76 shared bytes |
-| Read vault names, sizes, dates, signal list or creation time from disk | Held: all sealed |
+| Read vault names, sizes, dates, signal list or creation time from disk | Held: all sealed inside the vault files. Outside the harness, NTFS timestamps on the blob files still show when items were added |
 | Open the vault with 20,000 metadata keys or 5,000 random 256-bit recovery codes | Held: all rejected |
 | **Token + vault folder, but in a different environment** | Held: the token derives a different key and the index fails to authenticate |
 | Find the environment hash in `vault.json` | Held: not stored |
@@ -140,19 +140,20 @@ Keep a serial monitor open at 115200 baud during these tests and save its output
 ### H3. Vault with physical IO0 taps ⏳
 
 Use an empty folder and test files; record SHA-256 hashes first (`certutil -hashfile <file> SHA256`).
+Rows marked 2026-11-27 were run on firmware v9 and recorded for the demo video.
 
 | ID | Step | Expected | Result |
 |---|---|---|---|
-| H3.1 | Create vault | 1 IO0 tap; recovery code shown | |
+| H3.1 | Create vault | 1 IO0 tap; recovery code shown | ✅ 2026-11-27: LED solid until the tap; recovery code shown |
 | H3.2 | Lock, then Browse files | 1 tap opens the list | |
-| H3.3 | Add 3 files, choose Keep | No tap; originals still exist | |
-| H3.4 | Add 1 file, choose Delete | Original gone; status "shredded" | |
-| H3.5 | Export several files | 1 tap for all; hashes match originals | |
+| H3.3 | Add 3 files, choose Keep | No tap; originals still exist | ✅ 2026-11-27: canary folder (4 files) added with Keep; originals still present |
+| H3.4 | Add 1 file, choose Delete | Original gone; status "shredded" | ✅ 2026-11-27: test file gone; FTK Imager listings before and after show its MFT record freed (on C:\ the folder's $I30 index still held its short name, size and timestamps) |
+| H3.5 | Export several files | 1 tap for all; hashes match originals | ✅ 2026-11-27: 4 canary files exported; SHA-256 of all 4 match the originals |
 | H3.6 | Export files from two separate imports | Still 1 tap | |
 | H3.7 | Start export, don't tap for 60 s | Fails cleanly; LED off | |
 | H3.8 | Hold IO0 before clicking Export | Nothing until released and pressed again | |
 | H3.9 | Lock during a large export | No partial file or `.vault-operation-*` folder | |
-| H3.10 | Switch the token off with the vault open | Auto-locks within about 50 s | |
+| H3.10 | Switch the token off with the vault open | Auto-locks within about 50 s | ✅ 2026-11-27: token unplugged with the vault open; the vault auto-locked (time not measured) |
 | H3.11 | Leave the vault idle for 5 min, token on | Locks "without vault activity" | |
 | H3.12 | Recovery code, token off | Exports 1 file | |
 | H3.13 | Open the vault folder in Explorer | Only random hex names, `vault.json`, `index.bin`, `.vault.lock` (empty lock file); no environment hash in `vault.json` | |
@@ -197,10 +198,13 @@ Use an empty folder and test files; record SHA-256 hashes first (`certutil -hash
 | Token visible over Bluetooth | It advertises its name, and its ID is sent unencrypted in each challenge | Confirmed in E7; add to the report's limits |
 | Token trackable by its Bluetooth address | Fixed public address `84:1f:e8:67:b6:c2` (Espressif prefix); no address randomisation | Confirmed in E7; add to the report's limits |
 | No Bluetooth-level link encryption | 0 pairing (SMP) packets: all protection is the app's AES-GCM layer, so only ciphertext, nonces and the token ID cross the air | By design; state it in the report's design section |
-| Recovery code lingers in the app's memory | Confirmed in E10: from vault creation onwards the main app holds the recovery code and its raw key, for minutes; Python and Qt cannot wipe them. Matches the documented limit in `md/VAULT_SECURITY.md`. Pagefile or hibernation could copy it to disk | Limitation (low–medium): needs live memory access, or the code paged to disk. Mitigate: close the app after creating a vault, disable hibernation, clear the pagefile at shutdown |
+| Recovery code lingers in the app's memory | Confirmed in E10: after vault creation (2026-11-25) for minutes, and after a recovery-code unlock (2026-11-27) for over 30 minutes, until the app restarted; Python and Qt cannot wipe them. Matches the documented limit in `md/VAULT_SECURITY.md`. Pagefile or hibernation could copy it to disk | Limitation (low–medium): needs live memory access, or the code paged to disk. Mitigate: close the app after creating or recovering a vault, disable hibernation, clear the pagefile at shutdown |
+| Vault metadata key lingers in the app's memory | Confirmed in E10 (2026-11-27): the main app still held the import request (metadata key and environment hash) about 14 h after the import, while the app stayed open. The key decrypts the file list, not file contents | Limitation (medium): same mitigation; future work: restart the app or end the process on lock |
+| App process can outlive its window | 2026-11-28: a window-less `EnvStego.exe` was still running about 6.5 h after it started; it held its memory and blocked a rebuild of its folder | Limitation: check Task Manager after closing; future work: force the process to exit on close |
+| Vault use leaves timing traces | NTFS timestamps on blob files show when items were added; the 25 s heartbeat is a regular BLE pattern while a vault is open | Limitation; state in the report |
 | Token secret not encrypted at rest | ESP32 flash/NVS encryption is not enabled | Stated in `md/FLASH_ENCRYPTION.md` and the report |
 
-## 9. Forensic tool evaluation (E) ⏳
+## 9. Forensic tool evaluation (E) ⚠️
 
 Hash every image and RAM dump straight after capture (`certutil -hashfile <file> SHA256`)
 and record the hash. **Never upload RAM dumps**: they contain everything that was in memory.
@@ -216,7 +220,8 @@ and record the hash. **Never upload RAM dumps**: they contain everything that wa
 | E7 | Bluetooth traffic is encrypted | Wireshark + USBPcap or `btvs.exe` | Capture a key request | Ciphertext only; token name and ID visible | ⚠️ 2026-11-25, `Decrypting.pcapng` (1 exchange, frames 9289–9329) and `Encrypting.pcapng` (2 exchanges, frames 10525–11037), filter `btatt`. All 3 requests (78 B) and 3 responses (62 B) are ciphertext with 0 byte positions in common after the type byte. The token ID (`ee3649e6…`, identical in all 3 challenges) and the advertised name `3T-Token-v9` are readable |
 | E8 | Short-lived worker processes | Process Explorer or System Informer | Watch during an export | Worker appears, then exits | |
 | E9 | USB pairing never exposes the auth key | Wireshark + USBPcap | Capture a fresh pairing over USB | Only public keys and ciphertext on the wire | ✅ 2026-11-25, `Pairing.pcapng`: request carries the PC's public key; reply carries `MODE=ECDH`, the token's public key and the auth key encrypted (`ENC`, 60 B = IV + ciphertext + tag). No plaintext key; the master secret is never sent |
-| E10 | What process memory holds | System Informer (dump) + string search | Dump the main app and a vault worker | Names while open; no master secret | ⚠️ 2026-11-25, four dumps. During vault creation (18:41) the main app (PID 26788) held the new recovery code as text (with and without hyphens) and its raw 32-byte key 3 times; the creation worker (PID 49012) held neither. An earlier vault's code was present in the main app at 18:30 but gone from the same process by 18:41, so it lingers for minutes, not indefinitely. Vault workers held no recovery code. 2026-11-26, `Pairing.dmp` (main app, taken seconds after pairing at 15:27): the auth key was found 0 times (raw, hex, ASCII or UTF-16) and the token's serial reply (`PAIRING_SUCCESS…ENC=`) was not left in memory; only the token ID (public, also broadcast over BLE) and the DPAPI-encrypted config blob were present. 2026-11-26, `Vault 2.dmp` (main app, current code, 15:41, about 2 min after creating a vault at 15:39 and after an export): recovery code 0 hits (with or without hyphens, any case, ASCII or UTF-16, raw 32-byte key; code verified against `recovery_pub`), unlike `Vault 1.dmp`; auth key 1 raw copy (needed for the BLE session; a process running as the same user could unwrap it with DPAPI anyway); imported file names present (ASCII and UTF-16), as expected after the list was open. Canary search pending (needs the test file names) |
+| E10 | What process memory holds | System Informer (dump) + string search | Dump the main app and a vault worker | Names while open; no master secret | ⚠️ 2026-11-25, four dumps. During vault creation (18:41) the main app (PID 26788) held the new recovery code as text (with and without hyphens) and its raw 32-byte key 3 times; the creation worker (PID 49012) held neither. An earlier vault's code was present in the main app at 18:30 but gone from the same process by 18:41, so it lingers for minutes, not indefinitely. Vault workers held no recovery code. 2026-11-26, `Pairing.dmp` (main app, taken seconds after pairing at 15:27): the auth key was found 0 times (raw, hex, ASCII or UTF-16) and the token's serial reply (`PAIRING_SUCCESS…ENC=`) was not left in memory; only the token ID (public, also broadcast over BLE) and the DPAPI-encrypted config blob were present. 2026-11-26, `Vault 2.dmp` (main app, current code, 15:41, about 2 min after creating a vault at 15:39 and after an export): recovery code 0 hits (with or without hyphens, any case, ASCII or UTF-16, raw 32-byte key; code verified against `recovery_pub`), unlike `Vault 1.dmp`; auth key 1 raw copy (needed for the BLE session; a process running as the same user could unwrap it with DPAPI anyway); imported file names present (ASCII and UTF-16), as expected after the list was open. 2026-11-27, System Informer memory search of the main app at 16:11: the JSON request sent to the import worker (metadata key and environment hash) and the decrypted file-list JSON were both still in memory about 14 h after the import. After a recovery-code unlock the code was found 3 times (once in Python, twice as Qt UTF-16 text), then once (Qt) for over 30 minutes; after restarting the app it was not found. Canary search pending (needs the test file names) |
+| E11 | Keys written to disk by Windows paging or hibernation | FTK Imager (export), byte-string search, Autopsy keyword search, Hibernation Recon | Export `pagefile.sys` and `hiberfil.sys` from the live system; search for the metadata key, environment hash and JSON field names | 0 hits | ⚠️ 2026-11-27. `pagefile.sys` (26.8 GB): 0 hits for the metadata key (hex or raw), the environment hash, or the `metadata_key` / `signal_ids` JSON; Autopsy agreed (the field names only appear as code identifiers). 1,825 `EnvStego` hits show app memory was paged, so the search worked. Windows memory compression can hide compressed pages, so 0 hits is a lower bound. `hiberfil.sys` (13.7 GB): all zeros except a 277-byte `WAKE` header (Hibernation Recon: no valid data). Windows clears the image after resuming, so a live copy cannot show what was hibernated; that needs the disk imaged while the PC is hibernated |
 
 ## 10. Screenshots and recordings
 
@@ -246,6 +251,8 @@ For the report, crop to the relevant area; for the video, record the live step i
 | SS-19 | Aletheia output on clean vs stego images | E6 | Report |
 | SS-20 | Wireshark: encrypted request bytes | E7 | Report |
 | SS-21 | Process Explorer: worker process during export | E8 | Video |
+| SS-22 | Autopsy keyword search on `pagefile.sys`: 0 hits for the key prefixes | E11 | Report |
+| SS-23 | Hibernation Recon "no valid data" on the zeroed `hiberfil.sys` | E11 | Report |
 
 ## 11. Evidence files
 

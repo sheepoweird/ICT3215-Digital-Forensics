@@ -15,10 +15,10 @@ firmware **v8** or later. The implementation is
 | Recovery browse | Recovery code/private key temporarily, then metadata key in the session | Offline recovery code |
 | Recovery export | Recovery code/private key and selected file key in the worker | Re-enter code for each selected file |
 
-There is no shared content key in a normal v2 metadata session. The GUI does not
+There is no shared content key in a normal metadata session. The GUI does not
 receive file keys from import/export workers. Each worker exits after its action;
 large normal imports/exports stream in 1 MiB chunks. Vault preview and the
-`read_bytes` interface have been removed from the v2 GUI/API. The separate stego
+`read_bytes` interface have been removed from the GUI/API. The separate stego
 workflow still uses its existing environment-derived key. Its text preview was
 removed, so a recovered payload is written to disk without being shown in the window.
 
@@ -43,6 +43,20 @@ per-file key isolation. The recovery dialog and optional clipboard copy also
 expose that secret to the desktop environment. A copied code is cleared from the
 clipboard after 30 seconds unless something else was copied since; Windows
 clipboard history or cloud clipboard sync, if enabled, can still keep it.
+
+Measured on Windows 11 (see `md/TESTING.md`, E10 and E11):
+
+- The main app still held the import request (metadata key and environment hash) and
+  the decrypted file list about 14 hours after an import, while the app stayed open.
+- After a recovery-code unlock, one copy of the code stayed in memory for over 30
+  minutes; it was gone once the app was restarted.
+- A closed window does not always end the process: one window-less `EnvStego.exe` was
+  still running about 6.5 hours after it started. Its memory persists until it is ended.
+- A 26.8 GB `pagefile.sys` contained no copy of the metadata key or environment hash
+  (a lower bound, since Windows compresses some paged memory). The live `hiberfil.sys`
+  was zeroed after resume, so it could not be assessed.
+
+Close EnvStego after using a vault and confirm in Task Manager that it has exited.
 
 ## Token derivation and approval
 
@@ -153,7 +167,8 @@ See [flash provisioning](FLASH_ENCRYPTION.md) for hardware storage consideration
 
 ## Validation
 
-On 2026-11-25, `python -m pytest -q Python/tests` passed all 279 tests on Windows.
+On 2026-11-25, `python -m pytest -q Python/tests` passed all 279 tests on Windows
+(re-run 2026-11-28: 279 passed).
 The host tests exercise encrypted BLE responses, missing or forged approval,
 a wrong environment failing to open the vault or export its files, locking on Win+L,
 sleep and sign-out, single-tap export, selection substitution, single-request batch imports, worker
@@ -164,8 +179,12 @@ interface. The v8 ESP32-CAM PlatformIO build uses 1,198,685 bytes of program fla
 Live v8 status: the board booted firmware v8 (advertising `3T-Token-v8`) and completed a
 fresh USB pairing on 2026-11-19 after its NVS had been cleared. One boot on a front-panel
 USB port crashed during Bluetooth start-up and the token then stayed unresponsive until
-reset; on a different port it booted cleanly. A live v8 import and an IO0-approved
-export are still pending.
+reset; on a different port it booted cleanly.
+
+Live v9 status (2026-11-27): a vault was created with one IO0 tap, a four-file folder
+was imported with Keep and one file with Delete, and an IO0-approved export returned all
+four files with SHA-256 hashes matching the originals. FTK Imager listings taken before
+and after the Delete import show the shredded original's MFT record freed.
 
 A local disk-acquisition adversary harness (`devtools/adversary_harness.py`, not
 committed) attacks a format-3 vault built through `vault.py` with a simulated token. On

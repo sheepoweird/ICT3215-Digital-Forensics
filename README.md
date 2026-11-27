@@ -42,16 +42,20 @@ disk image.
 - A **token**: either an **ESP32-CAM** with its USB programmer board, or an
   **ESP32-S3-N16R8** dev board. See [Hardware](#hardware) for the parts list.
 - A **USB data cable** that fits the board. Some cables only carry power.
-- **Python 3.12**, only to build the app. `build.bat` offers to install it for you if
-  it's missing. The finished app doesn't need Python.
+- **Python 3.12**, only if you build the app yourself. `build.bat` offers to install it
+  for you if it's missing. The downloaded app doesn't need Python.
 
 ---
 
 ## Quick start
 
-### 1. Build the app
+### 1. Get the app
 
-From the repository root, run `build.bat` (or double-click it):
+**Easiest:** download `EnvStego-portable.zip` (app + token firmware) from the
+[latest release](https://github.com/sheepoweird/ICT3215-Digital-Forensics/releases/latest)
+and go to step 2.
+
+**Or build it yourself:** from the repository root, run `build.bat` (or double-click it):
 
 ```bat
 build.bat
@@ -236,6 +240,8 @@ There's no preview inside the app. Export a file to open it.
   reset.
 - **Shredding isn't guaranteed on SSDs and USB flash drives.** Overwriting can't promise
   the data is gone on these drives.
+- **Close EnvStego when you're done, and check it has exited** (Task Manager › Details).
+  Vault keys and the recovery code can stay in the app's memory until the process ends.
 
 ---
 
@@ -359,6 +365,12 @@ another PC is rebuilt automatically.
 
 When you double-click `build.bat`, the window stays open at the end so you can read
 the result. Press any key to close it.
+
+`PermissionError: [WinError 5] Access is denied` under `dist\EnvStego\` means a copy of
+`EnvStego.exe` from that folder is still running, sometimes with no window after it was
+closed. End it in Task Manager (Details › `EnvStego.exe`) and run `build.bat` again. Back
+up `token_config.json` and `envstego_settings.ini` from that folder first if you use
+that copy: the build deletes it.
 
 The first run downloads about 1 GB of PlatformIO toolchains, so it needs an internet
 connection and some time. If your Windows username has spaces or non-English
@@ -489,7 +501,7 @@ with PlatformIO directly.
 python -m pytest Python/tests/ -q
 ```
 
-All 271 tests pass (2026-11-24). The suite covers stego round trips for every supported
+All 279 tests pass (2026-11-28). The suite covers stego round trips for every supported
 carrier, host BLE protocol behavior, vault key separation, recovery, write failures,
 concurrency, batch approvals, subprocess cancellation and Qt UI flows. Host protocol
 simulation does not validate the physical IO0 circuit or BLE runtime. See

@@ -12,7 +12,9 @@
 
 ## Quick install (portable zip)
 
-1. Unzip `EnvStego-portable.zip` somewhere you can write to, such as Desktop,
+1. Download `EnvStego-portable.zip` from the
+   [latest release](https://github.com/sheepoweird/ICT3215-Digital-Forensics/releases/latest)
+   (or build it, see below) and unzip it somewhere you can write to, such as Desktop,
    Documents or a USB stick. **Not** `C:\Program Files`: the app keeps its settings
    and token pairing next to `EnvStego.exe`, and nothing in the Windows registry.
 2. Double-click `EnvStego.exe`. Python is not needed. If SmartScreen says the app is
@@ -95,8 +97,10 @@ Every run is a full build, so the zip's firmware always matches the source.
 
 Only the zip is left in `dist\`: the unzipped app folder and PyInstaller's work files
 (`build\pyinstaller\`) are deleted after zipping. Unzip it somewhere else to test. If a
-folder can't be deleted (for example a copy of `EnvStego.exe` from it is still
-running), the build prints a warning and still succeeds; delete the folder yourself.
+copy of `EnvStego.exe` from `dist\EnvStego\` is still running when the build starts
+(possibly with no window), PyInstaller fails with `Access is denied`: end it in Task
+Manager and run the build again. If the folder only becomes locked after zipping, the
+build prints a warning and still succeeds; delete the folder yourself.
 
 The frozen exe also serves as its own child processes: `--vault-worker`,
 `--jpeg-worker` and `--esptool`.
